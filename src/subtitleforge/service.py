@@ -22,6 +22,7 @@ from .providers import (
     CustomHttpProvider,
     OpenSubtitlesProvider,
     ProviderError,
+    SubtitleBestProvider,
     SubtitleProvider,
 )
 from .subtitle_files import (
@@ -48,6 +49,11 @@ class SubtitleService:
             headers={"User-Agent": "SubtitleForge/0.1.0"},
         )
         self.providers: dict[str, SubtitleProvider] = {
+            "subtitle_best": SubtitleBestProvider(
+                self._client,
+                settings.subtitle_best_api_key,
+                settings.subtitle_best_header_token,
+            ),
             "opensubtitles": OpenSubtitlesProvider(
                 self._client,
                 settings.opensubtitles_api_key,

@@ -26,7 +26,9 @@ class Settings(BaseSettings):
     api_token: str = ""
     media_roots: str = "/media"
     data_dir: Path = Path("/data")
-    provider_order: str = "opensubtitles,assrt,custom"
+    provider_order: str = "subtitle_best,opensubtitles,assrt,custom"
+    subtitle_best_api_key: str = ""
+    subtitle_best_header_token: str = ""
     opensubtitles_api_key: str = ""
     opensubtitles_username: str = ""
     opensubtitles_password: str = ""

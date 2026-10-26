@@ -12,6 +12,7 @@ installation logic, or MoviePilot integration.
 ## What is included
 
 - FastAPI service with API-token authentication.
+- SubtitleBest share-sub adapter (account key plus API client token).
 - Official OpenSubtitles API adapter (API key plus username/password for downloads).
 - ASSRT adapter (token).
 - Custom HTTP manifest adapter for your own source.
@@ -32,8 +33,9 @@ Movie.2024.1080p.zh-tw.ass
 
 ## Source policy
 
-OpenSubtitles and ASSRT are opt-in. They require accounts and credentials, and
-their quotas and terms can change. The service never scrapes a site by default.
+SubtitleBest, OpenSubtitles, and ASSRT are opt-in. They require accounts and
+credentials, and their quotas and terms can change. The service never scrapes
+a site by default.
 For another source, implement the JSON manifest contract below or add a provider
 adapter under `src/subtitleforge/providers/`.
 
@@ -64,6 +66,8 @@ Copy `.env.example` to `.env`. The most important values are:
 | --- | --- |
 | `SF_API_TOKEN` | Bearer token used by MoviePilot and API clients |
 | `SF_MEDIA_ROOTS` | Comma-separated allowed media roots |
+| `SF_SUBTITLE_BEST_API_KEY` | SubtitleBest account API key |
+| `SF_SUBTITLE_BEST_HEADER_TOKEN` | SubtitleBest API client token |
 | `SF_OPENSUBTITLES_API_KEY` | OpenSubtitles API key |
 | `SF_OPENSUBTITLES_USERNAME` | OpenSubtitles account username |
 | `SF_OPENSUBTITLES_PASSWORD` | OpenSubtitles account password |
@@ -74,7 +78,7 @@ Copy `.env.example` to `.env`. The most important values are:
 Provider order is configured with `SF_PROVIDER_ORDER`, for example:
 
 ```text
-SF_PROVIDER_ORDER=assrt,opensubtitles,custom
+SF_PROVIDER_ORDER=subtitle_best,assrt,opensubtitles,custom
 ```
 
 ## API
@@ -170,4 +174,3 @@ SubtitleForge is MIT licensed. ChineseSubFinder is also MIT licensed; its
 license and attribution are retained in this repository's history notes. This
 project intentionally reimplements the service boundary and provider adapters
 rather than maintaining a fork of the stopped Go application.
-

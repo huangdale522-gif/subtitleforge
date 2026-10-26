@@ -7,6 +7,7 @@ from subtitleforge.models import SearchRequest, SubtitleLanguage
 from subtitleforge.providers.assrt import AssrtProvider
 from subtitleforge.providers.custom import CustomHttpProvider
 from subtitleforge.providers.opensubtitles import OpenSubtitlesProvider
+from subtitleforge.providers.subtitle_best import SubtitleBestProvider
 
 
 @pytest.mark.asyncio
@@ -141,4 +142,66 @@ async def test_custom_provider_does_not_forward_token_to_other_host() -> None:
     await provider.download(candidates[0])
     assert seen_headers[0]["Authorization"] == "Bearer private-token"
     assert "Authorization" not in seen_headers[1]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_subtitle_best_searches_and_downloads_episode() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.host == "api.subtitle.best":
+            assert request.headers["Authorization"] == "Bearer client-token"
+        if request.url.path.endswith("/search-tv-eps"):
+            return httpx.Response(
+                200,
+                json={
+                    "status": 0,
+                    "subtitles": [
+                        {
+                            "sub_sha256": "abc123",
+                            "title": "Example.S01E02.zh-Hans.srt",
+                            "language": 1,
+                            "ext": "srt",
+                            "is_movie": False,
+                            "season": 1,
+                            "episode": 2,
+                            "token": "item-token",
+                        }
+                    ],
+                },
+            )
+        if request.url.path.endswith("/get-dl-url"):
+            return httpx.Response(
+                200,
+                json={
+                    "status": 0,
+                    "download_link": "https://cdn.example/episode.srt",
+                },
+            )
+        if request.url.host == "cdn.example":
+            return httpx.Response(200, content=b"subtitle")
+        return httpx.Response(404)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = SubtitleBestProvider(client, "account-key", "client-token")
+    candidates = await provider.search(
+        SearchRequest(
+            title="Example",
+            imdb_id="tt1234567",
+            media_type="tv",
+            season=1,
+            episode=2,
+        )
+    )
+    assert len(candidates) == 1
+    assert candidates[0].language is SubtitleLanguage.SIMPLIFIED
+    asset = await provider.download(candidates[0])
+    assert asset.content == b"subtitle"
+    assert not any(
+        "Authorization" in request.headers
+        for request in requests
+        if request.url.host == "cdn.example"
+    )
     await client.aclose()

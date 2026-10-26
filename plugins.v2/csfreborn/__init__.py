@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
 import subprocess
 import sys
 from datetime import datetime
@@ -16,10 +17,10 @@ from urllib.request import Request, urlopen
 from app.schemas.types import EventType
 
 try:
+    from app.schemas.types import MessageType
     from app.sdk.events import Event, eventmanager
     from app.sdk.logging import logger
     from app.sdk.plugin import _PluginBase
-    from app.schemas.types import MessageType
 except ImportError:
     from app.core.event import Event, eventmanager
     from app.log import logger
@@ -35,7 +36,7 @@ class CSFReborn(_PluginBase):
         "监听 MoviePilot 整理完成事件，调用自建 SubtitleForge 服务下载缺失字幕。"
     )
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.2.1"
+    plugin_version = "0.2.2"
     plugin_author = "SubtitleForge contributors"
     author_url = "https://github.com/"
     plugin_config_prefix = "csfreborn_"
@@ -57,6 +58,15 @@ class CSFReborn(_PluginBase):
         self._timeout = 180
         self._manage_service = False
         self._service_dir = Path("/config/subtitleforge")
+        self._provider_order = "subtitle_best,opensubtitles,assrt,custom"
+        self._subtitle_best_api_key = ""
+        self._subtitle_best_header_token = ""
+        self._opensubtitles_api_key = ""
+        self._opensubtitles_username = ""
+        self._opensubtitles_password = ""
+        self._assrt_token = ""
+        self._custom_provider_url = ""
+        self._custom_provider_token = ""
         self._managed_process: subprocess.Popen | None = None
         self._history_key = "download_history"
         self._history_max = 30
@@ -78,13 +88,39 @@ class CSFReborn(_PluginBase):
         self._service_dir = Path(
             str(config.get("service_dir") or "/config/subtitleforge")
         ).expanduser()
+        self._provider_order = str(
+            config.get("provider_order")
+            or "subtitle_best,opensubtitles,assrt,custom"
+        )
+        self._subtitle_best_api_key = str(config.get("subtitle_best_api_key") or "")
+        self._subtitle_best_header_token = str(
+            config.get("subtitle_best_header_token") or ""
+        )
+        self._opensubtitles_api_key = str(
+            config.get("opensubtitles_api_key") or ""
+        )
+        self._opensubtitles_username = str(
+            config.get("opensubtitles_username") or ""
+        )
+        self._opensubtitles_password = str(
+            config.get("opensubtitles_password") or ""
+        )
+        self._assrt_token = str(config.get("assrt_token") or "")
+        self._custom_provider_url = str(config.get("custom_provider_url") or "")
+        self._custom_provider_token = str(
+            config.get("custom_provider_token") or ""
+        )
         if not self._api_token:
             self._api_token = self._read_service_token()
         try:
             self._timeout = max(10, int(config.get("timeout") or 180))
         except (TypeError, ValueError):
             self._timeout = 180
+        source_changed = self._sync_bundled_service()
+        env_changed = self._write_provider_env()
         if self._enabled and self._manage_service:
+            if source_changed or env_changed:
+                self._stop_managed_service()
             self._ensure_managed_service()
         else:
             self._stop_managed_service()
@@ -162,6 +198,104 @@ class CSFReborn(_PluginBase):
             f"SubtitleForge 服务已启动，PID={self._managed_process.pid}, "
             f"目录={self._service_dir}"
         )
+        try:
+            (self._service_dir / "subtitleforge.pid").write_text(
+                str(self._managed_process.pid), encoding="utf-8"
+            )
+        except OSError:
+            logger.warning("SubtitleForge: 无法写入 PID 文件")
+
+    def _sync_bundled_service(self) -> bool:
+        """Copy the service bundled with the plugin without overwriting data."""
+
+        payload_dir = Path(__file__).resolve().parent / "payload"
+        if not payload_dir.is_dir():
+            return False
+        changed = False
+        for relative in ("src",):
+            source_root = payload_dir / relative
+            target_root = self._service_dir / relative
+            if not source_root.is_dir():
+                continue
+            for source in source_root.rglob("*"):
+                if not source.is_file() or "__pycache__" in source.parts:
+                    continue
+                target = target_root / source.relative_to(source_root)
+                try:
+                    if target.is_file() and target.read_bytes() == source.read_bytes():
+                        continue
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(source.read_bytes())
+                    changed = True
+                except OSError as exc:
+                    logger.error(f"SubtitleForge: 同步服务文件失败 {target}: {exc}")
+        for name in ("pyproject.toml", ".env.example"):
+            source = payload_dir / name
+            target = self._service_dir / name
+            if not source.is_file():
+                continue
+            try:
+                content = source.read_bytes()
+                if target.is_file() and target.read_bytes() == content:
+                    continue
+                self._service_dir.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(content)
+                changed = True
+            except OSError as exc:
+                logger.error(f"SubtitleForge: 同步服务文件失败 {target}: {exc}")
+        if changed:
+            logger.info("SubtitleForge: 已同步插件内置服务代码")
+        return changed
+
+    def _write_provider_env(self) -> bool:
+        """Persist provider settings to the private service env file."""
+
+        values = {
+            "SF_PROVIDER_ORDER": self._provider_order,
+            "SF_SUBTITLE_BEST_API_KEY": self._subtitle_best_api_key,
+            "SF_SUBTITLE_BEST_HEADER_TOKEN": self._subtitle_best_header_token,
+            "SF_OPENSUBTITLES_API_KEY": self._opensubtitles_api_key,
+            "SF_OPENSUBTITLES_USERNAME": self._opensubtitles_username,
+            "SF_OPENSUBTITLES_PASSWORD": self._opensubtitles_password,
+            "SF_ASSRT_TOKEN": self._assrt_token,
+            "SF_CUSTOM_PROVIDER_URL": self._custom_provider_url,
+            "SF_CUSTOM_PROVIDER_TOKEN": self._custom_provider_token,
+        }
+        # Blank secret fields mean "keep the existing value" so a routine form
+        # save cannot accidentally erase credentials.
+        updates = {
+            key: value.strip()
+            for key, value in values.items()
+            if value and "\n" not in value and "\r" not in value
+        }
+        if not updates:
+            return False
+        env_file = self._service_dir / ".env"
+        try:
+            self._service_dir.mkdir(parents=True, exist_ok=True)
+            lines = (
+                env_file.read_text(encoding="utf-8").splitlines()
+                if env_file.is_file()
+                else []
+            )
+            remaining = dict(updates)
+            output: list[str] = []
+            for line in lines:
+                key = line.split("=", 1)[0].strip() if "=" in line else ""
+                if key in remaining:
+                    output.append(f"{key}={json.dumps(remaining.pop(key), ensure_ascii=False)}")
+                else:
+                    output.append(line)
+            output.extend(
+                f"{key}={json.dumps(value, ensure_ascii=False)}"
+                for key, value in remaining.items()
+            )
+            env_file.write_text("\n".join(output) + "\n", encoding="utf-8")
+            env_file.chmod(0o600)
+            return True
+        except OSError as exc:
+            logger.error(f"SubtitleForge: 无法保存字幕源配置: {exc}")
+            return False
 
     def _read_service_token(self) -> str:
         """Read the service token from its private env file when not overridden."""
@@ -183,7 +317,7 @@ class CSFReborn(_PluginBase):
         try:
             self._request_json("GET", "/healthz", None, timeout=2)
             return True
-        except Exception:
+        except Exception:  # noqa: BLE001 - a health probe must not escape
             return False
 
     def _stop_managed_service(self) -> None:
@@ -191,14 +325,39 @@ class CSFReborn(_PluginBase):
 
         process = self._managed_process
         self._managed_process = None
-        if process is None or process.poll() is not None:
-            return
-        process.terminate()
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=3)
+        pid_file = self._service_dir / "subtitleforge.pid"
         try:
-            process.wait(timeout=8)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=3)
+            pid = int(pid_file.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            return
+        if self._is_managed_pid(pid):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+        try:
+            pid_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _is_managed_pid(pid: int) -> bool:
+        """Verify a PID belongs to the bundled service before signalling it."""
+
+        if pid < 2:
+            return False
+        try:
+            command_line = Path(f"/proc/{pid}/cmdline").read_bytes()
+        except OSError:
+            return False
+        return b"subtitleforge.api:app" in command_line and b"uvicorn" in command_line
 
     @eventmanager.register(EventType.TransferComplete)
     async def on_transfer_complete(self, event: Event) -> None:
@@ -378,6 +537,84 @@ class CSFReborn(_PluginBase):
                     {
                         "component": "VTextField",
                         "props": {
+                            "model": "provider_order",
+                            "label": "字幕源顺序",
+                            "placeholder": "subtitle_best,opensubtitles,assrt,custom",
+                        },
+                    },
+                    {
+                        "component": "VAlert",
+                        "props": {
+                            "type": "info",
+                            "variant": "tonal",
+                            "text": "字幕源密码留空表示保留 NAS 上已有的值。保存后插件会重载服务，健康页会显示每个源是否已配置。",
+                        },
+                    },
+                    {
+                        "component": "VTextField",
+                        "props": {
+                            "model": "subtitle_best_api_key",
+                            "label": "SubtitleBest API Key",
+                            "type": "password",
+                        },
+                    },
+                    {
+                        "component": "VTextField",
+                        "props": {
+                            "model": "subtitle_best_header_token",
+                            "label": "SubtitleBest 客户端 Token",
+                            "type": "password",
+                        },
+                    },
+                    {
+                        "component": "VTextField",
+                        "props": {
+                            "model": "assrt_token",
+                            "label": "ASSRT Token",
+                            "type": "password",
+                        },
+                    },
+                    {
+                        "component": "VTextField",
+                        "props": {
+                            "model": "opensubtitles_api_key",
+                            "label": "OpenSubtitles API Key",
+                            "type": "password",
+                        },
+                    },
+                    {
+                        "component": "VTextField",
+                        "props": {
+                            "model": "opensubtitles_username",
+                            "label": "OpenSubtitles 用户名",
+                        },
+                    },
+                    {
+                        "component": "VTextField",
+                        "props": {
+                            "model": "opensubtitles_password",
+                            "label": "OpenSubtitles 密码",
+                            "type": "password",
+                        },
+                    },
+                    {
+                        "component": "VTextField",
+                        "props": {
+                            "model": "custom_provider_url",
+                            "label": "自定义字幕源 JSON 地址",
+                        },
+                    },
+                    {
+                        "component": "VTextField",
+                        "props": {
+                            "model": "custom_provider_token",
+                            "label": "自定义字幕源 Token",
+                            "type": "password",
+                        },
+                    },
+                    {
+                        "component": "VTextField",
+                        "props": {
                             "model": "service_url",
                             "label": "SubtitleForge 服务地址",
                             "placeholder": "http://subtitleforge:8600",
@@ -465,6 +702,15 @@ class CSFReborn(_PluginBase):
             "dry_run": False,
             "manage_service": False,
             "service_dir": "/config/subtitleforge",
+            "provider_order": "subtitle_best,opensubtitles,assrt,custom",
+            "subtitle_best_api_key": "",
+            "subtitle_best_header_token": "",
+            "opensubtitles_api_key": "",
+            "opensubtitles_username": "",
+            "opensubtitles_password": "",
+            "assrt_token": "",
+            "custom_provider_url": "",
+            "custom_provider_token": "",
         }
 
     def get_page(self) -> list[dict]:

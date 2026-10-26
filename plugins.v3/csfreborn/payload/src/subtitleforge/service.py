@@ -1,0 +1,216 @@
+"""Application service that coordinates providers, matching and installation."""
+
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+
+import httpx
+
+from .config import Settings
+from .matching import candidates_for_language, rank_candidates
+from .models import (
+    DownloadedSubtitle,
+    ProcessRequest,
+    ProcessResult,
+    SearchRequest,
+    SubtitleCandidate,
+    SubtitleLanguage,
+)
+from .providers import (
+    AssrtProvider,
+    CustomHttpProvider,
+    OpenSubtitlesProvider,
+    ProviderError,
+    SubtitleBestProvider,
+    SubtitleProvider,
+)
+from .subtitle_files import (
+    ensure_path_allowed,
+    install_subtitle,
+    language_from_content,
+    probe_embedded_languages,
+    scan_external_languages,
+    select_subtitle,
+)
+
+
+class SubtitleService:
+    """Find and install subtitles for media files."""
+
+    def __init__(
+        self, settings: Settings, client: httpx.AsyncClient | None = None
+    ) -> None:
+        self.settings = settings
+        self._owns_client = client is None
+        self._client = client or httpx.AsyncClient(
+            timeout=settings.request_timeout_seconds,
+            follow_redirects=True,
+            headers={"User-Agent": "SubtitleForge/0.1.0"},
+        )
+        self.providers: dict[str, SubtitleProvider] = {
+            "subtitle_best": SubtitleBestProvider(
+                self._client,
+                settings.subtitle_best_api_key,
+                settings.subtitle_best_header_token,
+            ),
+            "opensubtitles": OpenSubtitlesProvider(
+                self._client,
+                settings.opensubtitles_api_key,
+                settings.opensubtitles_username,
+                settings.opensubtitles_password,
+            ),
+            "assrt": AssrtProvider(self._client, settings.assrt_token),
+            "custom": CustomHttpProvider(
+                self._client,
+                settings.custom_provider_url,
+                settings.custom_provider_token,
+            ),
+        }
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._locks_guard = asyncio.Lock()
+
+    async def close(self) -> None:
+        """Release provider and HTTP resources."""
+
+        for provider in self.providers.values():
+            await provider.close()
+        if self._owns_client:
+            await self._client.aclose()
+
+    def _provider_order(self, requested: list[str] | None = None) -> list[str]:
+        """Resolve provider preference order."""
+
+        names = requested or self.settings.provider_names
+        return [name for name in names if name in self.providers]
+
+    async def search(
+        self,
+        request: SearchRequest,
+        provider_order: list[str] | None = None,
+    ) -> tuple[list[SubtitleCandidate], list[str]]:
+        """Search configured providers and return ranked candidates."""
+
+        candidates: list[SubtitleCandidate] = []
+        errors: list[str] = []
+        order = self._provider_order(provider_order)
+        for name in order:
+            provider = self.providers[name]
+            if not provider.configured:
+                continue
+            try:
+                candidates.extend(await provider.search(request))
+            except ProviderError as exc:
+                errors.append(f"{name}: {exc}")
+        ranked = rank_candidates(
+            candidates,
+            request,
+            order,
+            self.settings.allow_machine_translated,
+        )
+        return ranked, errors
+
+    async def process(self, request: ProcessRequest) -> ProcessResult:
+        """Find missing languages and install the best matching subtitle."""
+
+        roots = self.settings.media_root_paths
+        video = ensure_path_allowed(request.video, roots)
+        if not video.is_file():
+            raise ValueError("Video file does not exist")
+        lock_key = str(video)
+        async with self._locks_guard:
+            lock = self._locks.setdefault(lock_key, asyncio.Lock())
+        async with lock:
+            return await self._process_locked(request, video)
+
+    async def _process_locked(
+        self, request: ProcessRequest, video: Path
+    ) -> ProcessResult:
+        """Perform one serialized processing operation."""
+
+        existing = scan_external_languages(video)
+        existing.update(
+            await probe_embedded_languages(video, self.settings.ffprobe_path)
+        )
+        missing = (
+            list(request.languages)
+            if request.overwrite
+            else [
+                language for language in request.languages if language not in existing
+            ]
+        )
+        result = ProcessResult(
+            status="skipped" if not missing else "processing",
+            video_path=str(video),
+            existing_languages=sorted(existing, key=lambda item: item.value),
+            missing_languages=missing,
+            dry_run=request.dry_run,
+        )
+        if not missing:
+            return result
+
+        candidates, errors = await self.search(request, request.provider_order)
+        result.errors.extend(errors)
+        if not candidates:
+            result.status = "not_found"
+            return result
+        if request.dry_run:
+            result.status = "dry_run"
+            return result
+
+        unresolved: list[SubtitleLanguage] = []
+        for language in missing:
+            language_candidates = candidates_for_language(candidates, language)
+            installed = False
+            for candidate in language_candidates[:10]:
+                provider = self.providers.get(candidate.provider)
+                if provider is None or not provider.configured:
+                    continue
+                try:
+                    asset = await provider.download(candidate)
+                    if len(asset.content) > self.settings.max_download_mb * 1024 * 1024:
+                        raise ValueError(
+                            "Downloaded subtitle exceeds the configured size limit"
+                        )
+                    content, file_name = select_subtitle(
+                        asset,
+                        language,
+                        self.settings.max_download_mb * 1024 * 1024,
+                    )
+                    detected = language_from_content(content)
+                    if detected is not None and detected is not language:
+                        raise ValueError(
+                            f"Detected {detected.value} instead of {language.value}"
+                        )
+                    destination, file_format = install_subtitle(
+                        video,
+                        content,
+                        file_name,
+                        language,
+                        request.overwrite,
+                    )
+                    result.downloaded.append(
+                        DownloadedSubtitle(
+                            language=language,
+                            provider=candidate.provider,
+                            candidate=candidate.display_name,
+                            path=str(destination),
+                            format=file_format,
+                        )
+                    )
+                    installed = True
+                    break
+                except (ProviderError, ValueError, FileExistsError, OSError) as exc:
+                    result.errors.append(
+                        f"{candidate.provider}/{candidate.candidate_id}: {exc}"
+                    )
+            if not installed:
+                unresolved.append(language)
+
+        result.missing_languages = unresolved
+        result.status = (
+            "completed"
+            if not unresolved
+            else ("partial" if result.downloaded else "not_found")
+        )
+        return result

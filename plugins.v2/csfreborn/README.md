@@ -11,8 +11,11 @@ Configuration:
 - `languages`: `zh-Hans` and/or `zh-Hant`.
 - `overwrite`: re-download even when a matching external subtitle exists.
 - `notify`: send a MoviePilot notification after a successful download.
+- `provider_order`: provider preference order.
+- Provider credentials for SubtitleBest, ASSRT, OpenSubtitles, and an optional
+  custom JSON source. Blank credential fields preserve values already stored in
+  the service's private `.env` file.
 
 Both containers must see the media library at the same path. For example, if
 MoviePilot sees a file as `/media/movies/Film.mkv`, SubtitleForge must also see
 `/media/movies/Film.mkv`.
-
