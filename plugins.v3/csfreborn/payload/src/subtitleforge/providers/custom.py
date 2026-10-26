@@ -13,7 +13,12 @@ from ..models import (
     SubtitleCandidate,
     SubtitleLanguage,
 )
-from .base import ProviderError, ProviderNotConfigured, SubtitleProvider
+from .base import (
+    ProviderError,
+    ProviderNotConfigured,
+    ProviderQuotaError,
+    SubtitleProvider,
+)
 
 
 class CustomHttpProvider(SubtitleProvider):
@@ -88,6 +93,8 @@ class CustomHttpProvider(SubtitleProvider):
             raise ProviderError(
                 f"Custom provider search failed: {type(exc).__name__}"
             ) from exc
+        if response.status_code == 429:
+            raise ProviderQuotaError("Custom provider search is rate limited")
         if response.status_code >= 400:
             raise ProviderError(f"Custom provider returned HTTP {response.status_code}")
         try:
@@ -140,6 +147,8 @@ class CustomHttpProvider(SubtitleProvider):
             raise ProviderError(
                 f"Custom provider download failed: {type(exc).__name__}"
             ) from exc
+        if response.status_code == 429:
+            raise ProviderQuotaError("Custom provider download is rate limited")
         if response.status_code >= 400:
             raise ProviderError(
                 f"Custom provider download returned HTTP {response.status_code}"

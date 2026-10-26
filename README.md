@@ -137,7 +137,11 @@ existing Chinese subtitles, and processes a bounded batch:
 With `dry_run: true`, the scanner only reads local subtitles and `ffprobe`
 metadata; it does not call subtitle providers, so a preview consumes no source
 quota. Real runs use provider failover in configured order and stop querying
-after the first provider returns usable candidates.
+after the first provider returns usable candidates. A provider that reports a
+rate limit or quota error enters a 24-hour cooldown, and each video is limited
+to three subtitle download attempts to prevent a bad match from exhausting a
+source. Cooldown state is persisted locally so a service restart does not
+immediately spend the same exhausted quota again.
 
 The scanner records completed files in SQLite. Each scheduled run prioritizes
 files that have never been checked, then the least recently checked files, and

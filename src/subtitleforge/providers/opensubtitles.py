@@ -14,7 +14,12 @@ from ..models import (
     SubtitleCandidate,
     SubtitleLanguage,
 )
-from .base import ProviderError, ProviderNotConfigured, SubtitleProvider
+from .base import (
+    ProviderError,
+    ProviderNotConfigured,
+    ProviderQuotaError,
+    SubtitleProvider,
+)
 
 
 class OpenSubtitlesProvider(SubtitleProvider):
@@ -29,7 +34,7 @@ class OpenSubtitlesProvider(SubtitleProvider):
         api_key: str,
         username: str = "",
         password: str = "",
-        user_agent: str = "SubtitleForge/0.2.2",
+        user_agent: str = "SubtitleForge/0.2.3",
     ) -> None:
         self._client = client
         self._api_key = api_key.strip()
@@ -156,7 +161,7 @@ class OpenSubtitlesProvider(SubtitleProvider):
         if response.status_code in {401, 403}:
             raise ProviderError("OpenSubtitles rejected the API key")
         if response.status_code == 429:
-            raise ProviderError("OpenSubtitles search is rate limited")
+            raise ProviderQuotaError("OpenSubtitles search is rate limited")
         if response.status_code >= 400:
             raise ProviderError(
                 f"OpenSubtitles search returned HTTP {response.status_code}"
@@ -263,7 +268,7 @@ class OpenSubtitlesProvider(SubtitleProvider):
                     headers=self._headers(authenticated=True),
                 )
             if response.status_code == 429:
-                raise ProviderError("OpenSubtitles download quota is exhausted")
+                raise ProviderQuotaError("OpenSubtitles download quota is exhausted")
             if response.status_code >= 400:
                 raise ProviderError(
                     f"OpenSubtitles download returned HTTP {response.status_code}"

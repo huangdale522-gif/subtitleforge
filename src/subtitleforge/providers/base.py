@@ -11,6 +11,10 @@ class ProviderError(RuntimeError):
     """A recoverable provider failure."""
 
 
+class ProviderQuotaError(ProviderError):
+    """A provider rejected a request because its quota or rate limit was hit."""
+
+
 class ProviderNotConfigured(ProviderError):
     """Raised when a provider has no usable credentials."""
 

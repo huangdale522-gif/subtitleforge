@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import time
 from pathlib import Path
 
 import httpx
@@ -22,6 +24,7 @@ from .providers import (
     CustomHttpProvider,
     OpenSubtitlesProvider,
     ProviderError,
+    ProviderQuotaError,
     SubtitleBestProvider,
     SubtitleProvider,
 )
@@ -46,7 +49,7 @@ class SubtitleService:
         self._client = client or httpx.AsyncClient(
             timeout=settings.request_timeout_seconds,
             follow_redirects=True,
-            headers={"User-Agent": "SubtitleForge/0.2.2"},
+            headers={"User-Agent": "SubtitleForge/0.2.3"},
         )
         self.providers: dict[str, SubtitleProvider] = {
             "subtitle_best": SubtitleBestProvider(
@@ -69,6 +72,8 @@ class SubtitleService:
         }
         self._locks: dict[str, asyncio.Lock] = {}
         self._locks_guard = asyncio.Lock()
+        self._provider_cooldowns: dict[str, float] = {}
+        self._load_provider_cooldowns()
 
     async def close(self) -> None:
         """Release provider and HTTP resources."""
@@ -84,6 +89,62 @@ class SubtitleService:
         names = requested or self.settings.provider_names
         return [name for name in names if name in self.providers]
 
+    def _provider_in_cooldown(self, name: str) -> bool:
+        """Return whether a provider is cooling down after a quota error."""
+
+        deadline = self._provider_cooldowns.get(name)
+        if deadline is None:
+            return False
+        if deadline <= time.time():
+            self._provider_cooldowns.pop(name, None)
+            self._save_provider_cooldowns()
+            return False
+        return True
+
+    def _activate_provider_cooldown(self, name: str) -> None:
+        """Stop spending requests on a provider until its cooldown expires."""
+
+        cooldown_seconds = max(0, self.settings.provider_cooldown_hours) * 3600
+        self._provider_cooldowns[name] = time.time() + cooldown_seconds
+        self._save_provider_cooldowns()
+
+    @property
+    def _provider_cooldown_file(self) -> Path:
+        """Return the small local state file used for quota cooldowns."""
+
+        return self.settings.data_dir / "provider_cooldowns.json"
+
+    def _load_provider_cooldowns(self) -> None:
+        """Restore unexpired provider cooldowns after a service restart."""
+
+        path = self._provider_cooldown_file
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(payload, dict):
+            return
+        now = time.time()
+        self._provider_cooldowns = {
+            str(name): float(deadline)
+            for name, deadline in payload.items()
+            if isinstance(deadline, (int, float)) and float(deadline) > now
+        }
+
+    def _save_provider_cooldowns(self) -> None:
+        """Persist quota cooldowns without exposing provider credentials."""
+
+        path = self._provider_cooldown_file
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(self._provider_cooldowns, sort_keys=True),
+                encoding="utf-8",
+            )
+        except OSError:
+            # Quota protection still works for this process if persistence fails.
+            pass
+
     async def search(
         self,
         request: SearchRequest,
@@ -97,13 +158,16 @@ class SubtitleService:
         order = self._provider_order(provider_order)
         for name in order:
             provider = self.providers[name]
-            if not provider.configured:
+            if not provider.configured or self._provider_in_cooldown(name):
                 continue
             try:
                 provider_candidates = await provider.search(request)
                 candidates.extend(provider_candidates)
                 if provider_failover and provider_candidates:
                     break
+            except ProviderQuotaError as exc:
+                errors.append(f"{name}: {exc}; cooling down")
+                self._activate_provider_cooldown(name)
             except ProviderError as exc:
                 errors.append(f"{name}: {exc}")
         ranked = rank_candidates(
@@ -171,9 +235,12 @@ class SubtitleService:
         for language in missing:
             language_candidates = candidates_for_language(candidates, language)
             installed = False
-            for candidate in language_candidates[:10]:
+            attempts = max(1, self.settings.max_download_attempts_per_file)
+            for candidate in language_candidates[:attempts]:
                 provider = self.providers.get(candidate.provider)
                 if provider is None or not provider.configured:
+                    continue
+                if self._provider_in_cooldown(candidate.provider):
                     continue
                 try:
                     asset = await provider.download(candidate)
@@ -208,6 +275,12 @@ class SubtitleService:
                         )
                     )
                     installed = True
+                    break
+                except ProviderQuotaError as exc:
+                    result.errors.append(
+                        f"{candidate.provider}/{candidate.candidate_id}: {exc}"
+                    )
+                    self._activate_provider_cooldown(candidate.provider)
                     break
                 except (ProviderError, ValueError, FileExistsError, OSError) as exc:
                     result.errors.append(

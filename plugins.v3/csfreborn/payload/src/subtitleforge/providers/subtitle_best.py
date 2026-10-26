@@ -14,7 +14,12 @@ from ..models import (
     SubtitleCandidate,
     SubtitleLanguage,
 )
-from .base import ProviderError, ProviderNotConfigured, SubtitleProvider
+from .base import (
+    ProviderError,
+    ProviderNotConfigured,
+    ProviderQuotaError,
+    SubtitleProvider,
+)
 
 
 class SubtitleBestProvider(SubtitleProvider):
@@ -94,7 +99,7 @@ class SubtitleBestProvider(SubtitleProvider):
         if response.status_code in {401, 403}:
             raise ProviderError("SubtitleBest rejected the configured credentials")
         if response.status_code == 429:
-            raise ProviderError("SubtitleBest is rate limited")
+            raise ProviderQuotaError("SubtitleBest is rate limited")
         if response.status_code >= 400:
             raise ProviderError(
                 f"SubtitleBest returned HTTP {response.status_code}"

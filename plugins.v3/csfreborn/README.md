@@ -35,8 +35,11 @@ Configuration:
 The scan recognizes external subtitles by filename/content and embedded
 subtitles through `ffprobe`. Existing Chinese subtitles are skipped unless
 `overwrite` is enabled. Providers are queried in order and later providers are
-skipped when the first one returns usable candidates. An authenticated
-`POST /api/v1/plugin/CSFReborn/scan` starts a manual scan using saved settings.
+skipped when the first one returns usable candidates. Rate-limit or quota
+responses put that provider into a 24-hour cooldown, and each video is limited
+to three download attempts. Cooldowns persist across service restarts. An
+authenticated `POST
+/api/v1/plugin/CSFReborn/scan` starts a manual scan using saved settings.
 
 Both containers must see the media library at the same path. For example, if
 MoviePilot sees a file as `/media/movies/Film.mkv`, SubtitleForge must also see

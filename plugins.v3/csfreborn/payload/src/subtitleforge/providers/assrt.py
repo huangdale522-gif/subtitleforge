@@ -8,7 +8,12 @@ from typing import Any
 import httpx
 
 from ..models import DownloadedAsset, SearchRequest, SubtitleCandidate, SubtitleLanguage
-from .base import ProviderError, ProviderNotConfigured, SubtitleProvider
+from .base import (
+    ProviderError,
+    ProviderNotConfigured,
+    ProviderQuotaError,
+    SubtitleProvider,
+)
 
 
 class AssrtProvider(SubtitleProvider):
@@ -87,7 +92,7 @@ class AssrtProvider(SubtitleProvider):
             if response.status_code in {401, 403}:
                 raise ProviderError("ASSRT rejected the token")
             if response.status_code == 429:
-                raise ProviderError("ASSRT search is rate limited")
+                raise ProviderQuotaError("ASSRT search is rate limited")
             if response.status_code >= 400:
                 raise ProviderError(
                     f"ASSRT search returned HTTP {response.status_code}"
@@ -124,6 +129,8 @@ class AssrtProvider(SubtitleProvider):
                     download_ref={"subtitle_id": subtitle_id},
                 )
                 candidates[subtitle_id] = candidate
+            if candidates:
+                break
         return list(candidates.values())
 
     async def download(self, candidate: SubtitleCandidate) -> DownloadedAsset:
@@ -139,6 +146,8 @@ class AssrtProvider(SubtitleProvider):
                 headers=self._headers(),
             )
             if response.status_code >= 400:
+                if response.status_code == 429:
+                    raise ProviderQuotaError("ASSRT download is rate limited")
                 raise ProviderError(
                     f"ASSRT detail returned HTTP {response.status_code}"
                 )
@@ -163,6 +172,8 @@ class AssrtProvider(SubtitleProvider):
             file_name = str(detail.get("filename") or f"assrt-{subtitle_id}.srt")
             file_response = await self._client.get(url)
             if file_response.status_code >= 400:
+                if file_response.status_code == 429:
+                    raise ProviderQuotaError("ASSRT file download is rate limited")
                 raise ProviderError(
                     f"ASSRT file download returned HTTP {file_response.status_code}"
                 )

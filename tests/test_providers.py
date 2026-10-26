@@ -77,9 +77,13 @@ async def test_opensubtitles_falls_back_to_title_and_downloads() -> None:
 
 @pytest.mark.asyncio
 async def test_assrt_normalizes_search_results() -> None:
+    search_calls = 0
+
     def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal search_calls
         assert request.headers["Authorization"] == "Bearer token"
         assert request.url.path.endswith("/sub/search")
+        search_calls += 1
         return httpx.Response(
             200,
             json={
@@ -101,8 +105,11 @@ async def test_assrt_normalizes_search_results() -> None:
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     provider = AssrtProvider(client, "token")
-    candidates = await provider.search(SearchRequest(title="Example Show"))
+    candidates = await provider.search(
+        SearchRequest(title="Example Show", english_title="Example Show")
+    )
     assert len(candidates) == 1
+    assert search_calls == 1
     assert candidates[0].season == 2
     assert candidates[0].episode == 4
     assert candidates[0].language is SubtitleLanguage.SIMPLIFIED
