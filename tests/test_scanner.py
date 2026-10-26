@@ -154,3 +154,37 @@ async def test_library_scan_honors_exclusions_and_dry_run(tmp_path: Path) -> Non
     assert result.downloaded == 0
     assert result.items[0].status == "dry_run"
     assert not (foreign.parent / "Movie.chi.zh-cn.srt").exists()
+
+
+@pytest.mark.asyncio
+async def test_scan_rotates_across_media_directories(tmp_path: Path) -> None:
+    root = tmp_path / "电视剧" / "欧美剧"
+    show = root / "Long Show (2024)" / "Season 1"
+    show.mkdir(parents=True)
+    for episode in range(1, 31):
+        (show / f"Long.Show.S01E{episode:02d}.mkv").write_bytes(b"video")
+    for movie_name in ("Movie One (2024)", "Movie Two (2023)"):
+        movie_dir = tmp_path / "电影" / "外语电影" / movie_name
+        movie_dir.mkdir(parents=True)
+        (movie_dir / f"{movie_name}.mkv").write_bytes(b"video")
+    settings = Settings(
+        media_roots=str(tmp_path), data_dir=tmp_path / "data", provider_order="custom"
+    )
+    service = SubtitleService(settings, client=httpx.AsyncClient())
+    service.providers["custom"] = ScanProvider()
+    scanner = LibraryScanner(service, settings.data_dir)
+    try:
+        result = await scanner.scan(
+            ScanRequest(
+                paths=[str(tmp_path / "电视剧"), str(tmp_path / "电影")],
+                languages=[SubtitleLanguage.SIMPLIFIED],
+                max_files=5,
+                dry_run=True,
+            )
+        )
+    finally:
+        await service.close()
+    titles = {item.title for item in result.items}
+    assert "Movie One" in titles
+    assert "Movie Two" in titles
+    assert "Long Show" in titles

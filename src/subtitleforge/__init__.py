@@ -1,3 +1,3 @@
 """SubtitleForge: provider-driven subtitle search and installation."""
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"

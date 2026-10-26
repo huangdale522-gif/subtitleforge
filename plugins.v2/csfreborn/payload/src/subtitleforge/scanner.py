@@ -322,6 +322,27 @@ def discover_videos(
     return root_pairs
 
 
+def interleave_by_media_directory(
+    items: list[tuple[Path, Path]],
+) -> list[tuple[Path, Path]]:
+    """Rotate through media directories so one series cannot fill a batch."""
+
+    groups: dict[Path, list[tuple[Path, Path]]] = {}
+    for item in items:
+        path = item[0]
+        group = path.parent
+        if SEASON_DIR_PATTERN.match(group.name) or "season" in group.name.casefold():
+            group = group.parent
+        groups.setdefault(group, []).append(item)
+    interleaved: list[tuple[Path, Path]] = []
+    while groups:
+        for group in list(groups):
+            interleaved.append(groups[group].pop(0))
+            if not groups[group]:
+                del groups[group]
+    return interleaved
+
+
 class LibraryScanner:
     """Apply subtitle processing to a bounded, least-recently-checked batch."""
 
@@ -361,13 +382,17 @@ class LibraryScanner:
             )
 
         last_checked = self._store.last_checked()
-        never_checked = sorted(
-            (item for item in discovered if str(item[0]) not in last_checked),
-            key=lambda item: str(item[0]),
+        never_checked = interleave_by_media_directory(
+            sorted(
+                (item for item in discovered if str(item[0]) not in last_checked),
+                key=lambda item: str(item[0]),
+            )
         )
-        previously_checked = sorted(
-            (item for item in discovered if str(item[0]) in last_checked),
-            key=lambda item: last_checked[str(item[0])],
+        previously_checked = interleave_by_media_directory(
+            sorted(
+                (item for item in discovered if str(item[0]) in last_checked),
+                key=lambda item: last_checked[str(item[0])],
+            )
         )
         selected = (never_checked + previously_checked)[: request.max_files]
         result = ScanResult(

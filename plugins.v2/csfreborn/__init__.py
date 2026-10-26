@@ -36,7 +36,7 @@ class CSFReborn(_PluginBase):
         "监听 MoviePilot 整理完成事件，并定时扫描媒体库，为缺少中文字幕的视频自动补全。"
     )
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.3.0"
+    plugin_version = "0.3.1"
     plugin_author = "SubtitleForge contributors"
     author_url = "https://github.com/"
     plugin_config_prefix = "csfreborn_"
