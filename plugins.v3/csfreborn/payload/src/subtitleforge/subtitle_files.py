@@ -16,6 +16,20 @@ from .models import DownloadedAsset, SubtitleLanguage
 SUBTITLE_EXTENSIONS = {".srt", ".ass", ".ssa", ".vtt", ".sub"}
 SIMPLIFIED_MARKERS = ("zh-cn", "zh-hans", "chs", "chi.zh-cn", "简", "simplified")
 TRADITIONAL_MARKERS = ("zh-tw", "zh-hant", "cht", "chi.zh-tw", "繁", "traditional")
+GENERIC_CHINESE_MARKERS = (
+    ".zh.",
+    ".zh-",
+    "_zh.",
+    "_zh-",
+    ".chi.",
+    "_chi.",
+    ".zho.",
+    "_zho.",
+    "中字",
+    "中文",
+    "简中",
+    "繁中",
+)
 SIMPLIFIED_CHARS = set(
     "这为说时会过个们来学开关头门体国对发现后经么样点从当还没给让问听实际报长东动里种类华机产万话风电业处际识达罗马鱼鸟龙书"
 )
@@ -33,6 +47,13 @@ def language_from_name(name: str) -> SubtitleLanguage | None:
     if any(marker in lowered for marker in SIMPLIFIED_MARKERS):
         return SubtitleLanguage.SIMPLIFIED
     return None
+
+
+def has_generic_chinese_marker(name: str) -> bool:
+    """Return whether a subtitle name identifies Chinese without its script."""
+
+    lowered = f".{name.casefold()}."
+    return any(marker in lowered for marker in GENERIC_CHINESE_MARKERS)
 
 
 def language_from_content(content: bytes) -> SubtitleLanguage | None:
@@ -100,6 +121,13 @@ def scan_external_languages(video_path: Path) -> set[SubtitleLanguage]:
             language = None
         if language is not None:
             found.add(language)
+        elif has_generic_chinese_marker(candidate.name):
+            # A generic ``zh``/``chi`` tag cannot tell Simplified from
+            # Traditional. Treat it as Chinese so the scanner does not spend
+            # quota downloading a duplicate.
+            found.update(
+                {SubtitleLanguage.SIMPLIFIED, SubtitleLanguage.TRADITIONAL}
+            )
     return found
 
 
@@ -138,6 +166,10 @@ async def probe_embedded_languages(
             found.add(SubtitleLanguage.SIMPLIFIED)
         elif code in {"zh-tw", "zh-hant", "zho-hant", "cht", "chi-tra", "zh-hk"}:
             found.add(SubtitleLanguage.TRADITIONAL)
+        elif code in {"zh", "chi", "zho", "chinese"}:
+            found.update(
+                {SubtitleLanguage.SIMPLIFIED, SubtitleLanguage.TRADITIONAL}
+            )
     return found
 
 

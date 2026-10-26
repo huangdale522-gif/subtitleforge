@@ -119,6 +119,82 @@ class ProcessResult(BaseModel):
     dry_run: bool = False
 
 
+class ScanRequest(BaseModel):
+    """Configuration for a bounded walk over the media library."""
+
+    paths: list[str] = Field(default_factory=lambda: ["/media"])
+    exclude_paths: list[str] = Field(default_factory=list)
+    video_extensions: list[str] = Field(
+        default_factory=lambda: [
+            ".mkv",
+            ".mp4",
+            ".avi",
+            ".mov",
+            ".wmv",
+            ".m4v",
+            ".ts",
+            ".m2ts",
+            ".webm",
+        ]
+    )
+    languages: list[SubtitleLanguage] = Field(
+        default_factory=lambda: [
+            SubtitleLanguage.SIMPLIFIED,
+            SubtitleLanguage.TRADITIONAL,
+        ]
+    )
+    max_files: int = Field(default=20, ge=1, le=100)
+    overwrite: bool = False
+    dry_run: bool = True
+    retry_after_hours: int = Field(default=24, ge=1, le=24 * 365)
+    provider_order: list[str] | None = None
+
+    @model_validator(mode="after")
+    def normalize_scan_lists(self) -> ScanRequest:
+        """Normalize extensions and languages while preserving their order."""
+
+        self.languages = list(dict.fromkeys(self.languages))
+        self.video_extensions = list(
+            dict.fromkeys(
+                extension.strip().casefold()
+                if extension.strip().startswith(".")
+                else f".{extension.strip().casefold()}"
+                for extension in self.video_extensions
+                if extension.strip()
+            )
+        )
+        return self
+
+
+class ScanItemResult(BaseModel):
+    """The processing outcome for one video discovered by a library scan."""
+
+    video_path: str
+    title: str
+    year: int | None = None
+    media_type: MediaType
+    season: int | None = None
+    episode: int | None = None
+    status: str
+    existing_languages: list[SubtitleLanguage] = Field(default_factory=list)
+    missing_languages: list[SubtitleLanguage] = Field(default_factory=list)
+    downloaded: list[DownloadedSubtitle] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
+
+
+class ScanResult(BaseModel):
+    """A bounded, resumable media-library scan."""
+
+    status: str
+    discovered: int = 0
+    checked: int = 0
+    remaining: int = 0
+    downloaded: int = 0
+    dry_run: bool = True
+    items: list[ScanItemResult] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
+
+
 class JobRecord(BaseModel):
     """Persisted background job state."""
 

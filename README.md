@@ -21,6 +21,8 @@ installation logic, or MoviePilot integration.
 - Safe ZIP extraction and atomic subtitle placement.
 - SQLite job history.
 - MoviePilot V3 adapter that listens for `TransferComplete`.
+- Resumable media-library scans with external and embedded Chinese subtitle
+  detection, bounded batches, exclusions, and dry-run preview.
 - Docker image and Compose deployment.
 
 The default output names are:
@@ -116,6 +118,25 @@ curl -X POST http://127.0.0.1:8600/v1/search \
 
 Use `POST /v1/jobs` with the same body as `/v1/process`, then poll
 `GET /v1/jobs/{job_id}`.
+
+### Scan the media library
+
+`POST /v1/scan` walks configured directories, parses movie/TV metadata, detects
+existing Chinese subtitles, and processes a bounded batch:
+
+```json
+{
+  "paths": ["/media/movies/foreign", "/media/tv/foreign"],
+  "exclude_paths": ["/media/movies/chinese"],
+  "languages": ["zh-Hans", "zh-Hant"],
+  "max_files": 20,
+  "dry_run": true
+}
+```
+
+The scanner records completed files in SQLite. Each scheduled run prioritizes
+files that have never been checked, then the least recently checked files, so a
+large library is covered without repeatedly consuming the first batch's quota.
 
 ## Custom provider contract
 

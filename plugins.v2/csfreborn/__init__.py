@@ -29,14 +29,14 @@ except ImportError:
 
 
 class CSFReborn(_PluginBase):
-    """Send completed media files to SubtitleForge for subtitle completion."""
+    """Complete subtitles after transfers and during scheduled library scans."""
 
     plugin_name = "SubtitleForge 字幕补全"
     plugin_desc = (
-        "监听 MoviePilot 整理完成事件，调用自建 SubtitleForge 服务下载缺失字幕。"
+        "监听 MoviePilot 整理完成事件，并定时扫描媒体库，为缺少中文字幕的视频自动补全。"
     )
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.2.2"
+    plugin_version = "0.3.0"
     plugin_author = "SubtitleForge contributors"
     author_url = "https://github.com/"
     plugin_config_prefix = "csfreborn_"
@@ -67,8 +67,23 @@ class CSFReborn(_PluginBase):
         self._assrt_token = ""
         self._custom_provider_url = ""
         self._custom_provider_token = ""
+        self._scan_enabled = False
+        self._scan_paths = (
+            "/plex/电影/外语电影,/plex/电视剧/欧美剧,/plex/电视剧/日韩剧,"
+            "/plex/电视剧/纪录片,/plex/动漫"
+        )
+        self._scan_exclude_paths = "/plex/电影/华语电影,/plex/电视剧/国产剧"
+        self._scan_video_extensions = (
+            ".mkv,.mp4,.avi,.mov,.wmv,.m4v,.ts,.m2ts,.webm"
+        )
+        self._scan_interval_hours = 24
+        self._scan_max_files = 20
+        self._scan_dry_run = True
+        self._scan_provider_order = ""
         self._managed_process: subprocess.Popen | None = None
+        self._scan_running = False
         self._history_key = "download_history"
+        self._latest_scan_key = "latest_scan"
         self._history_max = 30
 
     def init_plugin(self, config: dict | None = None) -> None:
@@ -110,6 +125,30 @@ class CSFReborn(_PluginBase):
         self._custom_provider_token = str(
             config.get("custom_provider_token") or ""
         )
+        self._scan_enabled = bool(config.get("scan_enabled", False))
+        self._scan_paths = str(config.get("scan_paths") or self._scan_paths)
+        self._scan_exclude_paths = str(
+            config.get("scan_exclude_paths") or self._scan_exclude_paths
+        )
+        self._scan_video_extensions = str(
+            config.get("scan_video_extensions") or self._scan_video_extensions
+        )
+        self._scan_dry_run = bool(config.get("scan_dry_run", True))
+        self._scan_provider_order = str(
+            config.get("scan_provider_order") or ""
+        )
+        try:
+            self._scan_interval_hours = max(
+                1, int(config.get("scan_interval_hours") or 24)
+            )
+        except (TypeError, ValueError):
+            self._scan_interval_hours = 24
+        try:
+            self._scan_max_files = min(
+                100, max(1, int(config.get("scan_max_files") or 20))
+            )
+        except (TypeError, ValueError):
+            self._scan_max_files = 20
         if not self._api_token:
             self._api_token = self._read_service_token()
         try:
@@ -132,12 +171,20 @@ class CSFReborn(_PluginBase):
 
     @staticmethod
     def get_command() -> list[dict[str, Any]]:
-        """This plugin has no remote commands."""
+        """Register a remote command for an on-demand library scan."""
 
-        return []
+        return [
+            {
+                "cmd": "/字幕扫描",
+                "event": EventType.PluginAction,
+                "desc": "立即扫描配置的媒体库并补全缺失字幕",
+                "category": "字幕",
+                "data": {"action": "subtitleforge_scan"},
+            }
+        ]
 
     def get_api(self) -> list[dict[str, Any]]:
-        """Expose a health endpoint for the plugin page."""
+        """Expose health and manual scan endpoints."""
 
         return [
             {
@@ -146,8 +193,114 @@ class CSFReborn(_PluginBase):
                 "methods": ["GET"],
                 "auth": "bear",
                 "summary": "检查 SubtitleForge 服务",
+            },
+            {
+                "path": "/scan",
+                "endpoint": self.run_manual_scan,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "立即扫描媒体库",
+            },
+        ]
+
+    def get_service(self) -> list[dict[str, Any]]:
+        """Register the resumable library scan with MoviePilot."""
+
+        if not self._enabled or not self._scan_enabled or not self._scan_paths:
+            return []
+        return [
+            {
+                "id": "SubtitleForgeLibraryScan",
+                "name": "SubtitleForge 媒体库字幕扫描",
+                "trigger": "interval",
+                "func": self.scan_library,
+                "kwargs": {"hours": self._scan_interval_hours},
             }
         ]
+
+    async def run_manual_scan(self) -> dict[str, Any]:
+        """Run one scan using the saved preview/download settings."""
+
+        return await self.scan_library(manual=True)
+
+    @eventmanager.register(EventType.PluginAction)
+    async def on_plugin_action(self, event: Event) -> None:
+        """Run a scan when the MoviePilot remote command is invoked."""
+
+        data = event.event_data if isinstance(event.event_data, dict) else {}
+        if data.get("action") != "subtitleforge_scan":
+            return
+        result = await self.scan_library(manual=True)
+        self.post_message(
+            channel=data.get("channel"),
+            mtype=MessageType.Plugin,
+            title="SubtitleForge 字幕扫描",
+            text=(
+                f"状态：{result.get('status', 'unknown')}；"
+                f"检查：{result.get('checked', 0)}；"
+                f"下载：{result.get('downloaded', 0)}"
+            ),
+            userid=data.get("user"),
+        )
+
+    async def scan_library(self, manual: bool = False) -> dict[str, Any]:
+        """Scan a bounded batch and download missing Chinese subtitles."""
+
+        if not self._enabled:
+            return {"status": "disabled", "message": "插件尚未启用"}
+        if self._scan_running:
+            return {"status": "busy", "message": "已有媒体库扫描正在运行"}
+        self._scan_running = True
+        payload = {
+            "paths": self._split_list(self._scan_paths),
+            "exclude_paths": self._split_list(self._scan_exclude_paths),
+            "video_extensions": self._split_list(self._scan_video_extensions),
+            "languages": self._languages,
+            "max_files": self._scan_max_files,
+            "overwrite": self._overwrite,
+            "dry_run": self._scan_dry_run,
+            "provider_order": (
+                self._split_list(self._scan_provider_order)
+                if self._scan_provider_order
+                else None
+            ),
+        }
+        try:
+            result = await asyncio.to_thread(
+                self._request_json,
+                "POST",
+                "/v1/scan",
+                payload,
+                max(600, self._scan_max_files * 45),
+            )
+            result["time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            result["trigger"] = "manual" if manual else "schedule"
+            self.save_data(
+                self._latest_scan_key,
+                json.dumps(result, ensure_ascii=False),
+            )
+            logger.info(
+                "SubtitleForge 媒体库扫描完成："
+                f"发现 {result.get('discovered', 0)}，"
+                f"检查 {result.get('checked', 0)}，"
+                f"下载 {result.get('downloaded', 0)}"
+            )
+            if self._notify and int(result.get("downloaded") or 0) > 0:
+                self.post_message(
+                    mtype=MessageType.Plugin,
+                    title="SubtitleForge 媒体库扫描完成",
+                    text=(
+                        f"检查 {result.get('checked', 0)} 个视频，"
+                        f"新增 {result.get('downloaded', 0)} 条中文字幕。"
+                    ),
+                )
+            return result
+        except Exception as exc:  # noqa: BLE001 - scheduler must survive failures
+            message = f"{type(exc).__name__}: {exc}"
+            logger.error(f"SubtitleForge 媒体库扫描失败：{message}")
+            return {"status": "error", "errors": [message]}
+        finally:
+            self._scan_running = False
 
     async def health(self) -> dict[str, Any]:
         """Check the configured SubtitleForge service."""
@@ -535,6 +688,117 @@ class CSFReborn(_PluginBase):
                         ],
                     },
                     {
+                        "component": "VAlert",
+                        "props": {
+                            "type": "info",
+                            "variant": "tonal",
+                            "text": "媒体库扫描会检查外挂和内嵌中文字幕。默认先预览，每轮只处理一批视频；确认识别无误后再关闭“仅预览”。",
+                        },
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "scan_enabled",
+                                            "label": "启用定时媒体库扫描",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "scan_dry_run",
+                                            "label": "仅预览，不下载",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "scan_interval_hours",
+                                            "label": "扫描间隔（小时）",
+                                            "type": "number",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VTextarea",
+                        "props": {
+                            "model": "scan_paths",
+                            "label": "扫描目录（每行或逗号分隔）",
+                            "rows": 3,
+                            "placeholder": "/plex/电影/外语电影\n/plex/电视剧/欧美剧",
+                        },
+                    },
+                    {
+                        "component": "VTextarea",
+                        "props": {
+                            "model": "scan_exclude_paths",
+                            "label": "排除目录",
+                            "rows": 2,
+                            "placeholder": "/plex/电影/华语电影\n/plex/电视剧/国产剧",
+                        },
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "scan_max_files",
+                                            "label": "每轮最多处理",
+                                            "type": "number",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 8},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "scan_video_extensions",
+                                            "label": "视频扩展名",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VTextField",
+                        "props": {
+                            "model": "scan_provider_order",
+                            "label": "扫描专用字幕源顺序（可选）",
+                            "placeholder": "留空则使用上方字幕源顺序",
+                        },
+                    },
+                    {
                         "component": "VTextField",
                         "props": {
                             "model": "provider_order",
@@ -711,24 +975,88 @@ class CSFReborn(_PluginBase):
             "assrt_token": "",
             "custom_provider_url": "",
             "custom_provider_token": "",
+            "scan_enabled": False,
+            "scan_paths": (
+                "/plex/电影/外语电影,/plex/电视剧/欧美剧,/plex/电视剧/日韩剧,"
+                "/plex/电视剧/纪录片,/plex/动漫"
+            ),
+            "scan_exclude_paths": "/plex/电影/华语电影,/plex/电视剧/国产剧",
+            "scan_video_extensions": (
+                ".mkv,.mp4,.avi,.mov,.wmv,.m4v,.ts,.m2ts,.webm"
+            ),
+            "scan_interval_hours": 24,
+            "scan_max_files": 20,
+            "scan_dry_run": True,
+            "scan_provider_order": "",
         }
 
     def get_page(self) -> list[dict]:
-        """Render recent processing history."""
+        """Render the latest library scan and recent processing history."""
 
         history = self._load_history()
-        if not history:
+        latest_scan = self._load_latest_scan()
+        cards: list[dict] = []
+        if latest_scan:
+            items = latest_scan.get("items") or []
+            missing = [
+                item
+                for item in items
+                if item.get("status") in {"dry_run", "not_found", "partial", "error"}
+            ]
+            cards.append(
+                {
+                    "component": "VCard",
+                    "props": {"class": "mb-3", "variant": "tonal"},
+                    "content": [
+                        {
+                            "component": "VCardText",
+                            "content": [
+                                {
+                                    "component": "div",
+                                    "props": {"class": "font-weight-bold"},
+                                    "text": (
+                                        f"媒体库扫描 · {latest_scan.get('time', '')} · "
+                                        f"{'仅预览' if latest_scan.get('dry_run') else '自动补全'}"
+                                    ),
+                                },
+                                {
+                                    "component": "div",
+                                    "props": {"class": "text-caption"},
+                                    "text": (
+                                        f"发现 {latest_scan.get('discovered', 0)} · "
+                                        f"检查 {latest_scan.get('checked', 0)} · "
+                                        f"下载 {latest_scan.get('downloaded', 0)} · "
+                                        f"待后续 {latest_scan.get('remaining', 0)}"
+                                    ),
+                                },
+                                {
+                                    "component": "div",
+                                    "props": {"class": "text-caption mt-2"},
+                                    "text": (
+                                        "；".join(
+                                            f"{item.get('title', '')}: "
+                                            f"{item.get('status', '')}"
+                                            for item in missing[:5]
+                                        )
+                                        or "本轮没有发现需要补全的条目"
+                                    ),
+                                },
+                            ],
+                        }
+                    ],
+                }
+            )
+        if not history and not latest_scan:
             return [
                 {
                     "component": "VAlert",
                     "props": {
                         "type": "info",
                         "variant": "tonal",
-                        "text": "暂无记录。启用后会在 MoviePilot 整理完成时自动请求 SubtitleForge。",
+                        "text": "暂无记录。启用媒体库扫描后会定时检查外挂和内嵌中文字幕。",
                     },
                 }
             ]
-        cards: list[dict] = []
         for item in history:
             result = item.get("result") or {}
             downloaded = result.get("downloaded") or []
@@ -777,6 +1105,17 @@ class CSFReborn(_PluginBase):
                 return []
         return value if isinstance(value, list) else []
 
+    def _load_latest_scan(self) -> dict[str, Any]:
+        """Read the most recent library scan summary."""
+
+        value = self.get_data(self._latest_scan_key)
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                return {}
+        return value if isinstance(value, dict) else {}
+
     def _add_history(self, request: dict[str, Any], result: dict[str, Any]) -> None:
         """Append a bounded history entry."""
 
@@ -809,6 +1148,16 @@ class CSFReborn(_PluginBase):
             return int(value) if value not in (None, "") else None
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _split_list(value: str) -> list[str]:
+        """Split comma- or newline-separated configuration values."""
+
+        return [
+            item.strip()
+            for item in str(value or "").replace("\n", ",").split(",")
+            if item.strip()
+        ]
 
 
 __all__ = ["CSFReborn"]

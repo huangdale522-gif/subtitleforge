@@ -15,9 +15,12 @@ from .models import (
     JobRecord,
     ProcessRequest,
     ProcessResult,
+    ScanRequest,
+    ScanResult,
     SearchRequest,
     SubtitleCandidate,
 )
+from .scanner import LibraryScanner
 from .service import SubtitleService
 
 
@@ -35,6 +38,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.service = service
         app.state.store = store
         app.state.jobs = jobs
+        app.state.scanner = LibraryScanner(service, runtime_settings.data_dir)
         try:
             yield
         finally:
@@ -43,7 +47,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(
         title="SubtitleForge",
-        version="0.1.0",
+        version="0.2.0",
         description="Provider-driven Chinese subtitle downloader for NAS and MoviePilot.",
         lifespan=lifespan,
     )
@@ -74,7 +78,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         service: SubtitleService = app.state.service
         return {
             "status": "ok",
-            "version": "0.1.0",
+            "version": "0.2.0",
             "providers": {
                 name: provider.configured
                 for name, provider in service.providers.items()
@@ -143,6 +147,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         jobs: JobManager = app.state.jobs
         return await jobs.submit(request)
+
+    @app.post("/v1/scan", response_model=ScanResult)
+    async def scan_library(
+        request: ScanRequest,
+        _: None = Depends(require_token),
+    ) -> ScanResult:
+        """Scan a bounded batch for videos that still need Chinese subtitles."""
+
+        scanner: LibraryScanner = app.state.scanner
+        return await scanner.scan(request)
 
     @app.get("/v1/jobs/{job_id}", response_model=JobRecord)
     async def get_job(
