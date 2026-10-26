@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -32,7 +35,7 @@ class CSFReborn(_PluginBase):
         "监听 MoviePilot 整理完成事件，调用自建 SubtitleForge 服务下载缺失字幕。"
     )
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.1.1"
+    plugin_version = "0.2.0"
     plugin_author = "SubtitleForge contributors"
     author_url = "https://github.com/"
     plugin_config_prefix = "csfreborn_"
@@ -52,6 +55,9 @@ class CSFReborn(_PluginBase):
         self._dry_run = False
         self._notify = True
         self._timeout = 180
+        self._manage_service = False
+        self._service_dir = Path("/config/subtitleforge")
+        self._managed_process: subprocess.Popen | None = None
         self._history_key = "download_history"
         self._history_max = 30
 
@@ -68,10 +74,18 @@ class CSFReborn(_PluginBase):
         self._overwrite = bool(config.get("overwrite", False))
         self._dry_run = bool(config.get("dry_run", False))
         self._notify = bool(config.get("notify", True))
+        self._manage_service = bool(config.get("manage_service", False))
+        self._service_dir = Path(
+            str(config.get("service_dir") or "/config/subtitleforge")
+        ).expanduser()
         try:
             self._timeout = max(10, int(config.get("timeout") or 180))
         except (TypeError, ValueError):
             self._timeout = 180
+        if self._enabled and self._manage_service:
+            self._ensure_managed_service()
+        else:
+            self._stop_managed_service()
 
     def get_state(self) -> bool:
         """Return whether the plugin is enabled."""
@@ -104,6 +118,71 @@ class CSFReborn(_PluginBase):
             return await asyncio.to_thread(self._request_json, "GET", "/healthz", None)
         except Exception as exc:  # noqa: BLE001 - API should return a useful error
             return {"status": "error", "error": str(exc)}
+
+    def _ensure_managed_service(self) -> None:
+        """Start the local SubtitleForge process once when requested."""
+
+        if self._service_healthy():
+            return
+        source_dir = self._service_dir / "src"
+        app_file = source_dir / "subtitleforge" / "api.py"
+        if not app_file.is_file():
+            logger.error(
+                f"SubtitleForge 服务目录不完整，未找到 {app_file}；"
+                "请检查 service_dir 配置"
+            )
+            return
+        log_dir = self._service_dir / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = str(source_dir)
+        environment["PYTHONUNBUFFERED"] = "1"
+        command = [
+            sys.executable,
+            "-m",
+            "uvicorn",
+            "subtitleforge.api:app",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "8600",
+        ]
+        with (log_dir / "subtitleforge.log").open("ab", buffering=0) as log_file:
+            self._managed_process = subprocess.Popen(
+                command,
+                cwd=self._service_dir,
+                env=environment,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        logger.info(
+            f"SubtitleForge 服务已启动，PID={self._managed_process.pid}, "
+            f"目录={self._service_dir}"
+        )
+
+    def _service_healthy(self) -> bool:
+        """Return whether the configured service answers its health check."""
+
+        try:
+            self._request_json("GET", "/healthz", None, timeout=2)
+            return True
+        except Exception:
+            return False
+
+    def _stop_managed_service(self) -> None:
+        """Stop only the child process started by this plugin instance."""
+
+        process = self._managed_process
+        self._managed_process = None
+        if process is None or process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=3)
 
     @eventmanager.register(EventType.TransferComplete)
     async def on_transfer_complete(self, event: Event) -> None:
@@ -198,7 +277,11 @@ class CSFReborn(_PluginBase):
         return list(dict.fromkeys(path for path in candidates if path))
 
     def _request_json(
-        self, method: str, path: str, payload: dict[str, Any] | None
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None,
+        timeout: float | None = None,
     ) -> Any:
         """Perform a small JSON request without adding another dependency."""
 
@@ -213,7 +296,7 @@ class CSFReborn(_PluginBase):
             headers["Authorization"] = f"Bearer {self._api_token}"
         request = Request(url, data=data, headers=headers, method=method)
         try:
-            with urlopen(request, timeout=self._timeout) as response:
+            with urlopen(request, timeout=timeout or self._timeout) as response:
                 body = response.read().decode("utf-8")
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:500]
@@ -314,6 +397,38 @@ class CSFReborn(_PluginBase):
                         },
                     },
                     {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "manage_service",
+                                            "label": "随插件启动本机服务",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 8},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "service_dir",
+                                            "label": "SubtitleForge 安装目录",
+                                            "placeholder": "/config/subtitleforge",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
                         "component": "VAlert",
                         "props": {
                             "type": "info",
@@ -332,6 +447,8 @@ class CSFReborn(_PluginBase):
             "notify": True,
             "timeout": 180,
             "dry_run": False,
+            "manage_service": False,
+            "service_dir": "/config/subtitleforge",
         }
 
     def get_page(self) -> list[dict]:
@@ -383,9 +500,9 @@ class CSFReborn(_PluginBase):
         return cards
 
     def stop_service(self) -> None:
-        """No persistent resources are held by this adapter."""
+        """Stop the optional local service process owned by this plugin."""
 
-        return
+        self._stop_managed_service()
 
     def _load_history(self) -> list[dict]:
         """Read recent history from plugin data."""

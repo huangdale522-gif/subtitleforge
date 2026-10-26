@@ -3,12 +3,13 @@
     "name": "SubtitleForge 字幕补全",
     "description": "监听 MoviePilot 整理完成事件，调用自建 SubtitleForge 服务下载缺失字幕。",
     "labels": "字幕,自动化",
-    "version": "0.1.1",
+    "version": "0.2.0",
     "icon": "Moviepilot_A.png",
     "author": "SubtitleForge contributors",
     "level": 1,
     "system_version": ">=2.15.0,<3",
     "history": {
+      "v0.2.0": "可在 NAS 的 MoviePilot 容器内随插件启动并管理 SubtitleForge 服务。",
       "v0.1.1": "兼容 MoviePilot 2.15.x 的 V2 插件接口与整理完成事件。",
       "v0.1.0": "首个版本：支持整理完成事件、字幕语言配置、服务健康检查与下载历史。"
     }
