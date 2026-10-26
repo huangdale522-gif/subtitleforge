@@ -417,6 +417,7 @@ class LibraryScanner:
                 languages=request.languages,
                 overwrite=request.overwrite,
                 dry_run=request.dry_run,
+                provider_failover=request.provider_failover,
                 provider_order=request.provider_order,
             )
             try:

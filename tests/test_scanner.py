@@ -20,11 +20,15 @@ from subtitleforge.service import SubtitleService
 class ScanProvider(SubtitleProvider):
     name = "custom"
 
+    def __init__(self) -> None:
+        self.search_calls = 0
+
     @property
     def configured(self) -> bool:
         return True
 
     async def search(self, request: SearchRequest) -> list[SubtitleCandidate]:
+        self.search_calls += 1
         return [
             SubtitleCandidate(
                 provider=self.name,
@@ -101,7 +105,8 @@ async def test_library_scan_downloads_only_missing_subtitles(tmp_path: Path) -> 
         media_roots=str(tmp_path), data_dir=tmp_path / "data", provider_order="custom"
     )
     service = SubtitleService(settings, client=httpx.AsyncClient())
-    service.providers["custom"] = ScanProvider()
+    provider = ScanProvider()
+    service.providers["custom"] = provider
     scanner = LibraryScanner(service, settings.data_dir)
     try:
         result = await scanner.scan(
@@ -137,7 +142,8 @@ async def test_library_scan_honors_exclusions_and_dry_run(tmp_path: Path) -> Non
         media_roots=str(tmp_path), data_dir=tmp_path / "data", provider_order="custom"
     )
     service = SubtitleService(settings, client=httpx.AsyncClient())
-    service.providers["custom"] = ScanProvider()
+    provider = ScanProvider()
+    service.providers["custom"] = provider
     scanner = LibraryScanner(service, settings.data_dir)
     try:
         result = await scanner.scan(
@@ -153,6 +159,7 @@ async def test_library_scan_honors_exclusions_and_dry_run(tmp_path: Path) -> Non
     assert result.discovered == 1
     assert result.downloaded == 0
     assert result.items[0].status == "dry_run"
+    assert provider.search_calls == 0
     assert not (foreign.parent / "Movie.chi.zh-cn.srt").exists()
 
 

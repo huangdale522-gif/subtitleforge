@@ -57,6 +57,7 @@ class ProcessRequest(SearchRequest):
     video_path: str = Field(min_length=1, max_length=4096)
     overwrite: bool = False
     dry_run: bool = False
+    provider_failover: bool = False
     provider_order: list[str] | None = None
 
     @property
@@ -147,6 +148,7 @@ class ScanRequest(BaseModel):
     overwrite: bool = False
     dry_run: bool = True
     retry_after_hours: int = Field(default=24, ge=1, le=24 * 365)
+    provider_failover: bool = True
     provider_order: list[str] | None = None
 
     @model_validator(mode="after")

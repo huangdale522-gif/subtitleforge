@@ -17,12 +17,16 @@ Configuration:
   foreign TV, documentaries, and anime on the NAS layout.
 - `scan_exclude_paths`: paths excluded from scanning, for example Chinese films
   and domestic TV.
-- `scan_dry_run`: only inspect/search and never write subtitles. This is enabled
-  by default until library identification has been reviewed.
+- `scan_dry_run`: only inspect and never write subtitles. This is enabled
+  by default until library identification has been reviewed. Preview mode does
+  not query subtitle providers, so it consumes no provider quota.
 - `scan_interval_hours`: scheduled interval in hours.
 - `scan_max_files`: maximum videos checked per run; the cursor resumes with the
   least recently checked files on the next run.
 - `scan_provider_order`: optional provider order used only by scanning.
+- `scan_languages`: languages required by scanning. The default is Simplified
+  Chinese only to reduce provider download quota; set both languages explicitly
+  if required.
 - `scan_video_extensions`: comma-separated video file extensions.
 - Provider credentials for SubtitleBest, ASSRT, OpenSubtitles, and an optional
   custom JSON source. Blank credential fields preserve values already stored in
@@ -30,8 +34,9 @@ Configuration:
 
 The scan recognizes external subtitles by filename/content and embedded
 subtitles through `ffprobe`. Existing Chinese subtitles are skipped unless
-`overwrite` is enabled. An authenticated `POST /api/v1/plugin/CSFReborn/scan`
-starts a manual scan using the saved settings.
+`overwrite` is enabled. Providers are queried in order and later providers are
+skipped when the first one returns usable candidates. An authenticated
+`POST /api/v1/plugin/CSFReborn/scan` starts a manual scan using saved settings.
 
 Both containers must see the media library at the same path. For example, if
 MoviePilot sees a file as `/media/movies/Film.mkv`, SubtitleForge must also see

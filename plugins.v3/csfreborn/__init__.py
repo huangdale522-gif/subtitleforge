@@ -36,7 +36,7 @@ class CSFReborn(_PluginBase):
         "监听 MoviePilot 整理完成事件，并定时扫描媒体库，为缺少中文字幕的视频自动补全。"
     )
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.3.1"
+    plugin_version = "0.3.2"
     plugin_author = "SubtitleForge contributors"
     author_url = "https://github.com/"
     plugin_config_prefix = "csfreborn_"
@@ -77,9 +77,10 @@ class CSFReborn(_PluginBase):
             ".mkv,.mp4,.avi,.mov,.wmv,.m4v,.ts,.m2ts,.webm"
         )
         self._scan_interval_hours = 24
-        self._scan_max_files = 20
+        self._scan_max_files = 10
         self._scan_dry_run = True
         self._scan_provider_order = ""
+        self._scan_languages = ["zh-Hans"]
         self._managed_process: subprocess.Popen | None = None
         self._scan_running = False
         self._history_key = "download_history"
@@ -134,6 +135,9 @@ class CSFReborn(_PluginBase):
             config.get("scan_video_extensions") or self._scan_video_extensions
         )
         self._scan_dry_run = bool(config.get("scan_dry_run", True))
+        self._scan_languages = list(
+            config.get("scan_languages") or ["zh-Hans"]
+        )
         self._scan_provider_order = str(
             config.get("scan_provider_order") or ""
         )
@@ -145,10 +149,10 @@ class CSFReborn(_PluginBase):
             self._scan_interval_hours = 24
         try:
             self._scan_max_files = min(
-                100, max(1, int(config.get("scan_max_files") or 20))
+                100, max(1, int(config.get("scan_max_files") or 10))
             )
         except (TypeError, ValueError):
-            self._scan_max_files = 20
+            self._scan_max_files = 10
         if not self._api_token:
             self._api_token = self._read_service_token()
         try:
@@ -255,10 +259,11 @@ class CSFReborn(_PluginBase):
             "paths": self._split_list(self._scan_paths),
             "exclude_paths": self._split_list(self._scan_exclude_paths),
             "video_extensions": self._split_list(self._scan_video_extensions),
-            "languages": self._languages,
+            "languages": self._scan_languages or self._languages,
             "max_files": self._scan_max_files,
             "overwrite": self._overwrite,
             "dry_run": self._scan_dry_run,
+            "provider_failover": True,
             "provider_order": (
                 self._split_list(self._scan_provider_order)
                 if self._scan_provider_order
@@ -795,7 +800,28 @@ class CSFReborn(_PluginBase):
                         "props": {
                             "model": "scan_provider_order",
                             "label": "扫描专用字幕源顺序（可选）",
-                            "placeholder": "留空则使用上方字幕源顺序",
+                            "placeholder": "留空则使用上方字幕源顺序，按顺序故障切换",
+                        },
+                    },
+                    {
+                        "component": "VSelect",
+                        "props": {
+                            "model": "scan_languages",
+                            "label": "扫描需要补齐的语言",
+                            "multiple": True,
+                            "chips": True,
+                            "items": [
+                                {"title": "简体中文", "value": "zh-Hans"},
+                                {"title": "繁體中文", "value": "zh-Hant"},
+                            ],
+                        },
+                    },
+                    {
+                        "component": "VAlert",
+                        "props": {
+                            "type": "warning",
+                            "variant": "tonal",
+                            "text": "配额保护：仅当视频确实缺少所选中文时才会访问字幕源；默认只补简体，并按字幕源顺序故障切换，前一个源无结果才查询下一个。",
                         },
                     },
                     {
@@ -985,9 +1011,10 @@ class CSFReborn(_PluginBase):
                 ".mkv,.mp4,.avi,.mov,.wmv,.m4v,.ts,.m2ts,.webm"
             ),
             "scan_interval_hours": 24,
-            "scan_max_files": 20,
+            "scan_max_files": 10,
             "scan_dry_run": True,
             "scan_provider_order": "",
+            "scan_languages": ["zh-Hans"],
         }
 
     def get_page(self) -> list[dict]:

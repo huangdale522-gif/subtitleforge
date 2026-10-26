@@ -46,7 +46,7 @@ class SubtitleService:
         self._client = client or httpx.AsyncClient(
             timeout=settings.request_timeout_seconds,
             follow_redirects=True,
-            headers={"User-Agent": "SubtitleForge/0.2.1"},
+            headers={"User-Agent": "SubtitleForge/0.2.2"},
         )
         self.providers: dict[str, SubtitleProvider] = {
             "subtitle_best": SubtitleBestProvider(
@@ -88,6 +88,7 @@ class SubtitleService:
         self,
         request: SearchRequest,
         provider_order: list[str] | None = None,
+        provider_failover: bool = False,
     ) -> tuple[list[SubtitleCandidate], list[str]]:
         """Search configured providers and return ranked candidates."""
 
@@ -99,7 +100,10 @@ class SubtitleService:
             if not provider.configured:
                 continue
             try:
-                candidates.extend(await provider.search(request))
+                provider_candidates = await provider.search(request)
+                candidates.extend(provider_candidates)
+                if provider_failover and provider_candidates:
+                    break
             except ProviderError as exc:
                 errors.append(f"{name}: {exc}")
         ranked = rank_candidates(
@@ -149,13 +153,18 @@ class SubtitleService:
         if not missing:
             return result
 
-        candidates, errors = await self.search(request, request.provider_order)
+        if request.dry_run:
+            result.status = "dry_run"
+            return result
+
+        candidates, errors = await self.search(
+            request,
+            request.provider_order,
+            request.provider_failover,
+        )
         result.errors.extend(errors)
         if not candidates:
             result.status = "not_found"
-            return result
-        if request.dry_run:
-            result.status = "dry_run"
             return result
 
         unresolved: list[SubtitleLanguage] = []

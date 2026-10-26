@@ -134,9 +134,15 @@ existing Chinese subtitles, and processes a bounded batch:
 }
 ```
 
+With `dry_run: true`, the scanner only reads local subtitles and `ffprobe`
+metadata; it does not call subtitle providers, so a preview consumes no source
+quota. Real runs use provider failover in configured order and stop querying
+after the first provider returns usable candidates.
+
 The scanner records completed files in SQLite. Each scheduled run prioritizes
-files that have never been checked, then the least recently checked files, so a
-large library is covered without repeatedly consuming the first batch's quota.
+files that have never been checked, then the least recently checked files, and
+rotates between media directories so a large library is covered without one
+series filling every batch.
 
 ## Custom provider contract
 
