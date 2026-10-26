@@ -35,7 +35,7 @@ class CSFReborn(_PluginBase):
         "监听 MoviePilot 整理完成事件，调用自建 SubtitleForge 服务下载缺失字幕。"
     )
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.2.0"
+    plugin_version = "0.2.1"
     plugin_author = "SubtitleForge contributors"
     author_url = "https://github.com/"
     plugin_config_prefix = "csfreborn_"
@@ -78,6 +78,8 @@ class CSFReborn(_PluginBase):
         self._service_dir = Path(
             str(config.get("service_dir") or "/config/subtitleforge")
         ).expanduser()
+        if not self._api_token:
+            self._api_token = self._read_service_token()
         try:
             self._timeout = max(10, int(config.get("timeout") or 180))
         except (TypeError, ValueError):
@@ -160,6 +162,20 @@ class CSFReborn(_PluginBase):
             f"SubtitleForge 服务已启动，PID={self._managed_process.pid}, "
             f"目录={self._service_dir}"
         )
+
+    def _read_service_token(self) -> str:
+        """Read the service token from its private env file when not overridden."""
+
+        env_file = self._service_dir / ".env"
+        try:
+            for raw_line in env_file.read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if not line.startswith("SF_API_TOKEN="):
+                    continue
+                return line.split("=", 1)[1].strip().strip("\"'")
+        except OSError:
+            return ""
+        return ""
 
     def _service_healthy(self) -> bool:
         """Return whether the configured service answers its health check."""
