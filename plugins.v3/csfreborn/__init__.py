@@ -1,18 +1,27 @@
-"""MoviePilot V3 adapter for SubtitleForge."""
+"""MoviePilot V2/V3 adapter for SubtitleForge."""
 
 from __future__ import annotations
 
 import asyncio
 import json
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from app.schemas.types import EventType, MessageType
-from app.sdk.events import Event, eventmanager
-from app.sdk.logging import logger
-from app.sdk.plugin import _PluginBase
+from app.schemas.types import EventType
+
+try:
+    from app.sdk.events import Event, eventmanager
+    from app.sdk.logging import logger
+    from app.sdk.plugin import _PluginBase
+    from app.schemas.types import MessageType
+except ImportError:
+    from app.core.event import Event, eventmanager
+    from app.log import logger
+    from app.plugins import _PluginBase
+    from app.schemas.types import NotificationType as MessageType
 
 
 class CSFReborn(_PluginBase):
@@ -23,7 +32,7 @@ class CSFReborn(_PluginBase):
         "监听 MoviePilot 整理完成事件，调用自建 SubtitleForge 服务下载缺失字幕。"
     )
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.1.0"
+    plugin_version = "0.1.1"
     plugin_author = "SubtitleForge contributors"
     author_url = "https://github.com/"
     plugin_config_prefix = "csfreborn_"
@@ -104,19 +113,17 @@ class CSFReborn(_PluginBase):
             return
         data = event.event_data if isinstance(event.event_data, dict) else {}
         transferinfo = data.get("transferinfo")
-        target = getattr(transferinfo, "target_item", None)
         mediainfo = data.get("mediainfo")
         meta = data.get("meta")
-        path = getattr(target, "path", None)
-        if not path:
-            logger.debug("SubtitleForge: TransferComplete has no target path")
+        paths = self._extract_video_paths(transferinfo)
+        if not paths:
+            logger.debug("SubtitleForge: TransferComplete has no video paths")
             return
         if mediainfo is None:
             logger.debug("SubtitleForge: TransferComplete has no mediainfo")
             return
         media_type = self._media_type(getattr(mediainfo, "type", None))
-        payload = {
-            "video_path": str(path),
+        common_payload = {
             "title": str(getattr(mediainfo, "title", "") or ""),
             "original_title": getattr(mediainfo, "original_title", None),
             "english_title": getattr(mediainfo, "en_title", None),
@@ -130,32 +137,65 @@ class CSFReborn(_PluginBase):
             "overwrite": self._overwrite,
             "dry_run": self._dry_run,
         }
-        if not payload["title"]:
+        if not common_payload["title"]:
             logger.warning("SubtitleForge: media title is empty; skip subtitle search")
             return
-        try:
-            result = await asyncio.to_thread(
-                self._request_json, "POST", "/v1/process", payload
+        aggregate: dict[str, Any] = {
+            "status": "ok",
+            "downloaded": [],
+            "errors": [],
+        }
+        for path in paths:
+            payload = {**common_payload, "video_path": str(path)}
+            try:
+                result = await asyncio.to_thread(
+                    self._request_json, "POST", "/v1/process", payload
+                )
+            except Exception as exc:  # noqa: BLE001 - handlers must not crash the host
+                logger.error(f"SubtitleForge 处理失败：{type(exc).__name__}: {exc}")
+                result = {"status": "error", "errors": [str(exc)]}
+            logger.info(
+                f"SubtitleForge: {payload['title']} -> {result.get('status')}, "
+                f"downloaded={len(result.get('downloaded') or [])}"
             )
-        except Exception as exc:  # noqa: BLE001 - event handlers must not crash the host
-            logger.error(f"SubtitleForge 处理失败：{type(exc).__name__}: {exc}")
-            self._add_history(payload, {"status": "error", "errors": [str(exc)]})
-            return
-        logger.info(
-            f"SubtitleForge: {payload['title']} -> {result.get('status')}, "
-            f"downloaded={len(result.get('downloaded') or [])}"
-        )
-        self._add_history(payload, result)
-        if self._notify and result.get("downloaded"):
+            self._add_history(payload, result)
+            aggregate["downloaded"].extend(result.get("downloaded") or [])
+            aggregate["errors"].extend(result.get("errors") or [])
+            if result.get("status") not in (None, "ok", "downloaded"):
+                aggregate["status"] = result.get("status")
+        if self._notify and aggregate["downloaded"]:
             names = "、".join(
                 f"{item.get('language')}:{item.get('candidate')}"
-                for item in result["downloaded"]
+                for item in aggregate["downloaded"]
             )
             self.post_message(
                 mtype=MessageType.Plugin,
-                title=f"字幕已补全 - {payload['title']}",
+                title=f"字幕已补全 - {common_payload['title']}",
                 text=names,
             )
+
+    @staticmethod
+    def _extract_video_paths(transferinfo: Any) -> list[str]:
+        """Read file paths from both MoviePilot V2 and V3 transfer payloads."""
+
+        if transferinfo is None:
+            return []
+        target_dir = getattr(transferinfo, "target_diritem", None)
+        target_dir_path = getattr(target_dir, "path", None)
+        candidates: list[str] = []
+        for item in getattr(transferinfo, "file_list_new", None) or []:
+            item_path = item if isinstance(item, str) else getattr(item, "path", None)
+            if not item_path:
+                continue
+            if target_dir_path and not str(item_path).startswith("/"):
+                item_path = str(Path(target_dir_path) / str(item_path))
+            candidates.append(str(item_path))
+        if not candidates:
+            target_item = getattr(transferinfo, "target_item", None)
+            target_path = getattr(target_item, "path", None)
+            if target_path:
+                candidates.append(str(target_path))
+        return list(dict.fromkeys(path for path in candidates if path))
 
     def _request_json(
         self, method: str, path: str, payload: dict[str, Any] | None
