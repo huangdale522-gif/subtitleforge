@@ -1,0 +1,20 @@
+services:
+  subtitleforge:
+    build: .
+    container_name: subtitleforge
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "8600:8600"
+    volumes:
+      - ./data:/data
+      # Must match MoviePilot's media-library path exactly.
+      - ${MEDIA_ROOT:-/volume1/media}:/media
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8600/healthz', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
