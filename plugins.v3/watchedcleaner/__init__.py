@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from threading import RLock
+from threading import RLock, Thread
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from fastapi import Body
@@ -42,7 +43,7 @@ class WatchedCleaner(_PluginBase):
         "显示海报，支持按季清理、Telegram 图片提醒和人工确认后安全删除。"
     )
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.3.0"
+    plugin_version = "1.3.1"
     plugin_author = "huangdale522-gif"
     author_url = "https://github.com/huangdale522-gif"
     plugin_config_prefix = "watchedcleaner_"
@@ -920,15 +921,7 @@ class WatchedCleaner(_PluginBase):
                 f"处理完成：删除 {counts['deleted']}，预演通过 {counts['dry_run']}，"
                 f"跳过 {counts['skipped']}，失败 {counts['failed']}"
             )
-            self._notify_delete_completed(
-                counts,
-                results,
-                images=[
-                    str(candidate_map[key].get("image") or "").strip()
-                    for key in keys
-                    if key in candidate_map
-                ],
-            )
+            self._notify_delete_completed(counts, results)
             return schemas.Response(
                 success=counts["failed"] == 0,
                 message=message,
@@ -1434,24 +1427,20 @@ class WatchedCleaner(_PluginBase):
     def _notify_scan_completed(
         self, state: Mapping[str, Any], summary: str
     ) -> None:
-        if not self._notify_scan_results:
+        if not self._notify_enabled or not self._notify_scan_results:
             return
         errors = list(state.get("errors") or [])
+        candidates = [
+            candidate
+            for candidate in (state.get("candidates") or [])
+            if isinstance(candidate, Mapping)
+        ]
         text = "\n".join(
             [
                 summary,
                 f"扫描条目：{state.get('scanned', 0)}",
-                f"候选数量：{len(state.get('candidates') or [])}",
-                *(
-                    [
-                        "首条候选："
-                        + self._candidate_display(
-                            (state.get("candidates") or [])[0]
-                        )
-                    ]
-                    if state.get("candidates")
-                    else []
-                ),
+                f"候选数量：{len(candidates)}",
+                f"逐条推送：{len(candidates)} 条（每条带海报）",
                 f"扫描时间：{state.get('created_at') or '-'}",
                 *(
                     [f"错误：{'；'.join(str(item) for item in errors[:3])}"]
@@ -1460,33 +1449,36 @@ class WatchedCleaner(_PluginBase):
                 ),
             ]
         )
-        candidates = list(state.get("candidates") or [])
-        image = (
-            str(candidates[0].get("image") or "").strip()
-            if candidates
-            else ""
-        )
-        self._send_plugin_message(
+        if not self._send_plugin_message(
             title="已观看媒体扫描结果",
             text=text,
-            image=image or None,
-        )
+        ):
+            return
+        if candidates:
+            items = [
+                self._scan_notification_item(candidate)
+                for candidate in candidates
+            ]
+            try:
+                Thread(
+                    target=self._send_notification_items,
+                    args=(items,),
+                    kwargs={"title_prefix": "扫描候选"},
+                    daemon=True,
+                    name="WatchedCleanerScanNotify",
+                ).start()
+            except Exception as error:
+                logger.warning(
+                    f"[已观看媒体清理] 启动逐条扫描推送失败：{error}"
+                )
 
     def _notify_delete_completed(
         self,
         counts: Mapping[str, Any],
         results: List[dict[str, Any]],
-        images: Optional[List[str]] = None,
     ) -> None:
-        if not self._notify_delete_results:
+        if not self._notify_enabled or not self._notify_delete_results:
             return
-        details = []
-        for result in results[:10]:
-            title = str(result.get("title") or "-")
-            status = str(result.get("status") or "-")
-            details.append(f"{title}：{status} {result.get('message') or ''}".strip())
-        if len(results) > 10:
-            details.append(f"另有 {len(results) - 10} 条未展开")
         title = "删除预演完成" if self._dry_run else "媒体删除完成"
         text = "\n".join(
             [
@@ -1496,14 +1488,135 @@ class WatchedCleaner(_PluginBase):
                     f"跳过 {counts.get('skipped', 0)}，"
                     f"失败 {counts.get('failed', 0)}"
                 ),
-                *details,
+                f"逐条推送：{len(results)} 条（每条带海报）",
             ]
         )
-        image = next(
-            (str(item).strip() for item in (images or []) if str(item).strip()),
-            "",
+        if not self._send_plugin_message(title=title, text=text):
+            return
+        if not results:
+            return
+        items = [self._delete_notification_item(result) for result in results]
+        try:
+            Thread(
+                target=self._send_notification_items,
+                args=(items,),
+                kwargs={
+                    "title_prefix": "删除预演" if self._dry_run else "删除结果"
+                },
+                daemon=True,
+                name="WatchedCleanerDeleteNotify",
+            ).start()
+        except Exception as error:
+            logger.warning(
+                f"[已观看媒体清理] 启动逐条删除推送失败：{error}"
+            )
+
+    @staticmethod
+    def _notification_category(candidate: Mapping[str, Any]) -> str:
+        return {
+            "movie": "电影",
+            "tv": "剧集",
+            "anime": "动漫",
+        }.get(str(candidate.get("category") or ""), "媒体")
+
+    @staticmethod
+    def _notification_kind(candidate: Mapping[str, Any]) -> str:
+        return {
+            "movie": "电影",
+            "season": "整季",
+            "series": "整剧",
+            "episode": "单集",
+        }.get(str(candidate.get("kind") or ""), "媒体")
+
+    def _scan_notification_item(
+        self, candidate: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        category = self._notification_category(candidate)
+        path = str(candidate.get("path") or "-")
+        if len(path) > 300:
+            path = path[:297] + "..."
+        lines = [
+            f"分类：{category}",
+            f"内容：{self._candidate_display(candidate)}",
+            f"粒度：{self._notification_kind(candidate)}",
+            f"媒体服务器：{candidate.get('server') or '-'}",
+            f"观看进度：{float(candidate.get('percentage') or 0):.1f}%",
+        ]
+        if candidate.get("added_at"):
+            lines.append(f"入库时间：{candidate.get('added_at')}")
+        if candidate.get("last_played"):
+            lines.append(f"最近播放：{candidate.get('last_played')}")
+        lines.extend(
+            [
+                f"路径：{path}",
+                "",
+                "请到 MoviePilot 插件页勾选后执行删除。",
+            ]
         )
-        self._send_plugin_message(title=title, text=text, image=image or None)
+        return {
+            "category": category,
+            "image": str(candidate.get("image") or "").strip() or None,
+            "text": "\n".join(lines),
+        }
+
+    def _delete_notification_item(
+        self, result: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        status = str(result.get("status") or "")
+        status_label = {
+            "deleted": "已删除",
+            "dry_run": "预演通过",
+            "skipped": "已跳过",
+            "failed": "失败",
+        }.get(status, status or "-")
+        category = self._notification_category(result)
+        lines = [
+            f"分类：{category}",
+            f"内容：{self._candidate_display(result)}",
+            f"处理结果：{status_label}",
+        ]
+        if result.get("message"):
+            lines.append(f"说明：{result.get('message')}")
+        if result.get("path"):
+            lines.append(f"路径：{result.get('path')}")
+        return {
+            "category": category,
+            "image": str(result.get("image") or "").strip() or None,
+            "text": "\n".join(lines),
+        }
+
+    def _send_notification_items(
+        self,
+        items: List[Mapping[str, Any]],
+        *,
+        title_prefix: str,
+        delay_seconds: float = 1.05,
+    ) -> dict[str, int]:
+        total = len(items)
+        sent = 0
+        failed = 0
+        for index, item in enumerate(items, start=1):
+            title = (
+                f"{title_prefix} {index}/{total}"
+                f" · {item.get('category') or '媒体'}"
+            )
+            if self._send_plugin_message(
+                title=title,
+                text=str(item.get("text") or ""),
+                image=str(item.get("image") or "").strip() or None,
+            ):
+                sent += 1
+                failed = 0
+            else:
+                failed += 1
+                if failed >= 3:
+                    logger.warning(
+                        "[已观看媒体清理] Telegram 逐条推送连续失败，已停止本轮推送"
+                    )
+                    break
+            if delay_seconds > 0 and index < total:
+                time.sleep(delay_seconds)
+        return {"sent": sent, "failed": failed, "total": total}
 
     def _load_age_reminder_state(self) -> dict[str, Any]:
         with self._state_lock:
@@ -2143,10 +2256,16 @@ class WatchedCleaner(_PluginBase):
             "category": candidate.get("category"),
             "kind": candidate.get("kind"),
             "title": candidate.get("title"),
+            "series_title": candidate.get("series_title"),
             "season_id": candidate.get("season_id"),
             "season": candidate.get("season"),
+            "season_title": candidate.get("season_title"),
             "episode": candidate.get("episode"),
+            "episode_count": candidate.get("episode_count"),
+            "percentage": candidate.get("percentage"),
+            "added_at": candidate.get("added_at"),
             "path": candidate.get("path"),
+            "image": candidate.get("image"),
             "status": "",
             "message": "",
         }

@@ -26,7 +26,7 @@
     "name": "已观看媒体清理",
     "description": "扫描 Emby/Jellyfin/Plex 的已观看电影、剧集和动漫，显示海报，支持按季清理、Telegram 图片提醒、超期询问和人工确认后安全删除。",
     "labels": "媒体库,清理",
-    "version": "1.3.0",
+    "version": "1.3.1",
     "icon": "Moviepilot_A.png",
     "author": "huangdale522-gif",
     "level": 1,
@@ -34,6 +34,7 @@
     "system_version": ">=3.0.0",
     "v3t": false,
     "history": {
+      "v1.3.1": "扫描和删除结果恢复为每个条目一条 Telegram 消息，每条都附带对应海报，并在后台限速发送以避免图片推送触发限流。",
       "v1.3.0": "候选列表新增电影、剧集和动漫海报；Telegram 扫描、删除和年度询问推送会附带对应媒体图片。",
       "v1.2.0": "新增按季清理：整季已看完时只生成一个季级候选，Emby、Jellyfin 和 Plex 均按季删除，Telegram 年度询问也改为整季确认。",
       "v1.1.0": "新增 Telegram 扫描/删除推送，以及已观看内容入库超过一年后的定时询问；支持 Telegram 按钮删除或保留，删除仍受预演、白名单和二次校验保护。",

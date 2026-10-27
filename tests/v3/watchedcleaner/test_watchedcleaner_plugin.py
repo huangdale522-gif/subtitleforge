@@ -858,13 +858,15 @@ def test_age_reminder_uses_season_scope_for_season_candidate(monkeypatch):
     assert sent[0]["image"] == candidate["image"]
 
 
-def test_candidate_table_renders_poster_and_scan_push_uses_it(monkeypatch):
+def test_candidate_table_and_scan_push_send_one_poster_item_per_candidate(
+    monkeypatch,
+):
     plugin, _ = _plugin(
         monkeypatch,
         notify_enabled=True,
         notify_user="123456789",
     )
-    candidate = {
+    first = {
         "key": candidate_key("Emby", "movie", "movie-1"),
         "server": "Emby",
         "user": "admin",
@@ -876,46 +878,123 @@ def test_candidate_table_renders_poster_and_scan_push_uses_it(monkeypatch):
         "last_played": OLD,
         "path": "/media/Movies/Test.mkv",
     }
+    second = {
+        **first,
+        "key": candidate_key("Emby", "movie", "movie-2"),
+        "item_id": "movie-2",
+        "title": "第二部电影",
+        "image": "http://emby.local:8096/emby/Items/movie-2/Images/Primary",
+        "path": "/media/Movies/Test2.mkv",
+    }
 
-    table = plugin._candidate_table([candidate])
+    table = plugin._candidate_table([first, second])
     row = table["content"][1]["content"][0]
     poster = row["content"][1]["content"][0]
     assert poster["component"] == "VImg"
-    assert poster["props"]["src"] == candidate["image"]
+    assert poster["props"]["src"] == first["image"]
 
+    scheduled = []
+
+    class FakeThread:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def start(self):
+            scheduled.append(self.kwargs)
+
+    monkeypatch.setattr(plugin_module, "Thread", FakeThread)
     sent = []
     plugin.post_message = lambda **kwargs: sent.append(kwargs)
     plugin._notify_scan_completed(
         {
-            "scanned": 1,
-            "candidates": [candidate],
+            "scanned": 2,
+            "candidates": [first, second],
             "created_at": OLD,
             "errors": [],
         },
         "扫描完成",
     )
 
-    assert sent[0]["image"] == candidate["image"]
+    assert sent[0]["image"] is None
+    assert "逐条推送：2 条" in sent[0]["text"]
+    assert scheduled[0]["kwargs"]["title_prefix"] == "扫描候选"
+    items = scheduled[0]["args"][0]
+    assert [item["image"] for item in items] == [
+        first["image"],
+        second["image"],
+    ]
+
+    item_messages = []
+    plugin.post_message = lambda **kwargs: item_messages.append(kwargs)
+    result = plugin._send_notification_items(
+        items,
+        title_prefix="扫描候选",
+        delay_seconds=0,
+    )
+
+    assert result == {"sent": 2, "failed": 0, "total": 2}
+    assert [message["image"] for message in item_messages] == [
+        first["image"],
+        second["image"],
+    ]
+    assert item_messages[0]["title"].startswith("扫描候选 1/2")
+    assert item_messages[1]["title"].startswith("扫描候选 2/2")
 
 
-def test_delete_push_uses_first_available_candidate_poster(monkeypatch):
+def test_delete_push_sends_each_result_with_its_poster(monkeypatch):
     plugin, _ = _plugin(
         monkeypatch,
         notify_enabled=True,
         notify_user="123456789",
     )
+    scheduled = []
+
+    class FakeThread:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def start(self):
+            scheduled.append(self.kwargs)
+
+    monkeypatch.setattr(plugin_module, "Thread", FakeThread)
     sent = []
     plugin.post_message = lambda **kwargs: sent.append(kwargs)
+    results = [
+        {
+            "key": candidate_key("Emby", "movie", "movie-1"),
+            "category": "movie",
+            "kind": "movie",
+            "title": "测试电影",
+            "image": "http://emby.local:8096/emby/Items/movie-1/Images/Primary",
+            "status": "deleted",
+            "message": "完成",
+        },
+        {
+            "key": candidate_key("Emby", "movie", "movie-2"),
+            "category": "movie",
+            "kind": "movie",
+            "title": "第二部电影",
+            "image": "http://emby.local:8096/emby/Items/movie-2/Images/Primary",
+            "status": "skipped",
+            "message": "收藏保护",
+        },
+    ]
 
     plugin._notify_delete_completed(
-        {"deleted": 1, "dry_run": 0, "skipped": 0, "failed": 0},
-        [{"title": "测试电影", "status": "deleted", "message": "完成"}],
-        images=["", "http://emby.local:8096/emby/Items/movie-1/Images/Primary"],
+        {"deleted": 1, "dry_run": 0, "skipped": 1, "failed": 0},
+        results,
     )
 
-    assert sent[0]["image"] == (
-        "http://emby.local:8096/emby/Items/movie-1/Images/Primary"
-    )
+    assert sent[0]["image"] is None
+    assert "逐条推送：2 条" in sent[0]["text"]
+    assert scheduled[0]["kwargs"]["title_prefix"] == "删除预演"
+    items = scheduled[0]["args"][0]
+    assert [item["image"] for item in items] == [
+        results[0]["image"],
+        results[1]["image"],
+    ]
+    assert "已删除" in items[0]["text"]
+    assert "已跳过" in items[1]["text"]
 
 
 def test_telegram_keep_callback_marks_kept_without_delete(monkeypatch):
