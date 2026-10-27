@@ -36,10 +36,11 @@ Configuration:
 
 The scan recognizes external subtitles by filename/content and embedded
 subtitles through `ffprobe`. Every configured video is inspected before any
-subtitle source is queried. Existing Chinese subtitles are skipped unless
-`overwrite` is enabled; missing items are saved in a persistent queue. Providers
-are queried only while consuming that queue, in configured order, and later
-providers are skipped when the first one returns usable candidates. Rate-limit
+subtitle source is queried. Blu-ray `BDMV/STREAM` fragments are ignored because
+they are not standalone media files. Existing Chinese subtitles are skipped
+unless `overwrite` is enabled; missing items are saved in a persistent queue.
+Providers are queried only while consuming that queue, in configured order, and
+later providers are skipped when the first one returns usable candidates. Rate-limit
 or quota responses put that provider into a 24-hour cooldown, and each video is
 limited to three download attempts. Cooldowns persist across service restarts.
 When `notify` is enabled, the notification lists the actual subtitle filenames

@@ -14,7 +14,7 @@ from subtitleforge.models import (
     SubtitleLanguage,
 )
 from subtitleforge.providers.base import SubtitleProvider
-from subtitleforge.scanner import LibraryScanner, parse_media_path
+from subtitleforge.scanner import LibraryScanner, ScanStore, parse_media_path
 from subtitleforge.service import SubtitleService
 
 
@@ -314,3 +314,47 @@ async def test_concurrent_scans_are_serialized_by_daily_quota(tmp_path: Path) ->
     assert first.downloaded + second.downloaded == 1
     assert max(first.downloads_today, second.downloads_today) == 1
     assert provider.search_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_bluray_segments_are_skipped_and_removed_from_queue(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "电影" / "外语电影"
+    normal = root / "Movie (2024)" / "Movie.2024.mkv"
+    segment = root / "Movie (2024)" / "BDMV" / "STREAM" / "00001.m2ts"
+    normal.parent.mkdir(parents=True)
+    segment.parent.mkdir(parents=True)
+    normal.write_bytes(b"video")
+    segment.write_bytes(b"video")
+
+    service = make_service(tmp_path)
+    service.providers["custom"] = ScanProvider()
+    store = ScanStore(service.settings.data_dir)
+    store.upsert_queue_item(
+        segment,
+        {
+            "video_path": str(segment),
+            "title": "STREAM",
+            "media_type": "movie",
+            "languages": ["zh-Hans"],
+        },
+    )
+    scanner = LibraryScanner(service, service.settings.data_dir)
+    try:
+        result = await scanner.scan(
+            ScanRequest(
+                paths=[str(root)],
+                languages=[SubtitleLanguage.SIMPLIFIED],
+                max_files=1,
+                daily_download_limit=1,
+                dry_run=False,
+            )
+        )
+    finally:
+        await service.close()
+
+    assert result.discovered == 1
+    assert result.checked == 1
+    assert segment not in {Path(item.video_path) for item in result.items}
+    assert scanner.queue_status()["total"] == 0

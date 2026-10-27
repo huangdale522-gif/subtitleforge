@@ -36,6 +36,7 @@ IGNORED_DIRECTORIES = {
     "$recycle.bin",
     ".recycle",
     ".trash",
+    "bdmv",
     "lost+found",
 }
 TRAILING_RELEASE_TOKENS = re.compile(
@@ -194,6 +195,15 @@ class ScanStore:
             connection.execute(
                 "DELETE FROM download_queue WHERE video_path = ?",
                 (str(video_path),),
+            )
+            connection.commit()
+
+    def remove_unsupported_media(self) -> None:
+        """Drop queue entries for Blu-ray segments that are not standalone media."""
+
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM download_queue WHERE lower(video_path) LIKE '%/bdmv/%'"
             )
             connection.commit()
 
@@ -571,6 +581,9 @@ class LibraryScanner:
 
     async def _scan_locked(self, request: ScanRequest) -> ScanResult:
         """Inventory every video before downloading a quota-bounded queue batch."""
+
+        if not request.dry_run:
+            self._store.remove_unsupported_media()
 
         roots: list[Path] = []
         errors: list[str] = []

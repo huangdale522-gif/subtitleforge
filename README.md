@@ -23,6 +23,8 @@ installation logic, or MoviePilot integration.
 - MoviePilot V3 adapter that listens for `TransferComplete`.
 - Full-library scans with external and embedded Chinese subtitle detection,
   a persistent missing-subtitle queue, exclusions, and dry-run preview.
+- Blu-ray `BDMV/STREAM` segments are ignored so disc fragments are not treated
+  as independent movies.
 - Separate per-run and per-day download limits, including a daily ledger that
   survives service restarts.
 - Docker image and Compose deployment.
