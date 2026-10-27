@@ -307,6 +307,7 @@ def normalize_record(record: Mapping[str, Any]) -> dict[str, Any]:
     normalized["season_id"] = str(normalized.get("season_id") or "").strip()
     normalized["season_title"] = str(normalized.get("season_title") or "").strip()
     normalized["item_id"] = str(normalized.get("item_id") or "").strip()
+    normalized["image"] = str(normalized.get("image") or "").strip()
     normalized["paths"] = split_values(normalized.get("paths"))
     normalized["genres"] = split_values(normalized.get("genres"))
     normalized["played"] = as_bool(normalized.get("played"))

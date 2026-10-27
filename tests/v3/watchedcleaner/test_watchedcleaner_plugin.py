@@ -334,6 +334,7 @@ def test_emby_parser_uses_user_state_and_file_path():
             "SeriesId": "series-1",
             "SeasonId": "season-1",
             "SeriesName": "测试剧",
+            "SeriesPrimaryImageTag": "series-tag",
             "ParentIndexNumber": 1,
             "IndexNumber": 2,
             "Path": "/media/TV/Test/S01E02.mkv",
@@ -353,6 +354,85 @@ def test_emby_parser_uses_user_state_and_file_path():
     assert record["percentage"] == 95
     assert record["favorite"] is True
     assert record["paths"] == ["/media/TV/Test/S01E02.mkv"]
+    assert record["image"] == (
+        "http://emby.local:8096/emby/Items/series-1/Images/Primary"
+        "?api_key=secret&tag=series-tag"
+    )
+
+
+def test_emby_episode_uses_own_poster_when_series_tag_is_missing():
+    service = SimpleNamespace(
+        type="jellyfin",
+        config=SimpleNamespace(
+            config={"host": "http://jellyfin.local:8096", "apikey": "secret"}
+        ),
+        instance=None,
+    )
+    adapter = EmbyFamilyAdapter("客厅 Jellyfin", service, "jellyfin")
+    record = adapter._record(
+        {
+            "Id": "episode-1",
+            "Type": "Episode",
+            "Name": "第一集",
+            "SeriesId": "series-1",
+            "SeasonId": "season-1",
+            "SeriesName": "测试剧",
+            "ImageTags": {"Primary": "episode-tag"},
+            "ParentIndexNumber": 1,
+            "IndexNumber": 1,
+            "Path": "/media/TV/Test/S01E01.mkv",
+            "UserData": {"Played": True, "LastPlayedDate": OLD},
+        }
+    )
+
+    assert record["image"] == (
+        "http://jellyfin.local:8096/Items/episode-1/Images/Primary"
+        "?api_key=secret&tag=episode-tag"
+    )
+
+
+def test_episode_mode_inherits_series_poster():
+    episode = _movie_record(
+        kind="episode",
+        item_id="ep-1",
+        series_id="show-1",
+        season_id="season-1",
+        title="第一集",
+        series_title="测试剧",
+        season=1,
+        episode=1,
+    )
+    series = _movie_record(
+        kind="series",
+        item_id="show-1",
+        title="测试剧",
+        image="http://emby.local:8096/emby/Items/show-1/Images/Primary",
+    )
+
+    result = _collect_candidates(
+        records=[series, episode],
+        options={
+            "categories": ["tv"],
+            "tv_mode": "episode",
+            "watched_threshold": 90,
+            "min_days_since_played": 7,
+            "min_days_since_added": 7,
+            "protect_favorites": True,
+            "allowed_roots": ["/media"],
+            "anime_keywords": [],
+            "max_candidates": 100,
+        },
+        service_name="Emby",
+        service_type="emby",
+        user_name="admin",
+        user_id="user-1",
+        library_name="电视剧",
+        base_category="tv",
+        scan_id="scan",
+        limit=100,
+    )
+
+    assert result["candidates"][0]["image"] == series["image"]
 
 
 def test_emby_season_refresh_reads_season_children(monkeypatch):
@@ -430,6 +510,7 @@ def test_plex_episode_parser_preserves_season_id():
             "ratingKey": "episode-1",
             "grandparentRatingKey": "series-1",
             "grandparentTitle": "测试剧",
+            "grandparentThumb": "/library/metadata/series-1/thumb/1",
             "parentRatingKey": "season-1",
             "parentIndex": 1,
             "index": 2,
@@ -445,6 +526,10 @@ def test_plex_episode_parser_preserves_season_id():
     assert record["series_id"] == "series-1"
     assert record["season_id"] == "season-1"
     assert record["season"] == 1
+    assert record["image"] == (
+        "http://plex.local:32400/library/metadata/series-1/thumb/1"
+        "?X-Plex-Token=secret"
+    )
 
 
 def test_emby_delete_uses_expected_endpoint_and_token(monkeypatch):
@@ -762,6 +847,7 @@ def test_age_reminder_uses_season_scope_for_season_candidate(monkeypatch):
         "added_at": YEAR_OLD,
         "path": "/media/TV/Test/Season 1",
         "age_days": 400,
+        "image": "http://emby.local:8096/emby/Items/season-1/Images/Primary",
     }
     sent = []
     plugin.post_message = lambda **kwargs: sent.append(kwargs)
@@ -769,6 +855,67 @@ def test_age_reminder_uses_season_scope_for_season_candidate(monkeypatch):
     assert plugin._send_age_reminder(candidate) is True
     assert "测试剧 第1季" in sent[0]["text"]
     assert sent[0]["buttons"][0][0]["text"] == "删除这一季"
+    assert sent[0]["image"] == candidate["image"]
+
+
+def test_candidate_table_renders_poster_and_scan_push_uses_it(monkeypatch):
+    plugin, _ = _plugin(
+        monkeypatch,
+        notify_enabled=True,
+        notify_user="123456789",
+    )
+    candidate = {
+        "key": candidate_key("Emby", "movie", "movie-1"),
+        "server": "Emby",
+        "user": "admin",
+        "category": "movie",
+        "kind": "movie",
+        "title": "测试电影",
+        "image": "http://emby.local:8096/emby/Items/movie-1/Images/Primary",
+        "percentage": 100,
+        "last_played": OLD,
+        "path": "/media/Movies/Test.mkv",
+    }
+
+    table = plugin._candidate_table([candidate])
+    row = table["content"][1]["content"][0]
+    poster = row["content"][1]["content"][0]
+    assert poster["component"] == "VImg"
+    assert poster["props"]["src"] == candidate["image"]
+
+    sent = []
+    plugin.post_message = lambda **kwargs: sent.append(kwargs)
+    plugin._notify_scan_completed(
+        {
+            "scanned": 1,
+            "candidates": [candidate],
+            "created_at": OLD,
+            "errors": [],
+        },
+        "扫描完成",
+    )
+
+    assert sent[0]["image"] == candidate["image"]
+
+
+def test_delete_push_uses_first_available_candidate_poster(monkeypatch):
+    plugin, _ = _plugin(
+        monkeypatch,
+        notify_enabled=True,
+        notify_user="123456789",
+    )
+    sent = []
+    plugin.post_message = lambda **kwargs: sent.append(kwargs)
+
+    plugin._notify_delete_completed(
+        {"deleted": 1, "dry_run": 0, "skipped": 0, "failed": 0},
+        [{"title": "测试电影", "status": "deleted", "message": "完成"}],
+        images=["", "http://emby.local:8096/emby/Items/movie-1/Images/Primary"],
+    )
+
+    assert sent[0]["image"] == (
+        "http://emby.local:8096/emby/Items/movie-1/Images/Primary"
+    )
 
 
 def test_telegram_keep_callback_marks_kept_without_delete(monkeypatch):

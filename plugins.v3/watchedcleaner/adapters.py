@@ -5,6 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
+from urllib.parse import quote, urlencode
 
 from app.sdk.network import RequestUtils
 
@@ -24,7 +25,7 @@ from .policy import (
 EMBY_ITEM_FIELDS = (
     "Path,DateCreated,Genres,ProviderIds,RunTimeTicks,SeriesId,SeriesName,"
     "SeasonId,ParentIndexNumber,IndexNumber,UserDataPlayCount,UserDataLastPlayedDate,"
-    "UserDataPlayedPercentage,UserDataIsFavorite"
+    "UserDataPlayedPercentage,UserDataIsFavorite,ImageTags,SeriesPrimaryImageTag"
 )
 
 
@@ -118,6 +119,10 @@ def _series_record(
             "series_id": series_id,
             "title": title,
             "series_title": title,
+            "image": (
+                series_meta.get("image")
+                or (episode_records[0].get("image") if episode_records else "")
+            ),
             "paths": paths,
             "episodes": episode_records,
             "played": bool(episode_records)
@@ -198,6 +203,11 @@ def _season_record(
             "season_title": season_title,
             "title": series_title,
             "series_title": series_title,
+            "image": (
+                season_meta.get("image")
+                or series_meta.get("image")
+                or (first_episode.get("image") if first_episode else "")
+            ),
             "paths": paths,
             "episodes": episode_records,
             "played": bool(episode_records)
@@ -256,6 +266,7 @@ def _candidate_from_record(
         "season_id": str(record.get("season_id") or "").strip(),
         "title": str(record.get("title") or "").strip(),
         "series_title": str(record.get("series_title") or "").strip(),
+        "image": str(record.get("image") or "").strip(),
         "season": record.get("season"),
         "season_title": str(record.get("season_title") or "").strip(),
         "episode": record.get("episode"),
@@ -363,8 +374,23 @@ def _collect_candidates(
     if tv_mode == "episode":
         for group in grouped.values():
             for episode in group:
+                record = episode
+                if not episode.get("image"):
+                    season_meta = seasons_by_id.get(
+                        str(episode.get("season_id") or "")
+                    )
+                    series_meta = series_by_id.get(
+                        str(episode.get("series_id") or "")
+                    )
+                    image = (
+                        (season_meta or {}).get("image")
+                        or (series_meta or {}).get("image")
+                        or ""
+                    )
+                    if image:
+                        record = {**episode, "image": image}
                 category = classify_category(base_category, library_name, episode, anime_keywords)
-                add_candidate(category, episode)
+                add_candidate(category, record)
     elif tv_mode == "season":
         for season_id, group in grouped_seasons.items():
             first_episode = group[0] if group else {}
@@ -498,6 +524,21 @@ class EmbyFamilyAdapter(MediaAdapter):
         else:
             headers["X-Emby-Token"] = self.api_key
         return headers
+
+    def _image_url(self, item_id: str, image_tag: Any = None) -> str:
+        """Build a poster URL for the browser and Telegram image fetch."""
+        item_id = str(item_id or "").strip()
+        if not item_id:
+            return ""
+        params: dict[str, str] = {"api_key": self.api_key}
+        tag = str(image_tag or "").strip()
+        if tag:
+            params["tag"] = tag
+        return (
+            self._url(f"Items/{quote(item_id, safe='')}/Images/Primary")
+            + "?"
+            + urlencode(params)
+        )
 
     def _get_json(self, path: str, params: Mapping[str, Any] | None = None) -> Any:
         request_params = dict(params or {})
@@ -653,6 +694,15 @@ class EmbyFamilyAdapter(MediaAdapter):
             if kind in {"episode", "season"}
             else str(item.get("Name") or "")
         )
+        image_tags = item.get("ImageTags")
+        image_tags = image_tags if isinstance(image_tags, Mapping) else {}
+        series_image_tag = str(item.get("SeriesPrimaryImageTag") or "").strip()
+        if kind in {"episode", "season"} and series_id and series_image_tag:
+            image_item_id = series_id
+            image_tag = series_image_tag
+        else:
+            image_item_id = str(item.get("Id") or "")
+            image_tag = image_tags.get("Primary")
         return normalize_record(
             {
                 "kind": kind,
@@ -661,6 +711,7 @@ class EmbyFamilyAdapter(MediaAdapter):
                 "season_id": season_id,
                 "title": str(item.get("Name") or ""),
                 "series_title": series_title,
+                "image": self._image_url(image_item_id, image_tag),
                 "season": season_number,
                 "episode": item.get("IndexNumber"),
                 "paths": [path] if path else [],
@@ -872,6 +923,34 @@ class PlexAdapter(MediaAdapter):
         directories = container.get("Directory") or []
         return [item for item in directories if isinstance(item, dict)]
 
+    def _image_url(self, item: Mapping[str, Any], item_type: str) -> str:
+        """Build a Plex poster URL, preferring the show's poster."""
+        if item_type == "episode":
+            image_path = (
+                item.get("grandparentThumb")
+                or item.get("parentThumb")
+                or item.get("thumb")
+            )
+        elif item_type == "season":
+            image_path = item.get("parentThumb") or item.get("thumb")
+        else:
+            image_path = item.get("thumb")
+        image_path = str(image_path or "").strip()
+        if not image_path:
+            item_id = str(item.get("ratingKey") or "").strip()
+            if item_id:
+                image_path = f"/library/metadata/{item_id}/thumb"
+        if not image_path:
+            return ""
+        if image_path.lower().startswith(("http://", "https://")):
+            return image_path
+        separator = "&" if "?" in image_path else "?"
+        return (
+            self._url(image_path)
+            + separator
+            + urlencode({"X-Plex-Token": self.token})
+        )
+
     def _record(self, item: Mapping[str, Any]) -> dict[str, Any]:
         item_type = str(item.get("type") or "").lower()
         view_count = int(item.get("viewCount") or 0)
@@ -945,6 +1024,7 @@ class PlexAdapter(MediaAdapter):
                     if item_type in {"episode", "season"}
                     else str(item.get("title") or "")
                 ),
+                "image": self._image_url(item, item_type),
                 "season": season_number,
                 "episode": item.get("index"),
                 "paths": paths,

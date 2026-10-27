@@ -39,10 +39,10 @@ class WatchedCleaner(_PluginBase):
     plugin_name = "已观看媒体清理"
     plugin_desc = (
         "扫描 Emby/Jellyfin/Plex 的已观看电影、剧集和动漫，"
-        "支持按季清理、Telegram 提醒和人工确认后安全删除。"
+        "显示海报，支持按季清理、Telegram 图片提醒和人工确认后安全删除。"
     )
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.2.0"
+    plugin_version = "1.3.0"
     plugin_author = "huangdale522-gif"
     author_url = "https://github.com/huangdale522-gif"
     plugin_config_prefix = "watchedcleaner_"
@@ -920,7 +920,15 @@ class WatchedCleaner(_PluginBase):
                 f"处理完成：删除 {counts['deleted']}，预演通过 {counts['dry_run']}，"
                 f"跳过 {counts['skipped']}，失败 {counts['failed']}"
             )
-            self._notify_delete_completed(counts, results)
+            self._notify_delete_completed(
+                counts,
+                results,
+                images=[
+                    str(candidate_map[key].get("image") or "").strip()
+                    for key in keys
+                    if key in candidate_map
+                ],
+            )
             return schemas.Response(
                 success=counts["failed"] == 0,
                 message=message,
@@ -1359,6 +1367,7 @@ class WatchedCleaner(_PluginBase):
         return self._send_plugin_message(
             title=f"入库超过 {self._age_reminder_days} 天，是否删除？",
             text=text,
+            image=str(candidate.get("image") or "").strip() or None,
             buttons=buttons,
             userid=self._notify_user,
         )
@@ -1402,6 +1411,7 @@ class WatchedCleaner(_PluginBase):
         buttons: Optional[List[List[dict[str, Any]]]] = None,
         userid: Optional[str] = None,
         source: Optional[str] = None,
+        image: Optional[str] = None,
     ) -> bool:
         if not self._notify_enabled:
             return False
@@ -1411,6 +1421,7 @@ class WatchedCleaner(_PluginBase):
                 mtype=MessageType.Plugin,
                 title=title,
                 text=text,
+                image=image,
                 userid=self._notify_user or userid,
                 source=source,
                 buttons=buttons,
@@ -1431,6 +1442,16 @@ class WatchedCleaner(_PluginBase):
                 summary,
                 f"扫描条目：{state.get('scanned', 0)}",
                 f"候选数量：{len(state.get('candidates') or [])}",
+                *(
+                    [
+                        "首条候选："
+                        + self._candidate_display(
+                            (state.get("candidates") or [])[0]
+                        )
+                    ]
+                    if state.get("candidates")
+                    else []
+                ),
                 f"扫描时间：{state.get('created_at') or '-'}",
                 *(
                     [f"错误：{'；'.join(str(item) for item in errors[:3])}"]
@@ -1439,12 +1460,23 @@ class WatchedCleaner(_PluginBase):
                 ),
             ]
         )
-        self._send_plugin_message(title="已观看媒体扫描结果", text=text)
+        candidates = list(state.get("candidates") or [])
+        image = (
+            str(candidates[0].get("image") or "").strip()
+            if candidates
+            else ""
+        )
+        self._send_plugin_message(
+            title="已观看媒体扫描结果",
+            text=text,
+            image=image or None,
+        )
 
     def _notify_delete_completed(
         self,
         counts: Mapping[str, Any],
         results: List[dict[str, Any]],
+        images: Optional[List[str]] = None,
     ) -> None:
         if not self._notify_delete_results:
             return
@@ -1467,7 +1499,11 @@ class WatchedCleaner(_PluginBase):
                 *details,
             ]
         )
-        self._send_plugin_message(title=title, text=text)
+        image = next(
+            (str(item).strip() for item in (images or []) if str(item).strip()),
+            "",
+        )
+        self._send_plugin_message(title=title, text=text, image=image or None)
 
     def _load_age_reminder_state(self) -> dict[str, Any]:
         with self._state_lock:
@@ -1835,6 +1871,7 @@ class WatchedCleaner(_PluginBase):
     def _candidate_table(self, candidates: List[dict[str, Any]]) -> dict[str, Any]:
         headers = [
             "",
+            "海报",
             "分类",
             "粒度",
             "标题",
@@ -1894,6 +1931,32 @@ class WatchedCleaner(_PluginBase):
                                     "aria-label": f"选择 {candidate.get('title')}",
                                 },
                             }
+                        ],
+                    },
+                    {
+                        "component": "td",
+                        "content": [
+                            (
+                                {
+                                    "component": "VImg",
+                                    "props": {
+                                        "src": str(candidate.get("image") or ""),
+                                        "alt": str(candidate.get("title") or "媒体海报"),
+                                        "width": 44,
+                                        "height": 66,
+                                        "cover": True,
+                                        "class": "rounded",
+                                    },
+                                }
+                                if candidate.get("image")
+                                else {
+                                    "component": "VIcon",
+                                    "props": {
+                                        "icon": "mdi-image-off-outline",
+                                        "size": 20,
+                                    },
+                                }
+                            )
                         ],
                     },
                     {"component": "td", "text": category},
