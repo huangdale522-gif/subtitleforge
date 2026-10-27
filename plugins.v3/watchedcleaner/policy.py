@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping, Sequence
 
 CATEGORIES = ("movie", "tv", "anime")
-TV_MODES = ("episode", "series")
+TV_MODES = ("season", "series", "episode")
 DEFAULT_ANIME_KEYWORDS = (
     "动漫",
     "动画",
@@ -78,8 +78,8 @@ def normalize_categories(value: Any) -> list[str]:
 
 def normalize_tv_mode(value: Any) -> str:
     """Return a supported TV deletion mode."""
-    mode = str(value or "episode").strip().lower()
-    return mode if mode in TV_MODES else "episode"
+    mode = str(value or "season").strip().lower()
+    return mode if mode in TV_MODES else "season"
 
 
 def parse_timestamp(value: Any) -> datetime | None:
@@ -246,14 +246,16 @@ def record_block_reason(record: Mapping[str, Any], options: Mapping[str, Any]) -
         return "收藏条目受保护"
 
     episodes = list(record.get("episodes") or [])
-    if record.get("kind") == "series":
+    kind = str(record.get("kind") or "")
+    if kind in {"season", "series"}:
+        unit = "整季" if kind == "season" else "整剧"
         if not episodes:
-            return "未找到已入库分集，无法确认整剧已看完"
+            return f"未找到已入库分集，无法确认{unit}已看完"
         unfinished = sum(1 for episode in episodes if not is_watched(episode, threshold))
         if unfinished:
             return f"仍有 {unfinished} 集未达到观看阈值"
         if protect_favorites and any(as_bool(episode.get("favorite")) for episode in episodes):
-            return "至少一集已收藏，整剧删除受保护"
+            return f"至少一集已收藏，{unit}删除受保护"
         paths = [
             path
             for episode in episodes
@@ -302,6 +304,8 @@ def normalize_record(record: Mapping[str, Any]) -> dict[str, Any]:
     normalized["title"] = str(normalized.get("title") or "").strip()
     normalized["series_title"] = str(normalized.get("series_title") or "").strip()
     normalized["series_id"] = str(normalized.get("series_id") or "").strip()
+    normalized["season_id"] = str(normalized.get("season_id") or "").strip()
+    normalized["season_title"] = str(normalized.get("season_title") or "").strip()
     normalized["item_id"] = str(normalized.get("item_id") or "").strip()
     normalized["paths"] = split_values(normalized.get("paths"))
     normalized["genres"] = split_values(normalized.get("genres"))

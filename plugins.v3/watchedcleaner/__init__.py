@@ -39,10 +39,10 @@ class WatchedCleaner(_PluginBase):
     plugin_name = "已观看媒体清理"
     plugin_desc = (
         "扫描 Emby/Jellyfin/Plex 的已观看电影、剧集和动漫，"
-        "支持 Telegram 提醒和人工确认后安全删除。"
+        "支持按季清理、Telegram 提醒和人工确认后安全删除。"
     )
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     plugin_author = "huangdale522-gif"
     author_url = "https://github.com/huangdale522-gif"
     plugin_config_prefix = "watchedcleaner_"
@@ -53,7 +53,7 @@ class WatchedCleaner(_PluginBase):
     _server_name = ""
     _server_user = ""
     _categories = list(CATEGORIES)
-    _tv_mode = "episode"
+    _tv_mode = "season"
     _watched_threshold = 90.0
     _min_days_since_played = 7
     _min_days_since_added = 7
@@ -280,11 +280,12 @@ class WatchedCleaner(_PluginBase):
             self._field(
                 "VSelect",
                 "tv_mode",
-                "电视剧删除粒度",
+                "剧集/动漫清理粒度",
                 md=5,
                 items=[
+                    {"title": "按季：整季看完后删除该季", "value": "season"},
+                    {"title": "按整剧：全剧看完后删除整部剧", "value": "series"},
                     {"title": "仅删除已看的单集", "value": "episode"},
-                    {"title": "整剧都看完后删除整部剧", "value": "series"},
                 ],
             ),
             self._field(
@@ -958,6 +959,7 @@ class WatchedCleaner(_PluginBase):
                 "enabled": self._enabled,
                 "dry_run": self._dry_run,
                 "allow_delete": self._allow_delete,
+                "tv_mode": self._tv_mode,
                 "has_allowed_roots": bool(valid_roots(split_values(self._allowed_roots))),
                 "telegram": {
                     "enabled": self._notify_enabled,
@@ -1312,7 +1314,9 @@ class WatchedCleaner(_PluginBase):
             "anime": "动漫",
         }.get(str(candidate.get("category") or ""), "媒体")
         kind = str(candidate.get("kind") or "")
-        if kind == "series":
+        if kind == "season":
+            action_label = "删除这一季"
+        elif kind == "series":
             action_label = "删除整部剧"
         elif kind == "episode":
             action_label = "删除这一集"
@@ -1366,6 +1370,15 @@ class WatchedCleaner(_PluginBase):
     def _candidate_display(candidate: Mapping[str, Any]) -> str:
         kind = str(candidate.get("kind") or "")
         title = str(candidate.get("title") or "-")
+        if kind == "season":
+            series_title = str(candidate.get("series_title") or title)
+            season = candidate.get("season")
+            season_label = (
+                f"第{season}季"
+                if season is not None
+                else str(candidate.get("season_title") or "未知季")
+            )
+            return f"{series_title} {season_label}"
         if kind == "episode":
             series_title = str(candidate.get("series_title") or title)
             season = candidate.get("season")
@@ -1837,6 +1850,18 @@ class WatchedCleaner(_PluginBase):
             if kind == "movie":
                 kind_label = "电影"
                 episode_label = "-"
+            elif kind == "season":
+                kind_label = "整季"
+                season = candidate.get("season")
+                season_label = (
+                    f"第{season}季"
+                    if season is not None
+                    else str(candidate.get("season_title") or "未知季")
+                )
+                episode_label = (
+                    f"{season_label} · "
+                    f"{candidate.get('episode_count', 0)} 集"
+                )
             elif kind == "series":
                 kind_label = "整剧"
                 episode_label = f"{candidate.get('episode_count', 0)} 集"
@@ -2055,6 +2080,7 @@ class WatchedCleaner(_PluginBase):
             "category": candidate.get("category"),
             "kind": candidate.get("kind"),
             "title": candidate.get("title"),
+            "season_id": candidate.get("season_id"),
             "season": candidate.get("season"),
             "episode": candidate.get("episode"),
             "path": candidate.get("path"),
@@ -2064,7 +2090,7 @@ class WatchedCleaner(_PluginBase):
 
     @staticmethod
     def _record_paths(record: Mapping[str, Any]) -> list[str]:
-        if record.get("kind") == "series":
+        if record.get("kind") in {"season", "series"}:
             return [
                 path
                 for episode in (record.get("episodes") or [])

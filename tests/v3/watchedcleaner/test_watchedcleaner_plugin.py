@@ -6,10 +6,15 @@ from types import SimpleNamespace
 import app.plugins.watchedcleaner as plugin_module
 from app.plugins.watchedcleaner import WatchedCleaner
 from app.plugins.watchedcleaner import adapters as adapter_module
-from app.plugins.watchedcleaner.adapters import EmbyFamilyAdapter, _collect_candidates
+from app.plugins.watchedcleaner.adapters import (
+    EmbyFamilyAdapter,
+    PlexAdapter,
+    _collect_candidates,
+)
 from app.plugins.watchedcleaner.policy import (
     candidate_key,
     normalize_record,
+    normalize_tv_mode,
     path_allowed,
     record_block_reason,
 )
@@ -135,6 +140,123 @@ def test_series_mode_requires_every_episode_to_be_watched():
     assert result["skipped"]["仍有 1 集未达到观看阈值"] == 1
 
 
+def test_season_mode_groups_watched_episodes_into_one_season_candidate():
+    episodes = [
+        _movie_record(
+            kind="episode",
+            item_id="ep-1",
+            series_id="show-1",
+            season_id="season-1",
+            title="第一集",
+            series_title="测试剧",
+            season=1,
+            episode=1,
+            paths=["/media/TV/Test/S01E01.mkv"],
+        ),
+        _movie_record(
+            kind="episode",
+            item_id="ep-2",
+            series_id="show-1",
+            season_id="season-1",
+            title="第二集",
+            series_title="测试剧",
+            season=1,
+            episode=2,
+            paths=["/media/TV/Test/S01E02.mkv"],
+        ),
+        _movie_record(
+            kind="episode",
+            item_id="ep-3",
+            series_id="show-1",
+            season_id="season-2",
+            title="第三集",
+            series_title="测试剧",
+            season=2,
+            episode=1,
+            paths=["/media/TV/Test/S02E01.mkv"],
+            played=False,
+            percentage=50,
+        ),
+    ]
+    options = {
+        "categories": ["tv"],
+        "tv_mode": "season",
+        "watched_threshold": 90,
+        "min_days_since_played": 7,
+        "min_days_since_added": 7,
+        "protect_favorites": True,
+        "allowed_roots": ["/media"],
+        "anime_keywords": ["anime"],
+        "max_candidates": 100,
+    }
+
+    result = _collect_candidates(
+        records=episodes,
+        options=options,
+        service_name="Emby",
+        service_type="emby",
+        user_name="admin",
+        user_id="user-1",
+        library_name="电视剧",
+        base_category="tv",
+        scan_id="scan",
+        limit=100,
+    )
+
+    assert len(result["candidates"]) == 1
+    candidate = result["candidates"][0]
+    assert candidate["kind"] == "season"
+    assert candidate["item_id"] == "season-1"
+    assert candidate["series_id"] == "show-1"
+    assert candidate["season"] == 1
+    assert candidate["episode_count"] == 2
+    assert candidate["paths"] == [
+        "/media/TV/Test/S01E01.mkv",
+        "/media/TV/Test/S01E02.mkv",
+    ]
+    assert result["skipped"]["仍有 1 集未达到观看阈值"] == 1
+
+
+def test_tv_mode_defaults_to_season_and_skips_specials():
+    episode = _movie_record(
+        kind="episode",
+        item_id="special-1",
+        series_id="show-1",
+        season_id="season-0",
+        title="特别篇",
+        series_title="测试剧",
+        season=0,
+        episode=1,
+    )
+
+    assert normalize_tv_mode("") == "season"
+    result = _collect_candidates(
+        records=[episode],
+        options={
+            "categories": ["tv"],
+            "tv_mode": "",
+            "watched_threshold": 90,
+            "min_days_since_played": 7,
+            "min_days_since_added": 7,
+            "protect_favorites": True,
+            "allowed_roots": ["/media"],
+            "anime_keywords": [],
+            "max_candidates": 100,
+        },
+        service_name="Emby",
+        service_type="emby",
+        user_name="admin",
+        user_id="user-1",
+        library_name="电视剧",
+        base_category="tv",
+        scan_id="scan",
+        limit=100,
+    )
+
+    assert result["candidates"] == []
+    assert result["skipped"]["特别篇（第0季）不参与按季清理"] == 1
+
+
 def test_anime_library_is_classified_without_losing_delete_granularity():
     episode = _movie_record(
         kind="episode",
@@ -210,6 +332,7 @@ def test_emby_parser_uses_user_state_and_file_path():
             "Type": "Episode",
             "Name": "第一集",
             "SeriesId": "series-1",
+            "SeasonId": "season-1",
             "SeriesName": "测试剧",
             "ParentIndexNumber": 1,
             "IndexNumber": 2,
@@ -226,9 +349,102 @@ def test_emby_parser_uses_user_state_and_file_path():
     )
 
     assert record["kind"] == "episode"
+    assert record["season_id"] == "season-1"
     assert record["percentage"] == 95
     assert record["favorite"] is True
     assert record["paths"] == ["/media/TV/Test/S01E02.mkv"]
+
+
+def test_emby_season_refresh_reads_season_children(monkeypatch):
+    service = SimpleNamespace(
+        type="emby",
+        config=SimpleNamespace(
+            config={"host": "http://emby.local:8096", "apikey": "secret"}
+        ),
+        instance=None,
+    )
+    adapter = EmbyFamilyAdapter("客厅 Emby", service, "emby")
+    season_item = {
+        "Id": "season-1",
+        "Type": "Season",
+        "Name": "第1季",
+        "SeriesId": "series-1",
+        "SeriesName": "测试剧",
+        "IndexNumber": 1,
+    }
+    episode_item = {
+        "Id": "episode-1",
+        "Type": "Episode",
+        "Name": "第一集",
+        "SeriesId": "series-1",
+        "SeasonId": "season-1",
+        "SeriesName": "测试剧",
+        "ParentIndexNumber": 1,
+        "IndexNumber": 1,
+        "Path": "/media/TV/Test/S01E01.mkv",
+        "DateCreated": OLD,
+        "UserData": {"Played": True, "LastPlayedDate": OLD},
+    }
+    monkeypatch.setattr(
+        adapter,
+        "_get_item",
+        lambda user_id, item_id: season_item if item_id == "season-1" else {
+            "Id": "series-1",
+            "Type": "Series",
+            "Name": "测试剧",
+        },
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_list_items",
+        lambda user_id, **kwargs: [episode_item],
+    )
+
+    record = adapter.refresh(
+        {
+            "kind": "season",
+            "item_id": "season-1",
+            "user_id": "user-1",
+        }
+    )
+
+    assert record["kind"] == "season"
+    assert record["item_id"] == "season-1"
+    assert record["series_id"] == "series-1"
+    assert record["season"] == 1
+    assert len(record["episodes"]) == 1
+
+
+def test_plex_episode_parser_preserves_season_id():
+    service = SimpleNamespace(
+        type="plex",
+        config=SimpleNamespace(
+            config={"host": "http://plex.local:32400", "token": "secret"}
+        ),
+        instance=None,
+    )
+    adapter = PlexAdapter("客厅 Plex", service)
+    record = adapter._record(
+        {
+            "type": "episode",
+            "ratingKey": "episode-1",
+            "grandparentRatingKey": "series-1",
+            "grandparentTitle": "测试剧",
+            "parentRatingKey": "season-1",
+            "parentIndex": 1,
+            "index": 2,
+            "title": "第二集",
+            "viewCount": 1,
+            "addedAt": 1,
+            "lastViewedAt": 2,
+            "Media": [{"Part": [{"file": "/media/TV/Test/S01E02.mkv"}]}],
+        }
+    )
+
+    assert record["kind"] == "episode"
+    assert record["series_id"] == "series-1"
+    assert record["season_id"] == "season-1"
+    assert record["season"] == 1
 
 
 def test_emby_delete_uses_expected_endpoint_and_token(monkeypatch):
@@ -521,6 +737,38 @@ def test_age_reminder_cooldown_prevents_duplicate(monkeypatch):
     assert (
         plugin._eligible_age_reminder_candidates([candidate], state) == []
     )
+
+
+def test_age_reminder_uses_season_scope_for_season_candidate(monkeypatch):
+    plugin, _ = _plugin(
+        monkeypatch,
+        notify_enabled=True,
+        notify_user="123456789",
+        age_reminder_enabled=True,
+    )
+    key = candidate_key("Emby", "season", "season-1")
+    candidate = {
+        "key": key,
+        "server": "Emby",
+        "category": "tv",
+        "kind": "season",
+        "item_id": "season-1",
+        "season_id": "season-1",
+        "title": "测试剧",
+        "series_title": "测试剧",
+        "season": 1,
+        "episode_count": 12,
+        "percentage": 100,
+        "added_at": YEAR_OLD,
+        "path": "/media/TV/Test/Season 1",
+        "age_days": 400,
+    }
+    sent = []
+    plugin.post_message = lambda **kwargs: sent.append(kwargs)
+
+    assert plugin._send_age_reminder(candidate) is True
+    assert "测试剧 第1季" in sent[0]["text"]
+    assert sent[0]["buttons"][0][0]["text"] == "删除这一季"
 
 
 def test_telegram_keep_callback_marks_kept_without_delete(monkeypatch):

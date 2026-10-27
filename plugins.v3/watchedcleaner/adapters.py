@@ -14,6 +14,7 @@ from .policy import (
     classify_category,
     iso_timestamp,
     normalize_record,
+    normalize_tv_mode,
     newest_timestamp,
     percentage,
     record_block_reason,
@@ -22,7 +23,7 @@ from .policy import (
 
 EMBY_ITEM_FIELDS = (
     "Path,DateCreated,Genres,ProviderIds,RunTimeTicks,SeriesId,SeriesName,"
-    "ParentIndexNumber,IndexNumber,UserDataPlayCount,UserDataLastPlayedDate,"
+    "SeasonId,ParentIndexNumber,IndexNumber,UserDataPlayCount,UserDataLastPlayedDate,"
     "UserDataPlayedPercentage,UserDataIsFavorite"
 )
 
@@ -137,6 +138,94 @@ def _series_record(
     )
 
 
+def _season_record(
+    season_id: str,
+    episodes: Sequence[Mapping[str, Any]],
+    season_meta: Mapping[str, Any] | None = None,
+    series_meta: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build a normalized season record from all currently stored episodes."""
+    episode_records = [normalize_record(item) for item in episodes]
+    season_meta = normalize_record(season_meta or {})
+    series_meta = normalize_record(series_meta or {})
+    first_episode = episode_records[0] if episode_records else {}
+    paths = [
+        path
+        for episode in episode_records
+        for path in (episode.get("paths") or [])
+    ]
+    series_id = (
+        season_meta.get("series_id")
+        or first_episode.get("series_id")
+        or series_meta.get("item_id")
+        or ""
+    )
+    season_number = (
+        season_meta.get("season")
+        if season_meta.get("season") is not None
+        else first_episode.get("season")
+    )
+    series_title = (
+        series_meta.get("title")
+        or season_meta.get("series_title")
+        or first_episode.get("series_title")
+        or season_meta.get("title")
+        or season_id
+    )
+    season_title = (
+        season_meta.get("title")
+        or (
+            f"第{season_number}季"
+            if season_number is not None
+            else "未知季"
+        )
+    )
+    genres = list(
+        series_meta.get("genres")
+        or season_meta.get("genres")
+        or []
+    )
+    if not genres:
+        for episode in episode_records:
+            genres.extend(episode.get("genres") or [])
+    return normalize_record(
+        {
+            "kind": "season",
+            "item_id": season_id,
+            "series_id": series_id,
+            "season_id": season_id,
+            "season": season_number,
+            "season_title": season_title,
+            "title": series_title,
+            "series_title": series_title,
+            "paths": paths,
+            "episodes": episode_records,
+            "played": bool(episode_records)
+            and all(as_bool(episode.get("played")) for episode in episode_records),
+            "percentage": min(
+                (percentage(episode) for episode in episode_records),
+                default=0.0,
+            ),
+            "last_played": newest_timestamp(
+                [episode.get("last_played") for episode in episode_records]
+            ),
+            "added_at": newest_timestamp(
+                [episode.get("added_at") for episode in episode_records]
+            ),
+            "favorite": any(as_bool(episode.get("favorite")) for episode in episode_records),
+            "genres": genres,
+        }
+    )
+
+
+def _season_number(value: Any) -> int | None:
+    """Return a numeric season index when the media server provides one."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _candidate_from_record(
     *,
     service_name: str,
@@ -164,9 +253,11 @@ def _candidate_from_record(
         "kind": kind,
         "item_id": item_id,
         "series_id": str(record.get("series_id") or "").strip(),
+        "season_id": str(record.get("season_id") or "").strip(),
         "title": str(record.get("title") or "").strip(),
         "series_title": str(record.get("series_title") or "").strip(),
         "season": record.get("season"),
+        "season_title": str(record.get("season_title") or "").strip(),
         "episode": record.get("episode"),
         "episode_count": len(episodes),
         "path": paths[0] if paths else "",
@@ -197,7 +288,7 @@ def _collect_candidates(
 ) -> dict[str, Any]:
     """Apply watched/safety policy and group records into selectable candidates."""
     categories = set(split_values(options.get("categories")))
-    tv_mode = str(options.get("tv_mode") or "episode")
+    tv_mode = normalize_tv_mode(options.get("tv_mode"))
     anime_keywords = split_values(options.get("anime_keywords"))
     skipped: dict[str, int] = {}
     candidates: list[dict[str, Any]] = []
@@ -211,6 +302,11 @@ def _collect_candidates(
         str(record.get("item_id")): record
         for record in normalized
         if record.get("kind") == "series" and record.get("item_id")
+    }
+    seasons_by_id = {
+        str(record.get("item_id")): record
+        for record in normalized
+        if record.get("kind") == "season" and record.get("item_id")
     }
 
     def add_candidate(category: str, record: Mapping[str, Any]) -> None:
@@ -244,6 +340,7 @@ def _collect_candidates(
         add_candidate(category, record)
 
     grouped: dict[str, list[Mapping[str, Any]]] = {}
+    grouped_seasons: dict[str, list[Mapping[str, Any]]] = {}
     for episode in episodes:
         series_id = str(episode.get("series_id") or "").strip()
         if not series_id:
@@ -254,35 +351,75 @@ def _collect_candidates(
                 skipped["分集缺少剧集标识"] = skipped.get("分集缺少剧集标识", 0) + 1
             continue
         grouped.setdefault(series_id, []).append(episode)
+        if tv_mode == "season":
+            season_id = str(episode.get("season_id") or "").strip()
+            if not season_id:
+                skipped["分集缺少季标识，无法按季删除"] = (
+                    skipped.get("分集缺少季标识，无法按季删除", 0) + 1
+                )
+                continue
+            grouped_seasons.setdefault(season_id, []).append(episode)
 
     if tv_mode == "episode":
         for group in grouped.values():
             for episode in group:
                 category = classify_category(base_category, library_name, episode, anime_keywords)
                 add_candidate(category, episode)
-    else:
-        for series_id, group in grouped.items():
-            series_meta = series_by_id.get(series_id)
-            combined_for_category = normalize_record(
-                {
-                    "title": (series_meta or {}).get("title"),
-                    "series_title": (series_meta or {}).get("title")
-                    or (group[0].get("series_title") if group else ""),
-                    "genres": (series_meta or {}).get("genres") or [],
-                    "paths": [
-                        path
-                        for episode in group
-                        for path in (episode.get("paths") or [])
-                    ],
-                }
+    elif tv_mode == "season":
+        for season_id, group in grouped_seasons.items():
+            first_episode = group[0] if group else {}
+            season_index = _season_number(first_episode.get("season"))
+            if season_index == 0:
+                skipped["特别篇（第0季）不参与按季清理"] = (
+                    skipped.get("特别篇（第0季）不参与按季清理", 0) + 1
+                )
+                continue
+            series_id = str(first_episode.get("series_id") or "").strip()
+            season_record = _season_record(
+                season_id,
+                group,
+                seasons_by_id.get(season_id),
+                series_by_id.get(series_id),
             )
             category = classify_category(
                 base_category,
                 library_name,
-                combined_for_category,
+                season_record,
                 anime_keywords,
             )
-            add_candidate(category, _series_record(series_id, group, series_meta))
+            add_candidate(category, season_record)
+
+        # A season without episode records cannot prove that every stored
+        # episode was watched, so it is deliberately not a deletion candidate.
+        for season_id, record in seasons_by_id.items():
+            if season_id in grouped_seasons:
+                continue
+            if _season_number(record.get("season")) == 0:
+                continue
+            category = classify_category(
+                base_category,
+                library_name,
+                record,
+                anime_keywords,
+            )
+            if category in categories:
+                reason = "未找到已入库分集，无法确认整季已看完"
+                skipped[reason] = skipped.get(reason, 0) + 1
+    else:
+        for series_id, group in grouped.items():
+            series_meta = series_by_id.get(series_id)
+            series_record = _series_record(
+                series_id,
+                group,
+                series_meta,
+            )
+            category = classify_category(
+                base_category,
+                library_name,
+                series_record,
+                anime_keywords,
+            )
+            add_candidate(category, series_record)
 
         # A series without episode records cannot prove that every stored
         # episode was watched, so it is deliberately not a deletion candidate.
@@ -430,7 +567,7 @@ class EmbyFamilyAdapter(MediaAdapter):
         user_id: str,
         *,
         parent_id: str = "",
-        item_types: str = "Movie,Series,Episode",
+        item_types: str = "Movie,Series,Season,Episode",
     ) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
         start = 0
@@ -493,24 +630,38 @@ class EmbyFamilyAdapter(MediaAdapter):
         kind = {
             "movie": "movie",
             "series": "series",
+            "season": "season",
             "episode": "episode",
         }.get(item_type, item_type)
         path = str(item.get("Path") or "").strip()
-        series_id = str(
-            item.get("SeriesId")
-            or (item.get("Id") if kind == "series" else "")
+        if kind == "series":
+            series_id = str(item.get("Id") or "").strip()
+        else:
+            series_id = str(item.get("SeriesId") or "").strip()
+        season_id = str(
+            item.get("SeasonId")
+            or (item.get("Id") if kind == "season" else "")
             or ""
         ).strip()
+        season_number = (
+            item.get("ParentIndexNumber")
+            if kind == "episode"
+            else item.get("IndexNumber") if kind == "season" else None
+        )
+        series_title = (
+            str(item.get("SeriesName") or item.get("Name") or "")
+            if kind in {"episode", "season"}
+            else str(item.get("Name") or "")
+        )
         return normalize_record(
             {
                 "kind": kind,
                 "item_id": str(item.get("Id") or ""),
                 "series_id": series_id,
+                "season_id": season_id,
                 "title": str(item.get("Name") or ""),
-                "series_title": str(item.get("SeriesName") or item.get("Name") or "")
-                if kind == "episode"
-                else str(item.get("Name") or ""),
-                "season": item.get("ParentIndexNumber"),
+                "series_title": series_title,
+                "season": season_number,
                 "episode": item.get("IndexNumber"),
                 "paths": [path] if path else [],
                 "played": played,
@@ -597,6 +748,45 @@ class EmbyFamilyAdapter(MediaAdapter):
         item_id = str(candidate.get("item_id") or "")
         if not item_id:
             raise AdapterError("候选缺少媒体条目标识")
+        if candidate.get("kind") == "season":
+            episodes = [
+                self._record(item)
+                for item in self._list_items(
+                    user_id,
+                    parent_id=item_id,
+                    item_types="Episode",
+                )
+            ]
+            season_meta: dict[str, Any] = {}
+            try:
+                season_meta = self._record(self._get_item(user_id, item_id))
+            except AdapterError:
+                pass
+            series_meta: dict[str, Any] = {}
+            series_id = str(
+                season_meta.get("series_id")
+                or next(
+                    (
+                        episode.get("series_id")
+                        for episode in episodes
+                        if episode.get("series_id")
+                    ),
+                    "",
+                )
+            )
+            if series_id:
+                try:
+                    series_meta = self._record(
+                        self._get_item(user_id, series_id)
+                    )
+                except AdapterError:
+                    pass
+            return _season_record(
+                item_id,
+                episodes,
+                season_meta,
+                series_meta,
+            )
         if candidate.get("kind") == "series":
             episodes = [
                 self._record(item)
@@ -714,13 +904,27 @@ class PlexAdapter(MediaAdapter):
         # version. Treating a positive user rating as protected is the safer
         # behavior and can be disabled by turning off favorite protection.
         favorite = as_bool(item.get("isFavorite")) or bool(item.get("userRating"))
-        series_id = str(
-            item.get("grandparentRatingKey")
-            or (item.get("ratingKey") if item_type == "show" else "")
+        if item_type == "show":
+            series_id = str(item.get("ratingKey") or "")
+        else:
+            series_id = str(
+                item.get("grandparentRatingKey")
+                or item.get("parentRatingKey")
+                or ""
+            )
+        season_id = str(
+            item.get("parentRatingKey")
+            or (item.get("ratingKey") if item_type == "season" else "")
             or ""
+        )
+        season_number = (
+            item.get("parentIndex")
+            if item_type == "episode"
+            else item.get("index") if item_type == "season" else None
         )
         series_title = str(
             item.get("grandparentTitle")
+            or item.get("parentTitle")
             or item.get("title")
             or ""
         )
@@ -729,17 +933,19 @@ class PlexAdapter(MediaAdapter):
                 "kind": {
                     "movie": "movie",
                     "show": "series",
+                    "season": "season",
                     "episode": "episode",
                 }.get(item_type, item_type),
                 "item_id": str(item.get("ratingKey") or item.get("key") or ""),
                 "series_id": series_id,
+                "season_id": season_id,
                 "title": str(item.get("title") or ""),
                 "series_title": (
                     series_title
-                    if item_type == "episode"
+                    if item_type in {"episode", "season"}
                     else str(item.get("title") or "")
                 ),
-                "season": item.get("parentIndex"),
+                "season": season_number,
                 "episode": item.get("index"),
                 "paths": paths,
                 "played": view_count > 0 or as_bool(item.get("isPlayed")),
@@ -851,6 +1057,60 @@ class PlexAdapter(MediaAdapter):
         item_id = str(candidate.get("item_id") or "")
         if not item_id:
             raise AdapterError("候选缺少 Plex 条目标识")
+        if candidate.get("kind") == "season":
+            metadata = self._metadata(
+                self._get_json(
+                    f"/library/metadata/{item_id}/allLeaves",
+                    {"includeMedia": 1, "includeUserState": 1},
+                )
+            )
+            episodes = [
+                self._record(item)
+                for item in metadata
+                if str(item.get("type") or "").lower() == "episode"
+            ]
+            season_meta: dict[str, Any] = {}
+            series_meta: dict[str, Any] = {}
+            try:
+                season_metadata = self._metadata(
+                    self._get_json(
+                        f"/library/metadata/{item_id}",
+                        {"includeMedia": 1, "includeUserState": 1},
+                    )
+                )
+                if season_metadata:
+                    season_meta = self._record(season_metadata[0])
+            except AdapterError:
+                pass
+            series_id = str(
+                season_meta.get("series_id")
+                or next(
+                    (
+                        episode.get("series_id")
+                        for episode in episodes
+                        if episode.get("series_id")
+                    ),
+                    "",
+                )
+            )
+            if series_id:
+                try:
+                    series_metadata = self._metadata(
+                        self._get_json(
+                            f"/library/metadata/{series_id}",
+                            {"includeUserState": 1},
+                        )
+                    )
+                    if series_metadata:
+                        series_meta = self._record(series_metadata[0])
+                except AdapterError:
+                    pass
+            return _season_record(
+                item_id,
+                episodes,
+                season_meta,
+                series_meta,
+            )
         if candidate.get("kind") == "series":
             metadata = self._metadata(
                 self._get_json(
