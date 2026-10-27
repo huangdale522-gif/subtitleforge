@@ -35,12 +35,31 @@ In the MoviePilot plugin page:
 3. Paste the same token used by `SF_API_TOKEN`.
 4. Choose `zh-Hans` and/or `zh-Hant`.
 5. Keep overwrite off unless you explicitly want replacement.
+6. Configure `scan_paths` for foreign movies, foreign TV, documentaries, and
+   anime, and keep Chinese-language libraries in `scan_exclude_paths`.
+7. Set `scan_max_files` for one batch and `scan_daily_download_limit` for the
+   total successful downloads allowed per local day.
+8. Leave `scan_dry_run` enabled for the first full-library inventory. The
+   preview checks external and embedded subtitles without calling providers.
 
 Use the plugin's `/health` endpoint to check the service.
+
+## Library scan and notifications
+
+Each scan inspects the complete configured library before querying any subtitle
+provider. Files without the requested Chinese subtitle are stored in a
+persistent queue; only queued items then consume provider downloads. Scheduled
+and manual scans share the same daily ledger, and simultaneous triggers are
+serialized.
+
+When `notify` is enabled, MoviePilot sends the scan summary through its
+configured Telegram or other notification channel. A successful scan message
+lists the actual subtitle filenames written beside the videos, including
+language and provider. Transfer-complete notifications use the same actual
+filename format.
 
 ## Failure behavior
 
 Provider failures are returned in the job result and displayed in plugin
 history. A failed subtitle search does not roll back the media transfer and
 does not crash MoviePilot.
-

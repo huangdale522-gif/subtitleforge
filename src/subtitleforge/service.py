@@ -49,7 +49,7 @@ class SubtitleService:
         self._client = client or httpx.AsyncClient(
             timeout=settings.request_timeout_seconds,
             follow_redirects=True,
-            headers={"User-Agent": "SubtitleForge/0.2.3"},
+            headers={"User-Agent": "SubtitleForge/0.2.4"},
         )
         self.providers: dict[str, SubtitleProvider] = {
             "subtitle_best": SubtitleBestProvider(
@@ -197,9 +197,10 @@ class SubtitleService:
         """Perform one serialized processing operation."""
 
         existing = scan_external_languages(video)
-        existing.update(
-            await probe_embedded_languages(video, self.settings.ffprobe_path)
-        )
+        if not set(request.languages).issubset(existing):
+            existing.update(
+                await probe_embedded_languages(video, self.settings.ffprobe_path)
+            )
         missing = (
             list(request.languages)
             if request.overwrite

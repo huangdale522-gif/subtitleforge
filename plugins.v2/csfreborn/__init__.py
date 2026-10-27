@@ -36,7 +36,7 @@ class CSFReborn(_PluginBase):
         "监听 MoviePilot 整理完成事件，并定时扫描媒体库，为缺少中文字幕的视频自动补全。"
     )
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.3.3"
+    plugin_version = "0.3.4"
     plugin_author = "SubtitleForge contributors"
     author_url = "https://github.com/"
     plugin_config_prefix = "csfreborn_"
@@ -78,6 +78,7 @@ class CSFReborn(_PluginBase):
         )
         self._scan_interval_hours = 24
         self._scan_max_files = 10
+        self._scan_daily_download_limit = 10
         self._scan_dry_run = True
         self._scan_provider_order = ""
         self._scan_languages = ["zh-Hans"]
@@ -153,6 +154,16 @@ class CSFReborn(_PluginBase):
             )
         except (TypeError, ValueError):
             self._scan_max_files = 10
+        try:
+            self._scan_daily_download_limit = min(
+                1000,
+                max(
+                    1,
+                    int(config.get("scan_daily_download_limit") or 10),
+                ),
+            )
+        except (TypeError, ValueError):
+            self._scan_daily_download_limit = 10
         if not self._api_token:
             self._api_token = self._read_service_token()
         try:
@@ -234,22 +245,24 @@ class CSFReborn(_PluginBase):
         data = event.event_data if isinstance(event.event_data, dict) else {}
         if data.get("action") != "subtitleforge_scan":
             return
-        result = await self.scan_library(manual=True)
+        result = await self.scan_library(manual=True, notify_completion=False)
         self.post_message(
             channel=data.get("channel"),
             mtype=MessageType.Plugin,
             title="SubtitleForge 字幕扫描",
-            text=(
-                f"状态：{result.get('status', 'unknown')}；"
-                f"检查：{result.get('checked', 0)}；"
-                f"下载：{result.get('downloaded', 0)}"
-            ),
+            text=self._scan_notification_text(result),
             userid=data.get("user"),
         )
 
-    async def scan_library(self, manual: bool = False) -> dict[str, Any]:
-        """Scan a bounded batch and download missing Chinese subtitles."""
+    async def scan_library(
+        self,
+        manual: bool = False,
+        hours: int | None = None,
+        notify_completion: bool = True,
+    ) -> dict[str, Any]:
+        """Scan the full library, then consume a quota-bounded download queue."""
 
+        _ = hours
         if not self._enabled:
             return {"status": "disabled", "message": "插件尚未启用"}
         if self._scan_running:
@@ -261,6 +274,7 @@ class CSFReborn(_PluginBase):
             "video_extensions": self._split_list(self._scan_video_extensions),
             "languages": self._scan_languages or self._languages,
             "max_files": self._scan_max_files,
+            "daily_download_limit": self._scan_daily_download_limit,
             "overwrite": self._overwrite,
             "dry_run": self._scan_dry_run,
             "provider_failover": True,
@@ -276,7 +290,7 @@ class CSFReborn(_PluginBase):
                 "POST",
                 "/v1/scan",
                 payload,
-                max(600, self._scan_max_files * 45),
+                3600,
             )
             result["time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             result["trigger"] = "manual" if manual else "schedule"
@@ -290,14 +304,15 @@ class CSFReborn(_PluginBase):
                 f"检查 {result.get('checked', 0)}，"
                 f"下载 {result.get('downloaded', 0)}"
             )
-            if self._notify and int(result.get("downloaded") or 0) > 0:
+            if (
+                notify_completion
+                and self._notify
+                and int(result.get("downloaded") or 0) > 0
+            ):
                 self.post_message(
                     mtype=MessageType.Plugin,
-                    title="SubtitleForge 媒体库扫描完成",
-                    text=(
-                        f"检查 {result.get('checked', 0)} 个视频，"
-                        f"新增 {result.get('downloaded', 0)} 条中文字幕。"
-                    ),
+                    title="SubtitleForge 已下载字幕",
+                    text=self._scan_notification_text(result),
                 )
             return result
         except Exception as exc:  # noqa: BLE001 - scheduler must survive failures
@@ -306,6 +321,48 @@ class CSFReborn(_PluginBase):
             return {"status": "error", "errors": [message]}
         finally:
             self._scan_running = False
+
+    @staticmethod
+    def _scan_notification_text(result: dict[str, Any]) -> str:
+        """Format downloaded subtitle files for Telegram or another message channel."""
+
+        lines = [
+            (
+                f"全库发现 {result.get('discovered', 0)} 个视频，"
+                f"检查 {result.get('checked', 0)} 个，"
+                f"已有 {result.get('existing', 0)} 个，"
+                f"队列剩余 {result.get('queue_remaining', 0)} 个。"
+            ),
+            (
+                f"本轮下载 {result.get('downloaded', 0)} 条，"
+                f"今日额度 {result.get('downloads_today', 0)}/"
+                f"{result.get('daily_download_limit', 0)}。"
+            ),
+        ]
+        downloaded: list[str] = []
+        for item in result.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            for subtitle in item.get("downloaded") or []:
+                if not isinstance(subtitle, dict):
+                    continue
+                filename = Path(str(subtitle.get("path") or "")).name
+                episode = ""
+                if item.get("season") is not None and item.get("episode") is not None:
+                    episode = (
+                        f" S{int(item['season']):02d}E{int(item['episode']):02d}"
+                    )
+                downloaded.append(
+                    f"· {item.get('title', '未知')}{episode} "
+                    f"[{subtitle.get('language', '')}/"
+                    f"{subtitle.get('provider', '')}] {filename}"
+                )
+        if downloaded:
+            lines.append("已下载文件：")
+            lines.extend(downloaded[:20])
+            if len(downloaded) > 20:
+                lines.append(f"……另有 {len(downloaded) - 20} 条未展开")
+        return "\n".join(lines)
 
     async def health(self) -> dict[str, Any]:
         """Check the configured SubtitleForge service."""
@@ -576,14 +633,16 @@ class CSFReborn(_PluginBase):
             if result.get("status") not in (None, "ok", "downloaded"):
                 aggregate["status"] = result.get("status")
         if self._notify and aggregate["downloaded"]:
-            names = "、".join(
-                f"{item.get('language')}:{item.get('candidate')}"
+            names = "\n".join(
+                f"· {Path(str(item.get('path') or '')).name} "
+                f"[{item.get('language', '')}/{item.get('provider', '')}]"
                 for item in aggregate["downloaded"]
+                if isinstance(item, dict)
             )
             self.post_message(
                 mtype=MessageType.Plugin,
                 title=f"字幕已补全 - {common_payload['title']}",
-                text=names,
+                text=f"已下载字幕文件：\n{names}",
             )
 
     @staticmethod
@@ -697,7 +756,7 @@ class CSFReborn(_PluginBase):
                         "props": {
                             "type": "info",
                             "variant": "tonal",
-                            "text": "媒体库扫描会检查外挂和内嵌中文字幕。默认先预览，每轮只处理一批视频；确认识别无误后再关闭“仅预览”。",
+                            "text": "每次运行先全库检查外挂和内嵌中文字幕，再把缺失项写入持久队列；只有队列任务会访问字幕源，并受每日下载额度限制。",
                         },
                     },
                     {
@@ -705,7 +764,7 @@ class CSFReborn(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
+                                "props": {"cols": 12, "md": 3},
                                 "content": [
                                     {
                                         "component": "VSwitch",
@@ -774,7 +833,7 @@ class CSFReborn(_PluginBase):
                                         "component": "VTextField",
                                         "props": {
                                             "model": "scan_max_files",
-                                            "label": "每轮最多处理",
+                                            "label": "每次最多从队列下载",
                                             "type": "number",
                                         },
                                     }
@@ -782,7 +841,23 @@ class CSFReborn(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 8},
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "scan_daily_download_limit",
+                                            "label": "每日下载上限",
+                                            "type": "number",
+                                            "hint": "所有字幕源合计，按成功下载数量计数",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
                                 "content": [
                                     {
                                         "component": "VTextField",
@@ -821,7 +896,7 @@ class CSFReborn(_PluginBase):
                         "props": {
                             "type": "warning",
                             "variant": "tonal",
-                            "text": "配额保护：仅当视频确实缺少所选中文时才会访问字幕源；默认只补简体，并按字幕源顺序故障切换，前一个源无结果才查询下一个。",
+                            "text": "配额保护：全库扫描和排队不访问字幕源；下载数量同时受“本次批次”和“每日上限”限制，跨重启保留。命中限流会冷却字幕源，TG 推送只列出实际下载成功的字幕文件。",
                         },
                     },
                     {
@@ -1012,6 +1087,7 @@ class CSFReborn(_PluginBase):
             ),
             "scan_interval_hours": 24,
             "scan_max_files": 10,
+            "scan_daily_download_limit": 10,
             "scan_dry_run": True,
             "scan_provider_order": "",
             "scan_languages": ["zh-Hans"],
@@ -1028,7 +1104,8 @@ class CSFReborn(_PluginBase):
             missing = [
                 item
                 for item in items
-                if item.get("status") in {"dry_run", "not_found", "partial", "error"}
+                if item.get("status")
+                in {"dry_run", "queued", "not_found", "partial", "error"}
             ]
             cards.append(
                 {
@@ -1052,8 +1129,12 @@ class CSFReborn(_PluginBase):
                                     "text": (
                                         f"发现 {latest_scan.get('discovered', 0)} · "
                                         f"检查 {latest_scan.get('checked', 0)} · "
+                                        f"已有 {latest_scan.get('existing', 0)} · "
+                                        f"缺失入队 {latest_scan.get('queued', 0)} · "
+                                        f"队列剩余 {latest_scan.get('queue_remaining', 0)} · "
                                         f"下载 {latest_scan.get('downloaded', 0)} · "
-                                        f"待后续 {latest_scan.get('remaining', 0)}"
+                                        f"今日 {latest_scan.get('downloads_today', 0)}/"
+                                        f"{latest_scan.get('daily_download_limit', 0)}"
                                     ),
                                 },
                                 {

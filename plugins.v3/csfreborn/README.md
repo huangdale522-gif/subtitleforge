@@ -21,8 +21,10 @@ Configuration:
   by default until library identification has been reviewed. Preview mode does
   not query subtitle providers, so it consumes no provider quota.
 - `scan_interval_hours`: scheduled interval in hours.
-- `scan_max_files`: maximum videos checked per run; the cursor resumes with the
-  least recently checked files on the next run.
+- `scan_max_files`: maximum queued videos processed by one scan run.
+- `scan_daily_download_limit`: maximum successful subtitle downloads allowed on
+  one local calendar day. The ledger is shared by scheduled and manual scans
+  and survives service restarts.
 - `scan_provider_order`: optional provider order used only by scanning.
 - `scan_languages`: languages required by scanning. The default is Simplified
   Chinese only to reduce provider download quota; set both languages explicitly
@@ -33,12 +35,16 @@ Configuration:
   the service's private `.env` file.
 
 The scan recognizes external subtitles by filename/content and embedded
-subtitles through `ffprobe`. Existing Chinese subtitles are skipped unless
-`overwrite` is enabled. Providers are queried in order and later providers are
-skipped when the first one returns usable candidates. Rate-limit or quota
-responses put that provider into a 24-hour cooldown, and each video is limited
-to three download attempts. Cooldowns persist across service restarts. An
-authenticated `POST
+subtitles through `ffprobe`. Every configured video is inspected before any
+subtitle source is queried. Existing Chinese subtitles are skipped unless
+`overwrite` is enabled; missing items are saved in a persistent queue. Providers
+are queried only while consuming that queue, in configured order, and later
+providers are skipped when the first one returns usable candidates. Rate-limit
+or quota responses put that provider into a 24-hour cooldown, and each video is
+limited to three download attempts. Cooldowns persist across service restarts.
+When `notify` is enabled, the notification lists the actual subtitle filenames
+that were downloaded successfully through MoviePilot's configured Telegram or
+other notification channel. An authenticated `POST
 /api/v1/plugin/CSFReborn/scan` starts a manual scan using saved settings.
 
 Both containers must see the media library at the same path. For example, if

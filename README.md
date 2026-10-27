@@ -21,8 +21,10 @@ installation logic, or MoviePilot integration.
 - Safe ZIP extraction and atomic subtitle placement.
 - SQLite job history.
 - MoviePilot V3 adapter that listens for `TransferComplete`.
-- Resumable media-library scans with external and embedded Chinese subtitle
-  detection, bounded batches, exclusions, and dry-run preview.
+- Full-library scans with external and embedded Chinese subtitle detection,
+  a persistent missing-subtitle queue, exclusions, and dry-run preview.
+- Separate per-run and per-day download limits, including a daily ledger that
+  survives service restarts.
 - Docker image and Compose deployment.
 
 The default output names are:
@@ -121,32 +123,39 @@ Use `POST /v1/jobs` with the same body as `/v1/process`, then poll
 
 ### Scan the media library
 
-`POST /v1/scan` walks configured directories, parses movie/TV metadata, detects
-existing Chinese subtitles, and processes a bounded batch:
+`POST /v1/scan` first walks every configured directory, parses movie/TV metadata,
+and detects existing Chinese subtitles without contacting any provider. Missing
+items are saved in a persistent SQLite queue. The scanner then consumes only a
+bounded number of queued items:
 
 ```json
 {
   "paths": ["/media/movies/foreign", "/media/tv/foreign"],
   "exclude_paths": ["/media/movies/chinese"],
   "languages": ["zh-Hans", "zh-Hant"],
-  "max_files": 20,
+  "max_files": 10,
+  "daily_download_limit": 20,
   "dry_run": true
 }
 ```
 
 With `dry_run: true`, the scanner only reads local subtitles and `ffprobe`
 metadata; it does not call subtitle providers, so a preview consumes no source
-quota. Real runs use provider failover in configured order and stop querying
-after the first provider returns usable candidates. A provider that reports a
-rate limit or quota error enters a 24-hour cooldown, and each video is limited
-to three subtitle download attempts to prevent a bad match from exhausting a
-source. Cooldown state is persisted locally so a service restart does not
-immediately spend the same exhausted quota again.
+quota and does not modify the download queue. Real runs use provider failover in
+configured order and stop querying after the first provider returns usable
+candidates. A provider that reports a rate limit or quota error enters a
+24-hour cooldown, and each video is limited to three subtitle download attempts
+to prevent a bad match from exhausting a source. Cooldown state is persisted
+locally so a service restart does not immediately spend the same exhausted quota
+again.
 
-The scanner records completed files in SQLite. Each scheduled run prioritizes
-files that have never been checked, then the least recently checked files, and
-rotates between media directories so a large library is covered without one
-series filling every batch.
+`max_files` limits one scan batch. `daily_download_limit` limits successful
+subtitle downloads for the local calendar day across every scanner instance
+using the same data directory. Both limits apply to each provider together.
+Queue retries are deferred for `retry_after_hours` after a failed task, and
+concurrent scan requests are serialized so they cannot overspend the daily
+ledger. The MoviePilot adapter can send the actual downloaded subtitle filenames
+through the user's configured Telegram/notification channel.
 
 ## Custom provider contract
 

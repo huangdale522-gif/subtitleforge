@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 
 import httpx
@@ -22,6 +23,7 @@ class ScanProvider(SubtitleProvider):
 
     def __init__(self) -> None:
         self.search_calls = 0
+        self.download_calls = 0
 
     @property
     def configured(self) -> bool:
@@ -41,10 +43,32 @@ class ScanProvider(SubtitleProvider):
         ]
 
     async def download(self, candidate: SubtitleCandidate) -> DownloadedAsset:
+        self.download_calls += 1
         return DownloadedAsset(
             content="1\n00:00:00,000 --> 00:00:01,000\n简体中文字幕\n".encode(),
-            file_name="subtitle.srt",
+            file_name="subtitle.zh-cn.srt",
         )
+
+
+class NoResultProvider(ScanProvider):
+    async def search(self, request: SearchRequest) -> list[SubtitleCandidate]:
+        self.search_calls += 1
+        return []
+
+
+class SlowScanProvider(ScanProvider):
+    async def search(self, request: SearchRequest) -> list[SubtitleCandidate]:
+        await asyncio.sleep(0.02)
+        return await super().search(request)
+
+
+def make_service(tmp_path: Path) -> SubtitleService:
+    settings = Settings(
+        media_roots=str(tmp_path),
+        data_dir=tmp_path / "data",
+        provider_order="custom",
+    )
+    return SubtitleService(settings, client=httpx.AsyncClient())
 
 
 def test_parse_movie_path_uses_tmdb_and_year(tmp_path: Path) -> None:
@@ -101,13 +125,10 @@ async def test_library_scan_downloads_only_missing_subtitles(tmp_path: Path) -> 
         "1\n00:00:00,000 --> 00:00:01,000\n简体中文字幕\n",
         encoding="utf-8",
     )
-    settings = Settings(
-        media_roots=str(tmp_path), data_dir=tmp_path / "data", provider_order="custom"
-    )
-    service = SubtitleService(settings, client=httpx.AsyncClient())
+    service = make_service(tmp_path)
     provider = ScanProvider()
     service.providers["custom"] = provider
-    scanner = LibraryScanner(service, settings.data_dir)
+    scanner = LibraryScanner(service, service.settings.data_dir)
     try:
         result = await scanner.scan(
             ScanRequest(
@@ -121,11 +142,73 @@ async def test_library_scan_downloads_only_missing_subtitles(tmp_path: Path) -> 
         await service.close()
     assert result.discovered == 2
     assert result.checked == 2
+    assert result.existing == 1
+    assert result.queued == 1
     assert result.downloaded == 1
+    assert result.queue_remaining == 0
+    assert provider.search_calls == 1
+    assert provider.download_calls == 1
     assert (missing.parent / "Movie.2024.chi.zh-cn.srt").exists()
     assert not any(
         item.status == "completed" for item in result.items if "Existing" in item.title
     )
+
+
+@pytest.mark.asyncio
+async def test_full_scan_queues_all_then_downloads_under_daily_limit(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "电影" / "外语电影"
+    for index in range(1, 13):
+        video = root / f"Movie {index} (2024)" / f"Movie.{index}.2024.mkv"
+        video.parent.mkdir(parents=True)
+        video.write_bytes(b"video")
+
+    service = make_service(tmp_path)
+    provider = ScanProvider()
+    service.providers["custom"] = provider
+    try:
+        first_scanner = LibraryScanner(service, service.settings.data_dir)
+        first = await first_scanner.scan(
+            ScanRequest(
+                paths=[str(root)],
+                languages=[SubtitleLanguage.SIMPLIFIED],
+                max_files=2,
+                daily_download_limit=10,
+                dry_run=False,
+            )
+        )
+        assert first.discovered == 12
+        assert first.checked == 12
+        assert first.existing == 0
+        assert first.queued == 12
+        assert first.downloaded == 2
+        assert first.download_limit == 2
+        assert first.downloads_today == 2
+        assert first.queue_remaining == 10
+        assert provider.search_calls == 2
+
+        rebuilt_scanner = LibraryScanner(service, service.settings.data_dir)
+        second = await rebuilt_scanner.scan(
+            ScanRequest(
+                paths=[str(root)],
+                languages=[SubtitleLanguage.SIMPLIFIED],
+                max_files=2,
+                daily_download_limit=2,
+                dry_run=False,
+            )
+        )
+    finally:
+        await service.close()
+
+    assert second.checked == 12
+    assert second.existing == 2
+    assert second.queued == 10
+    assert second.downloaded == 0
+    assert second.download_limit == 0
+    assert second.downloads_today == 2
+    assert second.queue_remaining == 10
+    assert provider.search_calls == 2
 
 
 @pytest.mark.asyncio
@@ -138,13 +221,10 @@ async def test_library_scan_honors_exclusions_and_dry_run(tmp_path: Path) -> Non
     chinese.parent.mkdir(parents=True)
     foreign.write_bytes(b"video")
     chinese.write_bytes(b"video")
-    settings = Settings(
-        media_roots=str(tmp_path), data_dir=tmp_path / "data", provider_order="custom"
-    )
-    service = SubtitleService(settings, client=httpx.AsyncClient())
+    service = make_service(tmp_path)
     provider = ScanProvider()
     service.providers["custom"] = provider
-    scanner = LibraryScanner(service, settings.data_dir)
+    scanner = LibraryScanner(service, service.settings.data_dir)
     try:
         result = await scanner.scan(
             ScanRequest(
@@ -160,38 +240,77 @@ async def test_library_scan_honors_exclusions_and_dry_run(tmp_path: Path) -> Non
     assert result.downloaded == 0
     assert result.items[0].status == "dry_run"
     assert provider.search_calls == 0
+    assert provider.download_calls == 0
+    assert scanner.queue_status()["total"] == 0
     assert not (foreign.parent / "Movie.chi.zh-cn.srt").exists()
 
 
 @pytest.mark.asyncio
-async def test_scan_rotates_across_media_directories(tmp_path: Path) -> None:
-    root = tmp_path / "电视剧" / "欧美剧"
-    show = root / "Long Show (2024)" / "Season 1"
-    show.mkdir(parents=True)
-    for episode in range(1, 31):
-        (show / f"Long.Show.S01E{episode:02d}.mkv").write_bytes(b"video")
-    for movie_name in ("Movie One (2024)", "Movie Two (2023)"):
-        movie_dir = tmp_path / "电影" / "外语电影" / movie_name
-        movie_dir.mkdir(parents=True)
-        (movie_dir / f"{movie_name}.mkv").write_bytes(b"video")
-    settings = Settings(
-        media_roots=str(tmp_path), data_dir=tmp_path / "data", provider_order="custom"
-    )
-    service = SubtitleService(settings, client=httpx.AsyncClient())
-    service.providers["custom"] = ScanProvider()
-    scanner = LibraryScanner(service, settings.data_dir)
+async def test_failed_queue_item_waits_for_retry_cooldown(tmp_path: Path) -> None:
+    root = tmp_path / "电影" / "外语电影"
+    video = root / "Movie (2024)" / "Movie.2024.mkv"
+    video.parent.mkdir(parents=True)
+    video.write_bytes(b"video")
+    service = make_service(tmp_path)
+    provider = NoResultProvider()
+    service.providers["custom"] = provider
+    scanner = LibraryScanner(service, service.settings.data_dir)
     try:
-        result = await scanner.scan(
+        first = await scanner.scan(
             ScanRequest(
-                paths=[str(tmp_path / "电视剧"), str(tmp_path / "电影")],
+                paths=[str(root)],
                 languages=[SubtitleLanguage.SIMPLIFIED],
-                max_files=5,
-                dry_run=True,
+                max_files=1,
+                daily_download_limit=5,
+                dry_run=False,
+            )
+        )
+        queue_after_first = scanner.queue_status()
+        second = await scanner.scan(
+            ScanRequest(
+                paths=[str(root)],
+                languages=[SubtitleLanguage.SIMPLIFIED],
+                max_files=1,
+                daily_download_limit=5,
+                dry_run=False,
             )
         )
     finally:
         await service.close()
-    titles = {item.title for item in result.items}
-    assert "Movie One" in titles
-    assert "Movie Two" in titles
-    assert "Long Show" in titles
+
+    assert first.downloaded == 0
+    assert first.queue_remaining == 1
+    assert queue_after_first == {"total": 1, "due": 0, "deferred": 1}
+    assert second.downloaded == 0
+    assert second.queue_remaining == 1
+    assert provider.search_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_scans_are_serialized_by_daily_quota(tmp_path: Path) -> None:
+    root = tmp_path / "电影" / "外语电影"
+    video = root / "Movie (2024)" / "Movie.2024.mkv"
+    video.parent.mkdir(parents=True)
+    video.write_bytes(b"video")
+    service = make_service(tmp_path)
+    provider = SlowScanProvider()
+    service.providers["custom"] = provider
+    scanner = LibraryScanner(service, service.settings.data_dir)
+    request = ScanRequest(
+        paths=[str(root)],
+        languages=[SubtitleLanguage.SIMPLIFIED],
+        max_files=1,
+        daily_download_limit=1,
+        dry_run=False,
+    )
+    try:
+        first, second = await asyncio.gather(
+            scanner.scan(request),
+            scanner.scan(request),
+        )
+    finally:
+        await service.close()
+
+    assert first.downloaded + second.downloaded == 1
+    assert max(first.downloads_today, second.downloads_today) == 1
+    assert provider.search_calls == 1

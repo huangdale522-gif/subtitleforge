@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 from .models import (
     MediaType,
@@ -40,6 +42,7 @@ TRAILING_RELEASE_TOKENS = re.compile(
     r"(?i)(?:[ ._-]+(?:2160p|1080p|720p|480p|bluray|blu-ray|webrip|web-dl|"
     r"hdtv|remux|x264|x265|h264|h265|hevc|avc|aac|dts|proper|repack).*)$"
 )
+MAX_SCAN_ITEMS = 500
 
 
 def _now() -> str:
@@ -63,8 +66,17 @@ class DiscoveredVideo:
     episode: int | None
 
 
+@dataclass(slots=True)
+class QueueEntry:
+    """One persisted missing-subtitle task waiting for download quota."""
+
+    video_path: str
+    payload: dict[str, Any]
+    attempts: int
+
+
 class ScanStore:
-    """Small SQLite cursor so bounded scans eventually cover the whole library."""
+    """Persistent full-scan state, download queue, and daily quota ledger."""
 
     def __init__(self, data_dir: Path) -> None:
         data_dir.mkdir(parents=True, exist_ok=True)
@@ -76,6 +88,28 @@ class ScanStore:
                     video_path TEXT PRIMARY KEY,
                     last_checked_at TEXT NOT NULL,
                     status TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS download_queue (
+                    video_path TEXT PRIMARY KEY,
+                    payload_json TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at TEXT,
+                    last_error TEXT,
+                    queued_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS daily_downloads (
+                    day TEXT PRIMARY KEY,
+                    count INTEGER NOT NULL
                 )
                 """
             )
@@ -124,6 +158,179 @@ class ScanStore:
         if checked is None:
             return True
         return datetime.now(UTC) - checked >= timedelta(hours=retry_after_hours)
+
+    def upsert_queue_item(
+        self, video_path: Path, payload: dict[str, Any]
+    ) -> None:
+        """Add or refresh one missing-subtitle task without losing its retry state."""
+
+        now = _now()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO download_queue (
+                    video_path, payload_json, status, attempts,
+                    next_attempt_at, last_error, queued_at, updated_at
+                )
+                VALUES (?, ?, 'pending', 0, NULL, NULL, ?, ?)
+                ON CONFLICT(video_path) DO UPDATE SET
+                    payload_json = excluded.payload_json,
+                    status = 'pending',
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    str(video_path),
+                    json.dumps(payload, ensure_ascii=False),
+                    now,
+                    now,
+                ),
+            )
+            connection.commit()
+
+    def remove_queue_item(self, video_path: Path) -> None:
+        """Remove a task that no longer needs subtitles."""
+
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM download_queue WHERE video_path = ?",
+                (str(video_path),),
+            )
+            connection.commit()
+
+    def next_queue_items(self, limit: int) -> list[QueueEntry]:
+        """Return due queue tasks in oldest-first order."""
+
+        if limit <= 0:
+            return []
+        now = _now()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT video_path, payload_json, attempts
+                FROM download_queue
+                WHERE status = 'pending'
+                  AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+                ORDER BY
+                    CASE WHEN next_attempt_at IS NULL THEN 0 ELSE 1 END,
+                    next_attempt_at,
+                    queued_at
+                LIMIT ?
+                """,
+                (now, limit),
+            ).fetchall()
+        entries: list[QueueEntry] = []
+        for video_path, payload_json, attempts in rows:
+            try:
+                payload = json.loads(str(payload_json))
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            entries.append(
+                QueueEntry(
+                    video_path=str(video_path),
+                    payload=payload,
+                    attempts=int(attempts or 0),
+                )
+            )
+        return entries
+
+    def mark_queue_result(
+        self,
+        video_path: Path,
+        status: str,
+        retry_after_hours: int,
+        errors: list[str],
+    ) -> None:
+        """Complete a task or defer it for a later quota window."""
+
+        if status in {"completed", "skipped"}:
+            self.remove_queue_item(video_path)
+            return
+        now = datetime.now(UTC)
+        next_attempt = now + timedelta(hours=max(1, retry_after_hours))
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE download_queue
+                SET status = 'pending',
+                    attempts = attempts + 1,
+                    next_attempt_at = ?,
+                    last_error = ?,
+                    updated_at = ?
+                WHERE video_path = ?
+                """,
+                (
+                    next_attempt.isoformat(),
+                    " | ".join(errors)[:2000],
+                    now.isoformat(),
+                    str(video_path),
+                ),
+            )
+            connection.commit()
+
+    def queue_count(self) -> int:
+        """Return the number of queued missing-subtitle tasks."""
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) FROM download_queue WHERE status = 'pending'"
+            ).fetchone()
+        return int(row[0]) if row else 0
+
+    def queue_status(self) -> dict[str, int]:
+        """Return total and currently due queue counts."""
+
+        now = _now()
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    COUNT(*),
+                    SUM(
+                        CASE
+                            WHEN next_attempt_at IS NULL THEN 1
+                            WHEN next_attempt_at <= ? THEN 1
+                            ELSE 0
+                        END
+                    )
+                FROM download_queue
+                WHERE status = 'pending'
+                """,
+                (now,),
+            ).fetchone()
+        total = int(row[0] or 0) if row else 0
+        due = int(row[1] or 0) if row else 0
+        return {"total": total, "due": due, "deferred": total - due}
+
+    def downloads_today(self) -> int:
+        """Return successful subtitle downloads recorded for the local day."""
+
+        day = datetime.now().date().isoformat()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT count FROM daily_downloads WHERE day = ?",
+                (day,),
+            ).fetchone()
+        return int(row[0]) if row else 0
+
+    def record_downloads(self, count: int) -> None:
+        """Add successful subtitle downloads to today's persistent ledger."""
+
+        if count <= 0:
+            return
+        day = datetime.now().date().isoformat()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO daily_downloads (day, count)
+                VALUES (?, ?)
+                ON CONFLICT(day) DO UPDATE SET
+                    count = count + excluded.count
+                """,
+                (day, count),
+            )
+            connection.commit()
 
 
 def _strip_release_suffix(value: str) -> str:
@@ -344,14 +551,26 @@ def interleave_by_media_directory(
 
 
 class LibraryScanner:
-    """Apply subtitle processing to a bounded, least-recently-checked batch."""
+    """Inspect the full library, queue missing subtitles, then spend a bounded quota."""
 
     def __init__(self, service: SubtitleService, data_dir: Path) -> None:
         self._service = service
         self._store = ScanStore(data_dir)
+        self._scan_lock = asyncio.Lock()
+
+    def queue_status(self) -> dict[str, int]:
+        """Return the persisted missing-subtitle queue summary."""
+
+        return self._store.queue_status()
 
     async def scan(self, request: ScanRequest) -> ScanResult:
-        """Scan configured roots and process up to ``max_files`` videos."""
+        """Serialize full scans so concurrent triggers cannot exceed daily quota."""
+
+        async with self._scan_lock:
+            return await self._scan_locked(request)
+
+    async def _scan_locked(self, request: ScanRequest) -> ScanResult:
+        """Inventory every video before downloading a quota-bounded queue batch."""
 
         roots: list[Path] = []
         errors: list[str] = []
@@ -374,37 +593,35 @@ class LibraryScanner:
             set(request.video_extensions),
         )
         if not discovered:
+            queue = self._store.queue_status()
             return ScanResult(
                 status="not_found",
                 discovered=0,
+                queue_remaining=queue["total"],
+                remaining=queue["total"],
+                downloads_today=self._store.downloads_today(),
+                daily_download_limit=request.daily_download_limit,
                 dry_run=request.dry_run,
                 errors=errors,
             )
 
-        last_checked = self._store.last_checked()
-        never_checked = interleave_by_media_directory(
-            sorted(
-                (item for item in discovered if str(item[0]) not in last_checked),
-                key=lambda item: str(item[0]),
-            )
+        ordered = interleave_by_media_directory(
+            sorted(discovered, key=lambda item: str(item[0]))
         )
-        previously_checked = interleave_by_media_directory(
-            sorted(
-                (item for item in discovered if str(item[0]) in last_checked),
-                key=lambda item: last_checked[str(item[0])],
-            )
-        )
-        selected = (never_checked + previously_checked)[: request.max_files]
         result = ScanResult(
             status="processing",
-            discovered=len(discovered),
-            remaining=max(0, len(discovered) - len(selected)),
+            discovered=len(ordered),
+            downloads_today=self._store.downloads_today(),
+            daily_download_limit=request.daily_download_limit,
             dry_run=request.dry_run,
             errors=errors,
         )
-        for path, root in selected:
+        items_by_path: dict[str, ScanItemResult] = {}
+
+        # Phase 1: inspect every file locally. This never queries a provider.
+        for path, root in ordered:
             discovered_media = parse_media_path(path, root)
-            process_request = ProcessRequest(
+            inspect_request = ProcessRequest(
                 video_path=str(path),
                 title=discovered_media.title,
                 original_title=discovered_media.original_title,
@@ -416,47 +633,176 @@ class LibraryScanner:
                 episode=discovered_media.episode,
                 languages=request.languages,
                 overwrite=request.overwrite,
-                dry_run=request.dry_run,
+                dry_run=True,
                 provider_failover=request.provider_failover,
                 provider_order=request.provider_order,
             )
             try:
-                processed = await self._service.process(process_request)
-                status = processed.status
-                item_errors = list(processed.errors)
+                inspected = await self._service.process(inspect_request)
             except Exception as exc:  # noqa: BLE001 - one bad file must not stop a scan
-                status = "error"
                 item_errors = [f"{type(exc).__name__}: {exc}"]
-                processed = ProcessResult(
+                inspected = ProcessResult(
                     status="error",
                     video_path=str(path),
                     errors=item_errors,
                 )
             result.checked += 1
-            result.downloaded += len(processed.downloaded)
-            result.items.append(
-                ScanItemResult(
+            item = ScanItemResult(
+                video_path=str(path),
+                title=discovered_media.title,
+                year=discovered_media.year,
+                media_type=discovered_media.media_type,
+                season=discovered_media.season,
+                episode=discovered_media.episode,
+                status=inspected.status,
+                existing_languages=inspected.existing_languages,
+                missing_languages=inspected.missing_languages,
+                errors=list(inspected.errors),
+            )
+            if inspected.errors:
+                result.errors.extend(f"{path}: {error}" for error in inspected.errors)
+            if not inspected.missing_languages:
+                result.existing += 1
+                if not request.dry_run:
+                    self._store.remove_queue_item(path)
+                continue
+
+            result.queued += 1
+            if request.dry_run:
+                item.status = "dry_run"
+            else:
+                payload = ProcessRequest(
                     video_path=str(path),
                     title=discovered_media.title,
+                    original_title=discovered_media.original_title,
                     year=discovered_media.year,
+                    imdb_id=discovered_media.imdb_id,
+                    tmdb_id=discovered_media.tmdb_id,
                     media_type=discovered_media.media_type,
                     season=discovered_media.season,
                     episode=discovered_media.episode,
-                    status=status,
+                    languages=inspected.missing_languages,
+                    overwrite=request.overwrite,
+                    dry_run=False,
+                    provider_failover=request.provider_failover,
+                    provider_order=request.provider_order,
+                ).model_dump(mode="json")
+                self._store.upsert_queue_item(path, payload)
+                item.status = "queued"
+            if len(items_by_path) < MAX_SCAN_ITEMS:
+                items_by_path[item.video_path] = item
+
+        queue = self._store.queue_status()
+        result.queue_remaining = queue["total"]
+        result.remaining = queue["total"]
+        if request.dry_run:
+            result.items = list(items_by_path.values())
+            result.status = "dry_run" if result.queued else "completed"
+            return result
+
+        # Phase 2: only queued missing files can consume provider quota.
+        used_today = self._store.downloads_today()
+        result.downloads_today = used_today
+        daily_remaining = max(0, request.daily_download_limit - used_today)
+        result.download_limit = min(request.max_files, daily_remaining)
+        if result.download_limit <= 0:
+            result.items = list(items_by_path.values())
+            result.status = "queued" if queue["total"] else _scan_status(result)
+            return result
+
+        queued_entries = self._store.next_queue_items(result.download_limit)
+        for entry in queued_entries:
+            used_today = self._store.downloads_today()
+            remaining_slots = request.daily_download_limit - used_today
+            if remaining_slots <= 0:
+                break
+            process_request: ProcessRequest | None = None
+            try:
+                process_request = ProcessRequest.model_validate(entry.payload)
+                process_request.languages = process_request.languages[:remaining_slots]
+                process_request.overwrite = request.overwrite
+                process_request.dry_run = False
+                process_request.provider_failover = request.provider_failover
+                process_request.provider_order = request.provider_order
+                processed = await self._service.process(process_request)
+            except Exception as exc:  # noqa: BLE001 - keep one task from blocking the queue
+                processed = ProcessResult(
+                    status="error",
+                    video_path=entry.video_path,
+                    errors=[f"{type(exc).__name__}: {exc}"],
+                )
+
+            downloaded_count = len(processed.downloaded)
+            if downloaded_count:
+                self._store.record_downloads(downloaded_count)
+            self._store.mark_queue_result(
+                Path(entry.video_path),
+                processed.status,
+                request.retry_after_hours,
+                processed.errors,
+            )
+            result.downloaded += downloaded_count
+            result.downloads_today = self._store.downloads_today()
+            item = items_by_path.get(entry.video_path)
+            if item is not None:
+                item.status = processed.status
+                item.existing_languages = processed.existing_languages
+                item.missing_languages = processed.missing_languages
+                item.downloaded = processed.downloaded
+                item.errors = list(processed.errors)
+            elif len(items_by_path) < MAX_SCAN_ITEMS:
+                items_by_path[entry.video_path] = ScanItemResult(
+                    video_path=entry.video_path,
+                    title=(
+                        process_request.title
+                        if process_request is not None
+                        else str(entry.payload.get("title") or entry.video_path)
+                    ),
+                    year=(
+                        process_request.year
+                        if process_request is not None
+                        else None
+                    ),
+                    media_type=(
+                        process_request.media_type
+                        if process_request is not None
+                        else MediaType.MOVIE
+                    ),
+                    season=(
+                        process_request.season
+                        if process_request is not None
+                        else None
+                    ),
+                    episode=(
+                        process_request.episode
+                        if process_request is not None
+                        else None
+                    ),
+                    status=processed.status,
                     existing_languages=processed.existing_languages,
                     missing_languages=processed.missing_languages,
                     downloaded=processed.downloaded,
-                    errors=item_errors,
+                    errors=list(processed.errors),
                 )
-            )
-            if not request.dry_run:
-                self._store.mark_checked(path, status)
+            if processed.errors:
+                result.errors.extend(
+                    f"{entry.video_path}: {error}" for error in processed.errors
+                )
 
-        result.remaining = max(0, len(discovered) - result.checked)
-        if any(item.status == "error" for item in result.items):
+        queue = self._store.queue_status()
+        result.queue_remaining = queue["total"]
+        result.remaining = queue["total"]
+        result.items = list(items_by_path.values())
+        if result.errors:
             result.status = "partial"
-        elif result.downloaded:
-            result.status = "completed"
         else:
-            result.status = result.items[-1].status if result.items else "not_found"
+            result.status = "completed" if queue["total"] == 0 else "queued"
         return result
+
+
+def _scan_status(result: ScanResult) -> str:
+    """Return a useful status when no queue work is currently due."""
+
+    if result.errors:
+        return "partial"
+    return "completed"

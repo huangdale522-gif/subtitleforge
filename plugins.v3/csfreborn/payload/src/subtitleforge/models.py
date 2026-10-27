@@ -121,7 +121,7 @@ class ProcessResult(BaseModel):
 
 
 class ScanRequest(BaseModel):
-    """Configuration for a bounded walk over the media library."""
+    """Configuration for a full inventory pass and a bounded download batch."""
 
     paths: list[str] = Field(default_factory=lambda: ["/media"])
     exclude_paths: list[str] = Field(default_factory=list)
@@ -145,6 +145,7 @@ class ScanRequest(BaseModel):
         ]
     )
     max_files: int = Field(default=20, ge=1, le=100)
+    daily_download_limit: int = Field(default=10, ge=1, le=1000)
     overwrite: bool = False
     dry_run: bool = True
     retry_after_hours: int = Field(default=24, ge=1, le=24 * 365)
@@ -185,13 +186,19 @@ class ScanItemResult(BaseModel):
 
 
 class ScanResult(BaseModel):
-    """A bounded, resumable media-library scan."""
+    """Full-inventory counts plus the bounded queue download result."""
 
     status: str
     discovered: int = 0
     checked: int = 0
+    existing: int = 0
+    queued: int = 0
+    queue_remaining: int = 0
     remaining: int = 0
     downloaded: int = 0
+    downloads_today: int = 0
+    daily_download_limit: int = 10
+    download_limit: int = 0
     dry_run: bool = True
     items: list[ScanItemResult] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
