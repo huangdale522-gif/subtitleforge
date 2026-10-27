@@ -21,5 +21,20 @@
       "v0.1.1": "兼容 MoviePilot V2/V3 事件载荷，保持同一套字幕补全流程。",
       "v0.1.0": "首个版本：支持整理完成事件、字幕语言配置、服务健康检查与下载历史。"
     }
+  },
+  "WatchedCleaner": {
+    "name": "已观看媒体清理",
+    "description": "扫描 Emby/Jellyfin/Plex 的已观看电影、剧集和动漫，人工勾选后安全删除。",
+    "labels": "媒体库,清理",
+    "version": "1.0.0",
+    "icon": "Moviepilot_A.png",
+    "author": "huangdale522-gif",
+    "level": 1,
+    "release": true,
+    "system_version": ">=3.0.0",
+    "v3t": false,
+    "history": {
+      "v1.0.0": "首版：支持电影、单集、整剧和动漫扫描，人工勾选、预演、二次确认、路径白名单和审计记录。"
+    }
   }
 }
