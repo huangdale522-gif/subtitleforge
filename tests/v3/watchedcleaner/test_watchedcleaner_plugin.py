@@ -16,6 +16,7 @@ from app.plugins.watchedcleaner.policy import (
 
 
 OLD = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+YEAR_OLD = (datetime.now(timezone.utc) - timedelta(days=400)).isoformat()
 
 
 def _plugin(monkeypatch, **overrides):
@@ -34,6 +35,15 @@ def _plugin(monkeypatch, **overrides):
         "min_days_since_played": 7,
         "min_days_since_added": 7,
         "protect_favorites": True,
+        "notify_enabled": False,
+        "notify_user": "",
+        "notify_scan_results": True,
+        "notify_delete_results": True,
+        "age_reminder_enabled": False,
+        "age_reminder_days": 365,
+        "age_reminder_interval_hours": 168,
+        "age_reminder_limit": 10,
+        "age_reminder_cooldown_days": 30,
         **overrides,
     }
     plugin.init_plugin(config)
@@ -391,3 +401,349 @@ def test_actual_delete_requires_all_three_safety_switches(monkeypatch):
 
     assert response.success is False
     assert "允许实际删除" in response.message
+
+
+def test_age_reminder_service_requires_telegram_user_and_enabled(monkeypatch):
+    plugin, _ = _plugin(
+        monkeypatch,
+        notify_enabled=True,
+        notify_user="",
+        age_reminder_enabled=True,
+    )
+    assert plugin.get_service() == []
+
+    plugin, _ = _plugin(
+        monkeypatch,
+        notify_enabled=True,
+        notify_user="123456789",
+        age_reminder_enabled=True,
+        age_reminder_interval_hours=24,
+    )
+    services = plugin.get_service()
+
+    assert len(services) == 1
+    assert services[0]["trigger"] == "interval"
+    assert services[0]["kwargs"] == {"hours": 24}
+    assert services[0]["func"] == plugin.scan_age_reminders
+
+
+def test_age_reminder_filters_old_candidates_and_sends_buttons(monkeypatch):
+    plugin, data = _plugin(
+        monkeypatch,
+        notify_enabled=True,
+        notify_user="123456789",
+        age_reminder_enabled=True,
+        age_reminder_days=365,
+        age_reminder_cooldown_days=30,
+    )
+    old = {
+        "key": candidate_key("Emby", "movie", "old-movie"),
+        "scan_id": "scan-age",
+        "server": "Emby",
+        "server_type": "emby",
+        "user": "admin",
+        "category": "movie",
+        "kind": "movie",
+        "item_id": "old-movie",
+        "title": "一年前的电影",
+        "path": "/media/Movies/Old.mkv",
+        "paths": ["/media/Movies/Old.mkv"],
+        "percentage": 100,
+        "last_played": YEAR_OLD,
+        "added_at": YEAR_OLD,
+    }
+    recent = {
+        **old,
+        "key": candidate_key("Emby", "movie", "recent-movie"),
+        "item_id": "recent-movie",
+        "title": "新电影",
+        "added_at": OLD,
+    }
+    plugin._store_scan(
+        {
+            "scan_id": "scan-age",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "scanned": 2,
+            "candidates": [old, recent],
+            "errors": [],
+        }
+    )
+    plugin.api_scan = lambda _payload: SimpleNamespace(
+        success=True,
+        message="扫描完成",
+    )
+    sent = []
+    plugin.post_message = lambda **kwargs: sent.append(kwargs)
+
+    result = plugin._run_age_reminders()
+
+    assert result["success"] is True
+    assert result["age_candidates"] == 1
+    assert result["sent"] == 1
+    assert len(sent) == 1
+    assert sent[0]["channel"] == plugin_module.NotificationChannel.Telegram
+    assert sent[0]["userid"] == "123456789"
+    callbacks = [
+        button["callback_data"]
+        for row in sent[0]["buttons"]
+        for button in row
+    ]
+    assert callbacks[0] == f"[PLUGIN]WatchedCleaner|d:{old['key']}"
+    assert callbacks[1] == f"[PLUGIN]WatchedCleaner|k:{old['key']}"
+    assert all(len(callback.encode("utf-8")) <= 64 for callback in callbacks)
+    assert data["age_reminders"]["items"][old["key"]]["status"] == "pending"
+
+
+def test_age_reminder_cooldown_prevents_duplicate(monkeypatch):
+    plugin, _ = _plugin(
+        monkeypatch,
+        notify_enabled=True,
+        notify_user="123456789",
+        age_reminder_enabled=True,
+    )
+    key = candidate_key("Emby", "movie", "old-movie")
+    candidate = {
+        "key": key,
+        "added_at": YEAR_OLD,
+        "category": "movie",
+        "kind": "movie",
+        "title": "一年前的电影",
+    }
+    state = {
+        "items": {
+            key: {
+                "status": "pending",
+                "last_notified_at": datetime.now(timezone.utc).isoformat(),
+            }
+        }
+    }
+
+    assert (
+        plugin._eligible_age_reminder_candidates([candidate], state) == []
+    )
+
+
+def test_telegram_keep_callback_marks_kept_without_delete(monkeypatch):
+    plugin, data = _plugin(
+        monkeypatch,
+        notify_enabled=True,
+        notify_user="123456789",
+    )
+    key = candidate_key("Emby", "movie", "movie-1")
+    data["age_reminders"] = {
+        "version": 1,
+        "items": {
+            key: {
+                "status": "pending",
+                "recipient": "123456789",
+                "candidate": {
+                    "key": key,
+                    "server": "Emby",
+                    "category": "movie",
+                    "kind": "movie",
+                    "title": "测试电影",
+                },
+            }
+        },
+    }
+    replies = []
+    plugin.post_message = lambda **kwargs: replies.append(kwargs)
+    monkeypatch.setattr(
+        plugin_module,
+        "build_adapter",
+        lambda *_: (_ for _ in ()).throw(AssertionError("不应删除")),
+    )
+
+    plugin.on_message_action(
+        SimpleNamespace(
+            event_data={
+                "plugin_id": "WatchedCleaner",
+                "text": f"k:{key}",
+                "userid": 123456789,
+                "channel": plugin_module.NotificationChannel.Telegram,
+                "source": "bot",
+            }
+        )
+    )
+
+    assert data["age_reminders"]["items"][key]["status"] == "kept"
+    assert replies[-1]["title"] == "已保留"
+
+
+def test_telegram_delete_callback_still_requires_actual_delete_mode(monkeypatch):
+    plugin, data = _plugin(
+        monkeypatch,
+        dry_run=True,
+        allow_delete=True,
+        allowed_roots="/media",
+        notify_enabled=True,
+        notify_user="123456789",
+    )
+    key = candidate_key("Emby", "movie", "movie-1")
+    data["age_reminders"] = {
+        "version": 1,
+        "items": {
+            key: {
+                "status": "pending",
+                "recipient": "123456789",
+                "candidate": {
+                    "key": key,
+                    "server": "Emby",
+                    "category": "movie",
+                    "kind": "movie",
+                    "title": "测试电影",
+                },
+            }
+        },
+    }
+    replies = []
+    plugin.post_message = lambda **kwargs: replies.append(kwargs)
+    monkeypatch.setattr(
+        plugin_module,
+        "build_adapter",
+        lambda *_: (_ for _ in ()).throw(AssertionError("不应删除")),
+    )
+
+    plugin.on_message_action(
+        SimpleNamespace(
+            event_data={
+                "plugin_id": "WatchedCleaner",
+                "text": f"d:{key}",
+                "userid": 123456789,
+                "channel": plugin_module.NotificationChannel.Telegram,
+                "source": "bot",
+            }
+        )
+    )
+
+    assert data["age_reminders"]["items"][key]["status"] == "pending"
+    assert replies[-1]["title"] == "当前仍为预演模式"
+
+
+def test_telegram_delete_callback_revalidates_and_deletes(monkeypatch):
+    plugin, data = _plugin(
+        monkeypatch,
+        dry_run=False,
+        allow_delete=True,
+        allowed_roots="/media",
+        notify_enabled=True,
+        notify_user="123456789",
+    )
+    key = candidate_key("Emby", "movie", "movie-1")
+    candidate = {
+        "key": key,
+        "scan_id": "scan-age",
+        "server": "Emby",
+        "server_type": "emby",
+        "user": "admin",
+        "category": "movie",
+        "kind": "movie",
+        "item_id": "movie-1",
+        "title": "测试电影",
+        "path": "/media/Movies/Test.mkv",
+        "paths": ["/media/Movies/Test.mkv"],
+        "percentage": 100,
+        "last_played": YEAR_OLD,
+        "added_at": YEAR_OLD,
+    }
+    data["age_reminders"] = {
+        "version": 1,
+        "items": {
+            key: {
+                "status": "pending",
+                "recipient": "123456789",
+                "scan_id": "scan-age",
+                "candidate": candidate,
+            }
+        },
+    }
+    plugin._store_scan(
+        {
+            "scan_id": "scan-age",
+            "expires_at": (
+                datetime.now(timezone.utc) + timedelta(hours=1)
+            ).isoformat(),
+            "candidates": [candidate],
+        }
+    )
+    plugin._discover_services = lambda: ({"Emby": object()}, "")
+    replies = []
+    plugin.post_message = lambda **kwargs: replies.append(kwargs)
+
+    class FakeAdapter:
+        deleted = False
+
+        def refresh(self, _candidate):
+            return _movie_record(added_at=YEAR_OLD, last_played=YEAR_OLD)
+
+        def delete(self, _candidate):
+            self.deleted = True
+            return "媒体服务器已接受删除请求"
+
+    adapter = FakeAdapter()
+    monkeypatch.setattr(plugin_module, "build_adapter", lambda *_: adapter)
+
+    plugin.on_message_action(
+        SimpleNamespace(
+            event_data={
+                "plugin_id": "WatchedCleaner",
+                "text": f"d:{key}",
+                "userid": 123456789,
+                "channel": plugin_module.NotificationChannel.Telegram,
+                "source": "bot",
+            }
+        )
+    )
+
+    assert adapter.deleted is True
+    assert data["age_reminders"]["items"][key]["status"] == "deleted"
+    assert data["last_scan"]["candidates"] == []
+    assert data["history"][0]["action"] == "telegram_delete"
+    assert replies[-1]["title"] == "删除完成"
+
+
+def test_telegram_callback_rejects_other_user(monkeypatch):
+    plugin, data = _plugin(
+        monkeypatch,
+        notify_enabled=True,
+        notify_user="123456789",
+    )
+    key = candidate_key("Emby", "movie", "movie-1")
+    data["age_reminders"] = {
+        "version": 1,
+        "items": {
+            key: {
+                "status": "pending",
+                "recipient": "123456789",
+                "candidate": {
+                    "key": key,
+                    "server": "Emby",
+                    "category": "movie",
+                    "kind": "movie",
+                    "title": "测试电影",
+                },
+            }
+        },
+    }
+    replies = []
+    plugin.post_message = lambda **kwargs: replies.append(kwargs)
+    monkeypatch.setattr(
+        plugin_module,
+        "build_adapter",
+        lambda *_: (_ for _ in ()).throw(AssertionError("不应删除")),
+    )
+
+    plugin.on_message_action(
+        SimpleNamespace(
+            event_data={
+                "plugin_id": "WatchedCleaner",
+                "text": f"d:{key}",
+                "userid": 987654321,
+                "channel": plugin_module.NotificationChannel.Telegram,
+                "source": "bot",
+            }
+        )
+    )
+
+    assert data["age_reminders"]["items"][key]["status"] == "pending"
+    assert replies[-1]["title"] == "无权处理"

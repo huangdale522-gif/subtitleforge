@@ -12,8 +12,10 @@ from fastapi import Body
 
 from app import schemas
 from app.sdk.logging import logger
+from app.sdk.events import Event, eventmanager
 from app.sdk.plugin import _PluginBase
 from app.sdk.services import MediaServerHelper
+from app.schemas.types import EventType, MessageType, NotificationChannel
 
 from .adapters import AdapterError, MediaAdapter, build_adapter
 from .policy import (
@@ -22,6 +24,7 @@ from .policy import (
     as_bool,
     bounded_float,
     bounded_int,
+    days_since,
     normalize_categories,
     normalize_tv_mode,
     record_block_reason,
@@ -34,9 +37,12 @@ class WatchedCleaner(_PluginBase):
     """Preview watched media and delete only manually selected candidates."""
 
     plugin_name = "已观看媒体清理"
-    plugin_desc = "扫描 Emby/Jellyfin/Plex 的已观看电影、剧集和动漫，人工勾选后安全删除。"
+    plugin_desc = (
+        "扫描 Emby/Jellyfin/Plex 的已观看电影、剧集和动漫，"
+        "支持 Telegram 提醒和人工确认后安全删除。"
+    )
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     plugin_author = "huangdale522-gif"
     author_url = "https://github.com/huangdale522-gif"
     plugin_config_prefix = "watchedcleaner_"
@@ -60,6 +66,15 @@ class WatchedCleaner(_PluginBase):
     _max_delete_batch = 20
     _scan_ttl_hours = 24
     _history_limit = 500
+    _notify_enabled = False
+    _notify_user = ""
+    _notify_scan_results = True
+    _notify_delete_results = True
+    _age_reminder_enabled = False
+    _age_reminder_days = 365
+    _age_reminder_interval_hours = 168
+    _age_reminder_limit = 10
+    _age_reminder_cooldown_days = 30
 
     _operation_lock: RLock
     _state_lock: RLock
@@ -103,6 +118,29 @@ class WatchedCleaner(_PluginBase):
         self._history_limit = bounded_int(
             config.get("history_limit"), 500, 20, 5000
         )
+        self._notify_enabled = as_bool(config.get("notify_enabled"), False)
+        self._notify_user = str(config.get("notify_user") or "").strip()
+        self._notify_scan_results = as_bool(
+            config.get("notify_scan_results"), True
+        )
+        self._notify_delete_results = as_bool(
+            config.get("notify_delete_results"), True
+        )
+        self._age_reminder_enabled = as_bool(
+            config.get("age_reminder_enabled"), False
+        )
+        self._age_reminder_days = bounded_int(
+            config.get("age_reminder_days"), 365, 1, 3650
+        )
+        self._age_reminder_interval_hours = bounded_int(
+            config.get("age_reminder_interval_hours"), 168, 1, 720
+        )
+        self._age_reminder_limit = bounded_int(
+            config.get("age_reminder_limit"), 10, 1, 100
+        )
+        self._age_reminder_cooldown_days = bounded_int(
+            config.get("age_reminder_cooldown_days"), 30, 1, 3650
+        )
         if not hasattr(self, "_operation_lock"):
             self._operation_lock = RLock()
         if not hasattr(self, "_state_lock"):
@@ -118,6 +156,25 @@ class WatchedCleaner(_PluginBase):
     def get_command() -> List[Dict[str, Any]]:
         """This plugin deliberately exposes no remote command."""
         return []
+
+    def get_service(self) -> List[Dict[str, Any]]:
+        """Register a read-only reminder scan; it never deletes automatically."""
+        if not (
+            self._enabled
+            and self._notify_enabled
+            and self._valid_notify_user()
+            and self._age_reminder_enabled
+        ):
+            return []
+        return [
+            {
+                "id": "WatchedCleanerAgeReminder",
+                "name": "已观看媒体年度清理提醒",
+                "trigger": "interval",
+                "func": self.scan_age_reminders,
+                "kwargs": {"hours": self._age_reminder_interval_hours},
+            }
+        ]
 
     def get_api(self) -> List[Dict[str, Any]]:
         """Register scan, delete, status, and audit APIs."""
@@ -158,6 +215,17 @@ class WatchedCleaner(_PluginBase):
                 "methods": ["GET"],
                 "auth": "bear",
                 "summary": "查看支持的媒体服务器",
+            },
+            {
+                "path": "/age-reminders/run",
+                "endpoint": self.api_age_reminders,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "立即检查超过保留期限的已观看媒体",
+                "description": (
+                    "扫描已观看媒体，并通过 Telegram 逐条询问是否删除；"
+                    "不会自动删除任何文件。"
+                ),
             },
         ]
 
@@ -306,6 +374,78 @@ class WatchedCleaner(_PluginBase):
                 min=20,
                 max=5000,
             ),
+            self._field(
+                "VSwitch",
+                "notify_enabled",
+                "启用 Telegram 推送",
+                md=4,
+            ),
+            self._field(
+                "VTextField",
+                "notify_user",
+                "Telegram 用户 ID",
+                md=8,
+                placeholder="例如 123456789",
+                **{"persistent-hint": True},
+                hint=(
+                    "年度删除按钮只接受该用户点击。可向 Telegram 的 "
+                    "@userinfobot 发送消息获取数字 ID。"
+                ),
+            ),
+            self._field(
+                "VSwitch",
+                "notify_scan_results",
+                "推送扫描结果",
+                md=4,
+            ),
+            self._field(
+                "VSwitch",
+                "notify_delete_results",
+                "推送删除结果",
+                md=4,
+            ),
+            self._field(
+                "VSwitch",
+                "age_reminder_enabled",
+                "启用超过保留期限的年度询问",
+                md=4,
+            ),
+            self._field(
+                "VTextField",
+                "age_reminder_days",
+                "入库超过多少天后询问",
+                md=3,
+                type="number",
+                min=1,
+                max=3650,
+            ),
+            self._field(
+                "VTextField",
+                "age_reminder_interval_hours",
+                "自动检查间隔（小时）",
+                md=3,
+                type="number",
+                min=1,
+                max=720,
+            ),
+            self._field(
+                "VTextField",
+                "age_reminder_limit",
+                "每轮最多询问条数",
+                md=3,
+                type="number",
+                min=1,
+                max=100,
+            ),
+            self._field(
+                "VTextField",
+                "age_reminder_cooldown_days",
+                "未处理提醒重复间隔（天）",
+                md=3,
+                type="number",
+                min=1,
+                max=3650,
+            ),
         ]
         return [
             {
@@ -334,6 +474,19 @@ class WatchedCleaner(_PluginBase):
                             "text": (
                                 "插件通过媒体服务器 API 删除，不会直接操作 NAS 文件系统。"
                                 "Emby/Jellyfin API Key 和 Plex Token 必须具有删除权限。"
+                            ),
+                        },
+                    },
+                    {
+                        "component": "VAlert",
+                        "props": {
+                            "type": "warning",
+                            "variant": "tonal",
+                            "class": "mt-3",
+                            "text": (
+                                "年度询问会按媒体服务器返回的入库时间筛选已观看内容。"
+                                "启用前请先在 MoviePilot 配置 Telegram 通知，并填写"
+                                " Telegram 数字用户 ID；插件只会询问，不会自动删除。"
                             ),
                         },
                     },
@@ -376,32 +529,86 @@ class WatchedCleaner(_PluginBase):
                 )
             )
 
+        if self._age_reminder_enabled and not self._notify_enabled:
+            content.append(
+                self._alert(
+                    "warning",
+                    "年度询问已开启，但 Telegram 推送未启用，不会发送提醒。",
+                )
+            )
+        elif self._age_reminder_enabled and not self._valid_notify_user():
+            content.append(
+                self._alert(
+                    "warning",
+                    "年度询问已开启，但未填写 Telegram 用户 ID，"
+                    "为避免群聊误点删除，插件不会发送提醒。",
+                )
+            )
+
+        actions: List[dict[str, Any]] = [
+            {
+                "component": "VBtn",
+                "props": {
+                    "color": "primary",
+                    "variant": "tonal",
+                    "prepend-icon": "mdi-magnify-scan",
+                    "onclick": self._scan_onclick(),
+                },
+                "text": "扫描已观看媒体",
+            }
+        ]
+        if (
+            self._notify_enabled
+            and self._valid_notify_user()
+            and self._age_reminder_enabled
+        ):
+            actions.append(
+                {
+                    "component": "VBtn",
+                    "props": {
+                        "color": "warning",
+                        "variant": "tonal",
+                        "prepend-icon": "mdi-bell-alert",
+                        "onclick": self._age_reminder_onclick(),
+                    },
+                    "text": "立即检查超期内容",
+                }
+            )
+        actions.extend(
+            [
+                {
+                    "component": "VChip",
+                    "props": {"variant": "tonal"},
+                    "text": f"候选 {len(candidates)}",
+                },
+                {
+                    "component": "VChip",
+                    "props": {"variant": "tonal", "color": "default"},
+                    "text": f"批量上限 {self._max_delete_batch}",
+                },
+                {
+                    "component": "VChip",
+                    "props": {
+                        "variant": "tonal",
+                        "color": (
+                            "warning"
+                            if self._age_reminder_enabled
+                            else "default"
+                        ),
+                    },
+                    "text": (
+                        f"年度询问 {self._age_reminder_days} 天"
+                        if self._age_reminder_enabled
+                        else "年度询问关闭"
+                    ),
+                },
+            ]
+        )
         content.append(
             {
                 "component": "div",
                 "props": {"class": "d-flex flex-wrap align-center ga-2 my-3"},
-                "content": [
-                    {
-                        "component": "VBtn",
-                        "props": {
-                            "color": "primary",
-                            "variant": "tonal",
-                            "prepend-icon": "mdi-magnify-scan",
-                            "onclick": self._scan_onclick(),
-                        },
-                        "text": "扫描已观看媒体",
-                    },
-                    {
-                        "component": "VChip",
-                        "props": {"variant": "tonal"},
-                        "text": f"候选 {len(candidates)}",
-                    },
-                    {
-                        "component": "VChip",
-                        "props": {"variant": "tonal", "color": "default"},
-                        "text": f"批量上限 {self._max_delete_batch}",
-                    },
-                ],
+                "content": actions,
             }
         )
 
@@ -434,6 +641,18 @@ class WatchedCleaner(_PluginBase):
                 content.append(
                     self._alert("error", "扫描错误：" + "；".join(errors))
                 )
+
+        reminder_state = self._load_age_reminder_state()
+        reminder_counts = self._age_reminder_counts(reminder_state)
+        if reminder_counts["pending"]:
+            content.append(
+                self._alert(
+                    "info",
+                    f"Telegram 年度询问待处理 {reminder_counts['pending']} 条；"
+                    f"已保留 {reminder_counts['kept']} 条；"
+                    f"已通过 Telegram 删除 {reminder_counts['deleted']} 条。",
+                )
+            )
 
         if not candidates:
             content.append(
@@ -562,6 +781,7 @@ class WatchedCleaner(_PluginBase):
                 message += "；候选达到上限，结果已截断"
             if errors:
                 message += f"；{len(errors)} 个错误"
+            self._notify_scan_completed(state, message)
             return schemas.Response(
                 success=True,
                 message=message,
@@ -699,6 +919,7 @@ class WatchedCleaner(_PluginBase):
                 f"处理完成：删除 {counts['deleted']}，预演通过 {counts['dry_run']}，"
                 f"跳过 {counts['skipped']}，失败 {counts['failed']}"
             )
+            self._notify_delete_completed(counts, results)
             return schemas.Response(
                 success=counts["failed"] == 0,
                 message=message,
@@ -729,6 +950,8 @@ class WatchedCleaner(_PluginBase):
     def api_status(self) -> schemas.Response:
         """Return the current safety mode and latest scan summary."""
         scan = self._load_scan()
+        reminder_state = self._load_age_reminder_state()
+        reminder_counts = self._age_reminder_counts(reminder_state)
         return schemas.Response(
             success=True,
             data={
@@ -736,6 +959,18 @@ class WatchedCleaner(_PluginBase):
                 "dry_run": self._dry_run,
                 "allow_delete": self._allow_delete,
                 "has_allowed_roots": bool(valid_roots(split_values(self._allowed_roots))),
+                "telegram": {
+                    "enabled": self._notify_enabled,
+                    "has_user": self._valid_notify_user(),
+                },
+                "age_reminder": {
+                    "enabled": self._age_reminder_enabled,
+                    "days": self._age_reminder_days,
+                    "interval_hours": self._age_reminder_interval_hours,
+                    "last_run_at": reminder_state.get("last_run_at"),
+                    "last_run": reminder_state.get("last_run") or {},
+                    "counts": reminder_counts,
+                },
                 "scan": {
                     "scan_id": scan.get("scan_id"),
                     "created_at": scan.get("created_at"),
@@ -765,6 +1000,27 @@ class WatchedCleaner(_PluginBase):
             },
         )
 
+    def api_age_reminders(
+        self, payload: Optional[dict] = Body(default=None)
+    ) -> schemas.Response:
+        """Run a read-only age scan and send Telegram confirmation requests."""
+        del payload
+        try:
+            result = self._run_age_reminders()
+        except Exception as error:
+            logger.exception(f"[已观看媒体清理] 年度询问失败：{error}")
+            return self._failure(f"年度询问失败：{error}")
+        if not result.get("success"):
+            return self._failure(str(result.get("message") or "年度询问失败"))
+        return schemas.Response(
+            success=True,
+            message=(
+                f"年度询问完成：发送 {result.get('sent', 0)} 条，"
+                f"剩余待处理 {result.get('remaining', 0)} 条"
+            ),
+            data=result,
+        )
+
     def _current_config(self) -> dict[str, Any]:
         return {
             "enabled": self._enabled,
@@ -784,6 +1040,15 @@ class WatchedCleaner(_PluginBase):
             "max_delete_batch": self._max_delete_batch,
             "scan_ttl_hours": self._scan_ttl_hours,
             "history_limit": self._history_limit,
+            "notify_enabled": self._notify_enabled,
+            "notify_user": self._notify_user,
+            "notify_scan_results": self._notify_scan_results,
+            "notify_delete_results": self._notify_delete_results,
+            "age_reminder_enabled": self._age_reminder_enabled,
+            "age_reminder_days": self._age_reminder_days,
+            "age_reminder_interval_hours": self._age_reminder_interval_hours,
+            "age_reminder_limit": self._age_reminder_limit,
+            "age_reminder_cooldown_days": self._age_reminder_cooldown_days,
         }
 
     def _scan_options(self, payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -913,6 +1178,633 @@ class WatchedCleaner(_PluginBase):
             f"[已观看媒体清理] 写入 {len(records)} 条审计记录，"
             f"当前保留 {min(len(history), self._history_limit)} 条"
         )
+
+    def scan_age_reminders(self) -> dict[str, Any]:
+        """Scheduled entry point: scan and ask, but never delete automatically."""
+        try:
+            return self._run_age_reminders()
+        except Exception as error:
+            logger.exception(f"[已观看媒体清理] 定时年度询问失败：{error}")
+            return {"success": False, "message": str(error)}
+
+    def _run_age_reminders(self) -> dict[str, Any]:
+        if not self._enabled:
+            return {"success": False, "message": "插件未启用"}
+        if not self._notify_enabled:
+            return {"success": False, "message": "Telegram 推送未启用"}
+        if not self._valid_notify_user():
+            return {
+                "success": False,
+                "message": "请填写有效的 Telegram 数字用户 ID，以避免他人误点删除",
+            }
+        if not self._age_reminder_enabled:
+            return {"success": False, "message": "年度询问未启用"}
+
+        scan_response = self.api_scan({})
+        if not getattr(scan_response, "success", False):
+            return {
+                "success": False,
+                "message": str(
+                    getattr(scan_response, "message", "") or "扫描失败"
+                ),
+            }
+
+        scan = self._load_scan()
+        state = self._load_age_reminder_state()
+        now = datetime.now(timezone.utc)
+        eligible = self._eligible_age_reminder_candidates(
+            list(scan.get("candidates") or []),
+            state,
+            now=now,
+        )
+        selected = eligible[: self._age_reminder_limit]
+        sent = 0
+        failed = 0
+        for candidate in selected:
+            key = str(candidate.get("key") or "")
+            if not self._send_age_reminder(candidate):
+                failed += 1
+                continue
+            items = state.setdefault("items", {})
+            previous = items.get(key) if isinstance(items, dict) else {}
+            previous = previous if isinstance(previous, dict) else {}
+            items[key] = {
+                **previous,
+                "status": "pending",
+                "recipient": self._notify_user,
+                "first_notified_at": (
+                    previous.get("first_notified_at") or now.isoformat()
+                ),
+                "last_notified_at": now.isoformat(),
+                "updated_at": now.isoformat(),
+                "scan_id": scan.get("scan_id"),
+                "candidate": dict(candidate),
+            }
+            self._store_age_reminder_state(state)
+            sent += 1
+
+        remaining = max(len(eligible) - sent, 0)
+        summary = {
+            "success": True,
+            "scanned": int(scan.get("scanned") or 0),
+            "age_candidates": len(eligible),
+            "sent": sent,
+            "failed": failed,
+            "remaining": remaining,
+            "scan_id": scan.get("scan_id"),
+            "message": (
+                f"超过 {self._age_reminder_days} 天的已观看候选 "
+                f"{len(eligible)} 条，已发送 {sent} 条"
+            ),
+        }
+        state["last_run_at"] = now.isoformat()
+        state["last_run"] = summary
+        self._store_age_reminder_state(state)
+        logger.info(f"[已观看媒体清理] 年度询问：{summary}")
+        return summary
+
+    def _eligible_age_reminder_candidates(
+        self,
+        candidates: List[dict[str, Any]],
+        state: Mapping[str, Any],
+        now: Optional[datetime] = None,
+    ) -> List[dict[str, Any]]:
+        """Filter candidates by age and persisted per-item cooldown."""
+        current = now or datetime.now(timezone.utc)
+        raw_items = state.get("items")
+        items = raw_items if isinstance(raw_items, Mapping) else {}
+        eligible: List[dict[str, Any]] = []
+        for candidate in candidates:
+            key = str(candidate.get("key") or "")
+            if not self._valid_candidate_key(key):
+                continue
+            age_days = days_since(candidate.get("added_at"), current)
+            if age_days is None or age_days < self._age_reminder_days:
+                continue
+            raw_item = items.get(key)
+            item = raw_item if isinstance(raw_item, Mapping) else {}
+            status = str(item.get("status") or "")
+            if status in {"kept", "deleted"}:
+                continue
+            elapsed = days_since(item.get("last_notified_at"), current)
+            if (
+                elapsed is not None
+                and elapsed < self._age_reminder_cooldown_days
+            ):
+                continue
+            enriched = dict(candidate)
+            enriched["age_days"] = round(age_days, 1)
+            enriched["reminder_status"] = status or "new"
+            eligible.append(enriched)
+        eligible.sort(
+            key=lambda item: float(item.get("age_days") or 0),
+            reverse=True,
+        )
+        return eligible
+
+    def _send_age_reminder(self, candidate: Mapping[str, Any]) -> bool:
+        key = str(candidate.get("key") or "")
+        if not self._valid_candidate_key(key):
+            return False
+        category = {
+            "movie": "电影",
+            "tv": "剧集",
+            "anime": "动漫",
+        }.get(str(candidate.get("category") or ""), "媒体")
+        kind = str(candidate.get("kind") or "")
+        if kind == "series":
+            action_label = "删除整部剧"
+        elif kind == "episode":
+            action_label = "删除这一集"
+        else:
+            action_label = "删除这部电影"
+        display = self._candidate_display(candidate)
+        added_at = str(candidate.get("added_at") or "-")
+        age_days = int(float(candidate.get("age_days") or 0))
+        path = str(candidate.get("path") or "-")
+        if len(path) > 300:
+            path = path[:297] + "..."
+        text = "\n".join(
+            [
+                f"分类：{category}",
+                f"内容：{display}",
+                f"媒体服务器：{candidate.get('server') or '-'}",
+                f"入库时间：{added_at}（已 {age_days} 天）",
+                f"观看进度：{float(candidate.get('percentage') or 0):.1f}%",
+                f"路径：{path}",
+                "",
+                "请选择是否删除。插件不会自动执行删除。",
+            ]
+        )
+        buttons = [
+            [
+                {
+                    "text": action_label,
+                    "callback_data": self._age_reminder_callback_data(
+                        "d", key
+                    ),
+                },
+                {
+                    "text": "保留，不再询问",
+                    "callback_data": self._age_reminder_callback_data(
+                        "k", key
+                    ),
+                },
+            ]
+        ]
+        return self._send_plugin_message(
+            title=f"入库超过 {self._age_reminder_days} 天，是否删除？",
+            text=text,
+            buttons=buttons,
+            userid=self._notify_user,
+        )
+
+    def _age_reminder_callback_data(self, action: str, key: str) -> str:
+        return f"[PLUGIN]{self.__class__.__name__}|{action}:{key}"
+
+    @staticmethod
+    def _candidate_display(candidate: Mapping[str, Any]) -> str:
+        kind = str(candidate.get("kind") or "")
+        title = str(candidate.get("title") or "-")
+        if kind == "episode":
+            series_title = str(candidate.get("series_title") or title)
+            season = candidate.get("season")
+            episode = candidate.get("episode")
+            episode_label = ""
+            if season is not None and episode is not None:
+                try:
+                    episode_label = (
+                        f" S{int(season):02d}E{int(episode):02d}"
+                    )
+                except (TypeError, ValueError):
+                    episode_label = f" S{season}E{episode}"
+            return f"{series_title}{episode_label} - {title}"
+        return title
+
+    def _send_plugin_message(
+        self,
+        *,
+        title: str,
+        text: str,
+        buttons: Optional[List[List[dict[str, Any]]]] = None,
+        userid: Optional[str] = None,
+        source: Optional[str] = None,
+    ) -> bool:
+        if not self._notify_enabled:
+            return False
+        try:
+            self.post_message(
+                channel=NotificationChannel.Telegram,
+                mtype=MessageType.Plugin,
+                title=title,
+                text=text,
+                userid=self._notify_user or userid,
+                source=source,
+                buttons=buttons,
+            )
+            return True
+        except Exception as error:
+            logger.warning(f"[已观看媒体清理] Telegram 推送失败：{error}")
+            return False
+
+    def _notify_scan_completed(
+        self, state: Mapping[str, Any], summary: str
+    ) -> None:
+        if not self._notify_scan_results:
+            return
+        errors = list(state.get("errors") or [])
+        text = "\n".join(
+            [
+                summary,
+                f"扫描条目：{state.get('scanned', 0)}",
+                f"候选数量：{len(state.get('candidates') or [])}",
+                f"扫描时间：{state.get('created_at') or '-'}",
+                *(
+                    [f"错误：{'；'.join(str(item) for item in errors[:3])}"]
+                    if errors
+                    else []
+                ),
+            ]
+        )
+        self._send_plugin_message(title="已观看媒体扫描结果", text=text)
+
+    def _notify_delete_completed(
+        self,
+        counts: Mapping[str, Any],
+        results: List[dict[str, Any]],
+    ) -> None:
+        if not self._notify_delete_results:
+            return
+        details = []
+        for result in results[:10]:
+            title = str(result.get("title") or "-")
+            status = str(result.get("status") or "-")
+            details.append(f"{title}：{status} {result.get('message') or ''}".strip())
+        if len(results) > 10:
+            details.append(f"另有 {len(results) - 10} 条未展开")
+        title = "删除预演完成" if self._dry_run else "媒体删除完成"
+        text = "\n".join(
+            [
+                (
+                    f"删除 {counts.get('deleted', 0)}，"
+                    f"预演通过 {counts.get('dry_run', 0)}，"
+                    f"跳过 {counts.get('skipped', 0)}，"
+                    f"失败 {counts.get('failed', 0)}"
+                ),
+                *details,
+            ]
+        )
+        self._send_plugin_message(title=title, text=text)
+
+    def _load_age_reminder_state(self) -> dict[str, Any]:
+        with self._state_lock:
+            raw = self._safe_get_data("age_reminders")
+        state = dict(raw) if isinstance(raw, Mapping) else {}
+        items = state.get("items")
+        state["version"] = 1
+        state["items"] = dict(items) if isinstance(items, Mapping) else {}
+        return state
+
+    def _store_age_reminder_state(self, state: Mapping[str, Any]) -> None:
+        with self._state_lock:
+            normalized = dict(state)
+            normalized["version"] = 1
+            items = normalized.get("items")
+            normalized["items"] = (
+                dict(items) if isinstance(items, Mapping) else {}
+            )
+            if len(normalized["items"]) > 2000:
+                def updated_at(entry: Any) -> str:
+                    value = entry[1]
+                    return (
+                        str(value.get("updated_at") or "")
+                        if isinstance(value, Mapping)
+                        else ""
+                    )
+
+                ordered = sorted(
+                    normalized["items"].items(),
+                    key=updated_at,
+                    reverse=True,
+                )
+                normalized["items"] = dict(ordered[:2000])
+            self.save_data("age_reminders", normalized)
+
+    def _update_age_reminder_item(
+        self, key: str, **updates: Any
+    ) -> dict[str, Any]:
+        state = self._load_age_reminder_state()
+        item = state["items"].get(key)
+        item = dict(item) if isinstance(item, Mapping) else {}
+        item.update(updates)
+        item["updated_at"] = datetime.now(timezone.utc).isoformat()
+        state["items"][key] = item
+        self._store_age_reminder_state(state)
+        return item
+
+    @staticmethod
+    def _age_reminder_counts(state: Mapping[str, Any]) -> dict[str, int]:
+        items = state.get("items")
+        items = items if isinstance(items, Mapping) else {}
+        counts = {
+            "pending": 0,
+            "kept": 0,
+            "deleted": 0,
+            "blocked": 0,
+            "failed": 0,
+        }
+        for item in items.values():
+            if not isinstance(item, Mapping):
+                continue
+            status = str(item.get("status") or "")
+            if status in counts:
+                counts[status] += 1
+        return counts
+
+    @eventmanager.register(EventType.MessageAction)
+    def on_message_action(self, event: Event) -> None:
+        """Handle Telegram delete/keep callbacks for age reminders."""
+        data = event.event_data if isinstance(event.event_data, Mapping) else {}
+        if data.get("plugin_id") != self.__class__.__name__:
+            return
+        callback_text = str(data.get("text") or "")
+        action, separator, key = callback_text.partition(":")
+        if not separator or action not in {"d", "k"}:
+            return
+        if not self._valid_candidate_key(key):
+            self._reply_to_event(data, "提醒无效", "候选标识格式不正确。")
+            return
+
+        state = self._load_age_reminder_state()
+        item = state["items"].get(key)
+        if not isinstance(item, Mapping):
+            self._reply_to_event(
+                data,
+                "提醒已失效",
+                "没有找到这条提醒，请等待下一次扫描或重新扫描。",
+            )
+            return
+
+        userid = str(data.get("userid") or "")
+        recipient = str(item.get("recipient") or "")
+        if not userid or userid != recipient or userid != self._notify_user:
+            self._reply_to_event(
+                data,
+                "无权处理",
+                "只有收到该提醒的 Telegram 用户才能操作。",
+            )
+            return
+
+        status = str(item.get("status") or "")
+        if status == "kept":
+            self._reply_to_event(data, "已经保留", "这条内容不会再次询问。")
+            return
+        if status == "deleted":
+            self._reply_to_event(data, "已经删除", "这条媒体已完成删除。")
+            return
+        if action == "k":
+            self._handle_age_reminder_keep(data, key, item)
+        else:
+            self._handle_age_reminder_delete(data, key, item)
+
+    def _handle_age_reminder_keep(
+        self,
+        event_data: Mapping[str, Any],
+        key: str,
+        item: Mapping[str, Any],
+    ) -> None:
+        candidate = item.get("candidate")
+        candidate = candidate if isinstance(candidate, Mapping) else {}
+        try:
+            self._update_age_reminder_item(
+                key,
+                status="kept",
+                kept_at=datetime.now(timezone.utc).isoformat(),
+            )
+        except Exception as error:
+            logger.warning(
+                f"[已观看媒体清理] 保存保留状态失败：{error}"
+            )
+            self._reply_to_event(
+                event_data,
+                "保存失败",
+                "未能保存保留状态，请稍后重试。",
+            )
+            return
+        self._reply_to_event(
+            event_data,
+            "已保留",
+            f"{self._candidate_display(candidate)} 已保留，后续不再询问。",
+        )
+
+    def _handle_age_reminder_delete(
+        self,
+        event_data: Mapping[str, Any],
+        key: str,
+        item: Mapping[str, Any],
+    ) -> None:
+        if not self._enabled:
+            self._reply_to_event(event_data, "插件未启用", "未执行删除。")
+            return
+        if not self._notify_enabled or not self._valid_notify_user():
+            self._reply_to_event(
+                event_data,
+                "Telegram 推送已关闭",
+                "未执行删除。请先重新启用 Telegram 推送和用户校验。",
+            )
+            return
+        if self._dry_run:
+            self._reply_to_event(
+                event_data,
+                "当前仍为预演模式",
+                "未删除任何文件。请先在插件设置中关闭预演模式。",
+            )
+            return
+        if not self._allow_delete:
+            self._reply_to_event(
+                event_data,
+                "实际删除未开启",
+                "未删除任何文件。请先开启“允许实际删除”。",
+            )
+            return
+        roots = split_values(self._allowed_roots)
+        if not valid_roots(roots):
+            self._reply_to_event(
+                event_data,
+                "路径白名单无效",
+                "未删除任何文件。请先配置媒体服务器路径白名单。",
+            )
+            return
+        if not self._operation_lock.acquire(blocking=False):
+            self._reply_to_event(
+                event_data,
+                "任务正在执行",
+                "请等待当前扫描或删除完成后再试。",
+            )
+            return
+
+        candidate = item.get("candidate")
+        candidate = candidate if isinstance(candidate, Mapping) else {}
+        result = self._result_base(candidate)
+        try:
+            latest_state = self._load_age_reminder_state()
+            latest_item = latest_state["items"].get(key)
+            latest_item = (
+                latest_item if isinstance(latest_item, Mapping) else {}
+            )
+            if latest_item.get("status") not in {
+                "pending",
+                "blocked",
+                "failed",
+            }:
+                self._reply_to_event(
+                    event_data,
+                    "提醒状态已变化",
+                    "请重新扫描后再操作。",
+                )
+                return
+
+            services, discovery_error = self._discover_services()
+            if discovery_error:
+                raise AdapterError(discovery_error)
+            server_name = str(candidate.get("server") or "")
+            service = services.get(server_name)
+            if not service:
+                raise AdapterError("原媒体服务器已不可用")
+            adapter = build_adapter(server_name, service)
+            current = adapter.refresh(candidate)
+            current_paths = self._record_paths(current)
+            if current_paths:
+                result["path"] = current_paths[0]
+            reason = record_block_reason(current, self._delete_policy())
+            if reason:
+                result.update(status="skipped", message=reason)
+                self._safe_update_age_reminder_item(
+                    key,
+                    status="blocked",
+                    last_checked_at=datetime.now(timezone.utc).isoformat(),
+                    message=reason,
+                )
+                self._append_telegram_audit(result, item.get("scan_id"))
+                self._reply_to_event(
+                    event_data,
+                    "安全校验未通过",
+                    f"{self._candidate_display(candidate)}：{reason}",
+                )
+                return
+
+            message = adapter.delete(candidate)
+            result.update(status="deleted", message=message)
+            self._safe_update_age_reminder_item(
+                key,
+                status="deleted",
+                deleted_at=datetime.now(timezone.utc).isoformat(),
+                message=message,
+            )
+            try:
+                self._remove_scan_candidate(key)
+            except Exception as cleanup_error:
+                logger.warning(
+                    f"[已观看媒体清理] 删除后更新候选快照失败：{cleanup_error}"
+                )
+            self._append_telegram_audit(result, item.get("scan_id"))
+            self._reply_to_event(
+                event_data,
+                "删除完成",
+                f"{self._candidate_display(candidate)}：{message}",
+            )
+        except Exception as error:
+            result.update(status="failed", message=str(error))
+            self._safe_update_age_reminder_item(
+                key,
+                status="failed",
+                last_checked_at=datetime.now(timezone.utc).isoformat(),
+                message=str(error),
+            )
+            self._append_telegram_audit(result, item.get("scan_id"))
+            logger.warning(
+                f"[已观看媒体清理] Telegram 删除失败：{error}"
+            )
+            self._reply_to_event(
+                event_data,
+                "删除失败",
+                f"{self._candidate_display(candidate)}：{error}",
+            )
+        finally:
+            self._operation_lock.release()
+
+    def _safe_update_age_reminder_item(
+        self, key: str, **updates: Any
+    ) -> None:
+        try:
+            self._update_age_reminder_item(key, **updates)
+        except Exception as error:
+            logger.warning(
+                f"[已观看媒体清理] 更新年度提醒状态失败：{error}"
+            )
+
+    def _append_telegram_audit(
+        self, result: Mapping[str, Any], scan_id: Any
+    ) -> None:
+        try:
+            self._append_history(
+                [
+                    {
+                        **result,
+                        "time": datetime.now(timezone.utc).isoformat(),
+                        "action": "telegram_delete",
+                        "scan_id": scan_id,
+                    }
+                ]
+            )
+        except Exception as error:
+            logger.warning(
+                f"[已观看媒体清理] 写入 Telegram 审计记录失败：{error}"
+            )
+
+    def _reply_to_event(
+        self,
+        event_data: Mapping[str, Any],
+        title: str,
+        text: str,
+    ) -> None:
+        try:
+            self.post_message(
+                channel=event_data.get("channel")
+                or NotificationChannel.Telegram,
+                mtype=MessageType.Plugin,
+                title=title,
+                text=text,
+                userid=event_data.get("userid"),
+                source=event_data.get("source"),
+            )
+        except Exception as error:
+            logger.warning(
+                f"[已观看媒体清理] Telegram 回调回复失败：{error}"
+            )
+
+    def _remove_scan_candidate(self, key: str) -> None:
+        scan = self._load_scan()
+        candidates = list(scan.get("candidates") or [])
+        remaining = [
+            candidate
+            for candidate in candidates
+            if str(candidate.get("key") or "") != key
+        ]
+        if len(remaining) == len(candidates):
+            return
+        scan["candidates"] = remaining
+        self._store_scan(scan)
+
+    @staticmethod
+    def _valid_candidate_key(key: str) -> bool:
+        return (
+            len(key) == 24
+            and all(char in "0123456789abcdef" for char in key)
+        )
+
+    def _valid_notify_user(self) -> bool:
+        return bool(self._notify_user and self._notify_user.isdigit())
 
     def _safe_get_data(self, key: str) -> Any:
         try:
@@ -1055,6 +1947,22 @@ class WatchedCleaner(_PluginBase):
             "if(!r||r.success===false){alert((r&&r.message)||'扫描失败');return;}"
             "alert(r.message||'扫描完成');location.reload();"
             "}).catch(function(err){console.error(err);alert('扫描失败');});"
+            "})()"
+        )
+
+    def _age_reminder_onclick(self) -> str:
+        api = json.dumps(
+            f"plugin/{self.__class__.__name__}/age-reminders/run"
+        )
+        return (
+            "(function(){"
+            "if(!confirm('将扫描已观看媒体，并通过 Telegram 逐条询问是否删除；"
+            "不会自动删除。继续？')){return;}"
+            f"window.MoviePilotAPI.post({api},{{}})"
+            ".then(function(r){"
+            "if(!r||r.success===false){alert((r&&r.message)||'年度询问失败');return;}"
+            "alert(r.message||'年度询问完成');location.reload();"
+            "}).catch(function(err){console.error(err);alert('年度询问失败');});"
             "})()"
         )
 
