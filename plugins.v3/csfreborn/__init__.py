@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -77,7 +78,7 @@ class CSFReborn(_PluginBase):
         "内置 SubtitleBest / ASSRT / 迅雷 / Shooter 字幕源，无需额外服务也能工作。"
     )
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.6.2"
+    plugin_version = "0.6.3"
     plugin_author = "SubtitleForge contributors"
     author_url = "https://github.com/"
     plugin_config_prefix = "csfreborn_"
@@ -1827,11 +1828,26 @@ class CSFReborn(_PluginBase):
                                     "text": (
                                         "；".join(
                                             f"{item.get('title', '')}: "
-                                            f"{item.get('status', '')}"
+                                            f"{self._status_label(item.get('status'))}"
                                             for item in missing[:5]
                                         )
                                         or "本轮没有发现需要补全的条目"
                                     ),
+                                },
+                                {
+                                    "component": "div",
+                                    "props": {"class": "text-caption text-warning mt-1"},
+                                    "text": (
+                                        f"本轮没有下载字幕：{int(latest_scan.get('queued') or 0)} 条已进入"
+                                        "待补全队列，可在上方表格勾选后手动下载。"
+                                    ),
+                                } if (
+                                    int(latest_scan.get("downloaded") or 0) == 0
+                                    and int(latest_scan.get("queued") or 0) > 0
+                                ) else {
+                                    "component": "span",
+                                    "props": {"class": "d-none"},
+                                    "text": "",
                                 },
                             ],
                         }
@@ -1994,6 +2010,18 @@ class CSFReborn(_PluginBase):
 
     def _queue_card(self, queue: list[dict[str, Any]]) -> dict[str, Any]:
         """Render the pending queue grouped by movies and TV seasons."""
+
+        # 页面渲染时先尝试本地 NFO 海报，避免依赖 TMDB 接口
+        poster_changed = False
+        for entry in queue:
+            if entry.get("poster"):
+                continue
+            poster = self._poster_from_nfo(Path(str(entry.get("path") or "")))
+            if poster:
+                entry["poster"] = poster
+                poster_changed = True
+        if poster_changed:
+            self._save_queue(queue)
 
         movies, seasons = self._queue_groups(queue)
         episode_count = sum(len(item["entries"]) for item in seasons)
@@ -2463,6 +2491,36 @@ class CSFReborn(_PluginBase):
             + (text if text.startswith("/") else f"/{text}")
         )
 
+    @staticmethod
+    def _poster_from_nfo(video: Path) -> str:
+        """Read the poster URL from a scraped NFO beside the video."""
+
+        folder = video.parent
+        candidates = [
+            folder / f"{video.stem}.nfo",
+            folder / "movie.nfo",
+            folder / "tvshow.nfo",
+            folder.parent / "tvshow.nfo",
+            folder.parent / "movie.nfo",
+        ]
+        for nfo in candidates:
+            try:
+                if not nfo.is_file():
+                    continue
+                text = nfo.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            matched = re.search(
+                r'<thumb[^>]*aspect="poster"[^>]*>\s*([^<\s]+)\s*</thumb>',
+                text,
+                re.IGNORECASE,
+            ) or re.search(r"<thumb[^>]*>\s*([^<\s]+)\s*</thumb>", text, re.IGNORECASE)
+            if matched:
+                url = matched.group(1).strip()
+                if url.startswith("http"):
+                    return url
+        return ""
+
     async def _enrich_queue_posters(self) -> None:
         """Fill missing posters for the first few queue entries (best effort)."""
 
@@ -2476,6 +2534,11 @@ class CSFReborn(_PluginBase):
 
         changed = False
         for entry in pending:
+            nfo_poster = self._poster_from_nfo(Path(str(entry.get("path") or "")))
+            if nfo_poster:
+                entry["poster"] = nfo_poster
+                changed = True
+                continue
             try:
                 info = await chain.async_match_tmdbinfo(
                     name=str(entry.get("title") or ""),
@@ -2603,6 +2666,24 @@ class CSFReborn(_PluginBase):
             self._history_key,
             json.dumps(history[: self._history_max], ensure_ascii=False),
         )
+
+    @staticmethod
+    def _status_label(status: Any) -> str:
+        """Map SubtitleForge status codes to readable Chinese labels."""
+
+        return {
+            "queued": "排队中",
+            "dry_run": "待下载",
+            "not_found": "未找到",
+            "partial": "部分缺失",
+            "error": "失败",
+            "downloaded": "已下载",
+            "completed": "已完成",
+            "skipped": "已跳过",
+            "ok": "正常",
+            "existing": "已有字幕",
+            "busy": "忙碌",
+        }.get(str(status or ""), str(status or "-"))
 
     @staticmethod
     def _media_type(value: Any) -> str:

@@ -150,11 +150,23 @@ class _ResponseModel:
 
 
 class _MetaInfo:
+    """极简 MetaInfo：从文件名里拆出英文名与年份。"""
+
     def __init__(self, title: str = "", **kwargs):
+        import re as _re
+
         self.cn_name = title
         self.name = title
-        self.en_name = ""
-        self.year = ""
+        cleaned = _re.sub(r"[._]+", " ", title)
+        cleaned = _re.sub(
+            r"\b(19|20)\d{2}\b|\b(1080|2160|720)p\b|\b(WEB-DL|WEBRip|BluRay|HDTV)\b",
+            " ",
+            cleaned,
+            flags=_re.IGNORECASE,
+        )
+        self.en_name = " ".join(cleaned.split())
+        match = _re.search(r"\b(19|20)\d{2}\b", title)
+        self.year = match.group(0) if match else ""
         self.begin_season = None
         self.begin_episode = None
 
@@ -930,6 +942,85 @@ def test_queue(module, native, tmp: Path) -> None:
     check("仍缺字幕的条目保留", len(plugin._load_queue()) == 1, str(len(plugin._load_queue())))
 
 
+
+def test_scan_card(module, tmp: Path) -> None:
+    print("\n[8] 扫描卡片文案")
+
+    plugin = module.CSFReborn()
+    plugin.init_plugin({"enabled": True, "languages": ["zh-Hans"]})
+    plugin.save_data(
+        "latest_scan",
+        json.dumps(
+            {
+                "time": "2026-10-28 14:55:50",
+                "discovered": 635,
+                "checked": 635,
+                "existing": 454,
+                "queued": 181,
+                "queue_remaining": 181,
+                "downloaded": 0,
+                "downloads_today": 0,
+                "daily_download_limit": 10,
+                "dry_run": False,
+                "items": [
+                    {"title": "牧神记", "status": "queued"},
+                    {"title": "Alarum", "status": "queued"},
+                ],
+            },
+            ensure_ascii=False,
+        ),
+    )
+    page = json.dumps(plugin.get_page(), ensure_ascii=False)
+    check("扫描条目状态中文化", "牧神记: 排队中" in page, page[:200])
+    check("未下载时给出提示", "本轮没有下载字幕" in page)
+
+
+
+def test_titles_and_posters(module, native, tmp: Path) -> None:
+    print("\n[9] 英文标题与 NFO 海报")
+
+    media = tmp / "nfo-media"
+    media.mkdir()
+    video = media / "Alarum.2025.1080p.WEB-DL.mkv"
+    video.write_bytes(os.urandom(2048))
+    (media / "movie.nfo").write_text(
+        '<?xml version="1.0"?><movie><title>Alarum</title>'
+        '<thumb aspect="poster">https://image.tmdb.org/t/p/original/abc123.jpg</thumb></movie>',
+        encoding="utf-8",
+    )
+
+    plugin = module.CSFReborn()
+    plugin.init_plugin({"enabled": True, "languages": ["zh-Hans"]})
+
+    engine = plugin._native_engine
+    req = engine.request_from_payload(
+        {"video_path": str(video), "title": "余烬夺宝", "languages": ["zh-Hans"]}
+    )
+    check("文件名补出英文标题", "Alarum" in (req.en_title or ""), req.en_title)
+    check("英文名进入检索词", any("Alarum" in word for word in req.keywords), str(req.keywords))
+    check("文件名补出年份", req.year == "2025", req.year)
+
+    plugin._queue_sync_from_scan(
+        {
+            "items": [
+                {
+                    "path": str(video),
+                    "title": "余烬夺宝",
+                    "year": "2025",
+                    "media_type": "movie",
+                    "missing": ["简体中文"],
+                    "status": "not_found",
+                    "downloaded": [],
+                }
+            ]
+        }
+    )
+    page = json.dumps(plugin.get_page(), ensure_ascii=False)
+    check("NFO 海报写入队列", "abc123.jpg" in page, page[:160])
+    saved = plugin._load_queue()[0]
+    check("海报已持久化", saved.get("poster", "").endswith("abc123.jpg"), saved.get("poster"))
+
+
 def main() -> int:
     install_fake_host()
     module = load_plugin()
@@ -943,6 +1034,8 @@ def main() -> int:
         test_orchestration(module, native, tmp)
         test_transfer_event(module, native, tmp)
         test_queue(module, native, tmp)
+        test_scan_card(module, tmp)
+        test_titles_and_posters(module, native, tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

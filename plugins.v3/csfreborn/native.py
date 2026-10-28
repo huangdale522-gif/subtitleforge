@@ -1124,19 +1124,28 @@ class NativeSubtitleEngine:
             overwrite=bool(payload.get("overwrite")),
         )
 
-        if not req.title or not req.en_title:
-            # 没有外部元数据时，用文件名兜底解析
-            try:
-                meta = MetaInfo(title=video.stem)
-                req.title = req.title or str(getattr(meta, "cn_name", "") or video.stem)
-                req.en_title = req.en_title or str(getattr(meta, "en_name", "") or "")
-                req.year = req.year or str(getattr(meta, "year", "") or "")
-                if req.episode is None:
-                    req.episode = getattr(meta, "begin_episode", None)
-                if req.season is None:
-                    req.season = getattr(meta, "begin_season", None)
-            except Exception:  # noqa: BLE001 - filename parsing is best effort
-                req.title = req.title or video.stem
+        # 队列条目通常只有中文标题，文件名里的英文名对 ASSRT 命中很关键
+        try:
+            meta = MetaInfo(title=video.stem)
+        except Exception:  # noqa: BLE001 - filename parsing is best effort
+            meta = None
+        if meta is not None:
+            en_name = str(getattr(meta, "en_name", "") or "").strip()
+            cn_name = str(getattr(meta, "cn_name", "") or "").strip()
+            if not req.title:
+                req.title = cn_name or video.stem
+            if not req.en_title and en_name:
+                req.en_title = en_name
+            if en_name and en_name not in req.aliases and en_name != req.title:
+                req.aliases.append(en_name)
+            if not req.year:
+                req.year = str(getattr(meta, "year", "") or "")
+            if req.episode is None:
+                req.episode = getattr(meta, "begin_episode", None)
+            if req.season is None:
+                req.season = getattr(meta, "begin_season", None)
+        if not req.title:
+            req.title = video.stem
         return req
 
     async def search(self, req: SubtitleRequest) -> list[SubCandidate]:

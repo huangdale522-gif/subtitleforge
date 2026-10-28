@@ -113,3 +113,13 @@ their `errors` and `notes`. Candidate-level skips (wrong language, unparsable
 archive) are reported as `notes`, not `errors`; a history entry with
 `下载 1 · 错误 0 · 提示 1` means the subtitle was written and one candidate was
 skipped.
+
+## Queue posters and title matching
+
+Queue rows show a poster from, in order: transfer metadata, the scraped NFO
+next to the video (`<thumb aspect="poster">`), and a best-effort TMDB lookup.
+No extra configuration is needed for NFO-based posters.
+
+Queue items created by a library scan only carry the localized title, so the
+native engine also parses the filename with `MetaInfo` and adds the English
+title to the ASSRT keywords — that is what makes foreign films findable.
