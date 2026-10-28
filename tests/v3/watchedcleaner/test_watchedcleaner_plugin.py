@@ -532,6 +532,67 @@ def test_plex_episode_parser_preserves_season_id():
     )
 
 
+def test_plex_season_refresh_reads_season_children(monkeypatch):
+    service = SimpleNamespace(
+        type="plex",
+        config=SimpleNamespace(
+            config={"host": "http://plex.local:32400", "token": "secret"}
+        ),
+        instance=None,
+    )
+    adapter = PlexAdapter("客厅 Plex", service)
+    requested = []
+    season = {
+        "type": "season",
+        "ratingKey": "season-1",
+        "parentRatingKey": "series-1",
+        "parentTitle": "测试剧",
+        "title": "第1季",
+        "index": 1,
+    }
+    episode = {
+        "type": "episode",
+        "ratingKey": "episode-1",
+        "grandparentRatingKey": "series-1",
+        "grandparentTitle": "测试剧",
+        "parentRatingKey": "season-1",
+        "parentIndex": 1,
+        "index": 1,
+        "title": "第一集",
+        "viewCount": 1,
+        "Media": [{"Part": [{"file": "/media/TV/Test/S01E01.mkv"}]}],
+    }
+    show = {
+        "type": "show",
+        "ratingKey": "series-1",
+        "title": "测试剧",
+    }
+
+    def fake_get_json(path, params=None):
+        requested.append(path)
+        payloads = {
+            "/library/metadata/season-1/children": [episode],
+            "/library/metadata/season-1": [season],
+            "/library/metadata/series-1": [show],
+        }
+        return {"MediaContainer": {"Metadata": payloads.get(path, [])}}
+
+    monkeypatch.setattr(adapter, "_get_json", fake_get_json)
+    record = adapter.refresh(
+        {
+            "kind": "season",
+            "item_id": "season-1",
+        }
+    )
+
+    assert "/library/metadata/season-1/children" in requested
+    assert all(not path.endswith("/allLeaves") for path in requested)
+    assert record["kind"] == "season"
+    assert record["series_id"] == "series-1"
+    assert record["season"] == 1
+    assert len(record["episodes"]) == 1
+
+
 def test_emby_delete_uses_expected_endpoint_and_token(monkeypatch):
     service = SimpleNamespace(
         type="emby",

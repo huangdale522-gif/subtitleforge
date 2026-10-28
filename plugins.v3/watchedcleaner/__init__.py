@@ -43,7 +43,7 @@ class WatchedCleaner(_PluginBase):
         "显示海报，支持按季清理、Telegram 图片提醒和人工确认后安全删除。"
     )
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.3.1"
+    plugin_version = "1.3.2"
     plugin_author = "huangdale522-gif"
     author_url = "https://github.com/huangdale522-gif"
     plugin_config_prefix = "watchedcleaner_"

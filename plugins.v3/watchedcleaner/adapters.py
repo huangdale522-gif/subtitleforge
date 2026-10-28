@@ -1140,7 +1140,7 @@ class PlexAdapter(MediaAdapter):
         if candidate.get("kind") == "season":
             metadata = self._metadata(
                 self._get_json(
-                    f"/library/metadata/{item_id}/allLeaves",
+                    f"/library/metadata/{item_id}/children",
                     {"includeMedia": 1, "includeUserState": 1},
                 )
             )
