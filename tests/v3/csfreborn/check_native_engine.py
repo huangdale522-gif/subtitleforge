@@ -1130,6 +1130,85 @@ def test_title_cleanup(module, native, tmp: Path) -> None:
     check("电影单独一行", len(movies) == 1, str(movies))
 
 
+
+def test_cooldown(native, tmp: Path) -> None:
+    print("\n[12] 限流冷却与搜索缓存")
+
+    plugin = FakePlugin(tmp / "cool", _assrt_token="token")
+    (tmp / "cool").mkdir(exist_ok=True)
+    engine = native.NativeSubtitleEngine(plugin)
+    calls: list[str] = []
+    original_get = AsyncRequestUtils.get_res
+
+    async def fake_509(self, url, params=None, **kwargs):
+        calls.append(url)
+        if url.endswith("/sub/search"):
+            return _Response(509, b"")
+        return _Response(404, b"")
+
+    AsyncRequestUtils.get_res = fake_509
+    try:
+        req = native.SubtitleRequest(
+            video_path=tmp / "cool" / "x.mkv",
+            media_type="tv",
+            title="牧神记",
+            season=1,
+            episode=1,
+        )
+        candidates = asyncio.run(engine.search(req))
+        check("限流时返回空结果", candidates == [])
+        keys = [source.key for source in engine.active_sources()]
+        check("ASSRT 进入冷却", "assrt" not in keys, str(keys))
+        described = {row["key"]: row for row in engine.describe()}
+        check("诊断显示冷却中", "冷却" in (described["assrt"]["reason"] or ""), described["assrt"]["reason"])
+        before = len(calls)
+        asyncio.run(engine.search(req))
+        check("冷却期间不再请求", len(calls) == before, f"{before} -> {len(calls)}")
+    finally:
+        AsyncRequestUtils.get_res = original_get
+
+    # 同一关键词只搜一次（同一部剧的多集共用缓存）
+    cache: dict = {}
+    source = native.AssrtSource(native.SourceConfig(assrt_token="t"), cache)
+    keywords: list[str] = []
+
+    async def fake_ok(self, url, params=None, **kwargs):
+        if url.endswith("/sub/search"):
+            keywords.append(str((params or {}).get("q")))
+            body = {
+                "status": 0,
+                "sub": {
+                    "subs": [
+                        {
+                            "id": 1,
+                            "native_name": "牧神记",
+                            "videoname": "Mu Shen Ji 2024",
+                            "lang": {"langlist": {"langchs": True}},
+                        }
+                    ]
+                },
+            }
+            return _Response(200, json.dumps(body).encode())
+        return _Response(404, b"")
+
+    AsyncRequestUtils.get_res = fake_ok
+    try:
+        for episode in (1, 2, 3):
+            req = native.SubtitleRequest(
+                video_path=tmp / "cool" / f"e{episode}.mkv",
+                media_type="tv",
+                title="牧神记",
+                en_title="Mu Shen Ji",
+                season=1,
+                episode=episode,
+            )
+            result = asyncio.run(source.search(req))
+            check(f"第 {episode} 集命中", len(result) == 1, str(len(result)))
+        check("同一关键词只请求一次", len(keywords) == 1, str(keywords))
+    finally:
+        AsyncRequestUtils.get_res = original_get
+
+
 def main() -> int:
     install_fake_host()
     module = load_plugin()
@@ -1147,6 +1226,7 @@ def main() -> int:
         test_titles_and_posters(module, native, tmp)
         test_bdmv_and_inspect(module, native, tmp)
         test_title_cleanup(module, native, tmp)
+        test_cooldown(native, tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

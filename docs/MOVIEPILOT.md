@@ -142,3 +142,12 @@ stripped from the filename (`如果我是一只动物 S01E43 1080p.FROGWeb` beco
 `如果我是一只动物` plus S01E43), and the entry is grouped as a TV season. The
 poster is re-read from the NFO on every render, so a stale or wrong poster
 (actor portrait) heals itself without clearing the queue.
+
+## Rate limits
+
+Providers that answer `429`/`509` (or reject our token) are put into a
+cooldown — 30 minutes for rate limits, 24 hours for credential/quota errors —
+and are skipped until it expires. The provider card shows `限流冷却中（N 分钟）`.
+ASSRT search results are cached per keyword for 15 minutes, so every episode of
+a show reuses one request. A queue run stops after six consecutive failures to
+stop burning quota.

@@ -78,7 +78,7 @@ class CSFReborn(_PluginBase):
         "内置 SubtitleBest / ASSRT / 迅雷 / Shooter 字幕源，无需额外服务也能工作。"
     )
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.6.5"
+    plugin_version = "0.6.6"
     plugin_author = "SubtitleForge contributors"
     author_url = "https://github.com/"
     plugin_config_prefix = "csfreborn_"
@@ -2692,6 +2692,7 @@ class CSFReborn(_PluginBase):
         """Download subtitles for the selected queue entries, one by one."""
 
         self._queue_running = True
+        consecutive_failures = 0
         try:
             for key in keys:
                 entry = next(
@@ -2735,6 +2736,7 @@ class CSFReborn(_PluginBase):
                         "%Y-%m-%d %H:%M:%S"
                     )
                 if result.get("downloaded"):
+                    consecutive_failures = 0
                     self._queue_drop(queue, str(entry.get("path") or ""))
                     self._add_history(payload, result)
                 else:
@@ -2756,7 +2758,15 @@ class CSFReborn(_PluginBase):
                             for value in (result.get("missing") or current.get("missing") or [])
                         ]
                 self._save_queue(queue)
-                await asyncio.sleep(max(0.5, self._native_request_delay))
+                if not result.get("downloaded"):
+                    consecutive_failures += 1
+                    if consecutive_failures >= 6:
+                        logger.warning(
+                            "SubtitleForge 连续 6 个视频未取到字幕，本轮提前结束"
+                            "（字幕源可能限流或配额用尽）"
+                        )
+                        break
+                await asyncio.sleep(max(2.0, self._native_request_delay))
         finally:
             self._queue_running = False
 

@@ -399,13 +399,24 @@ def sniff_ext(data: bytes) -> str:
 # ---------------------------------------------------------------------------
 
 
+class SourceCooldown(Exception):
+    """Raised when a provider asks us to slow down or refuses our credentials."""
+
+    def __init__(self, source: str, seconds: int, detail: str = "") -> None:
+        super().__init__(detail or f"{source} 暂时不可用")
+        self.source = source
+        self.seconds = seconds
+        self.detail = detail
+
+
 class BaseSource:
     """字幕来源基类：search 返回候选，resolve 返回可下载直链。"""
 
     key = ""
 
-    def __init__(self, config: SourceConfig) -> None:
+    def __init__(self, config: SourceConfig, cache: Optional[dict] = None) -> None:
         self.config = config
+        self.cache = cache if cache is not None else {}
 
     @property
     def label(self) -> str:
@@ -457,6 +468,8 @@ class SubtitleBestSource(BaseSource):
                 "Content-Type": "application/json",
             },
         )
+        if getattr(resp, "status_code", 0) in (429, 503):
+            raise SourceCooldown("subtitle_best", 3600, f"SubtitleBest 限流（HTTP {resp.status_code}）")
         data = self._json(resp)
         if not isinstance(data, dict):
             return {}
@@ -587,6 +600,35 @@ class AssrtSource(BaseSource):
             bilingual=eng or dou,
         )
 
+    async def _search_keyword(self, client: AsyncRequestUtils, keyword: str, token: str) -> list[dict]:
+        """Search one keyword with a short-lived cache (multi-episode shows reuse it)."""
+
+        cache_key = f"assrt|{keyword}"
+        cached = self.cache.get(cache_key)
+        if isinstance(cached, tuple) and time.time() - cached[0] < 900:
+            return cached[1]
+
+        resp = await client.get_res(
+            f"{ASSRT_ROOT}/sub/search",
+            params={"q": keyword, "cnt": 15, "pos": 0, "token": token},
+        )
+        status = getattr(resp, "status_code", 0)
+        if status in (429, 509):
+            raise SourceCooldown("assrt", 1800, f"ASSRT 限流（HTTP {status}）")
+        data = self._json(resp)
+        if not isinstance(data, dict):
+            return []
+        if int(data.get("status") or 0) not in (0,):
+            message = str(data.get("errmsg") or "")
+            if "token" in message.lower() or "quota" in message.lower():
+                raise SourceCooldown("assrt", 86400, f"ASSRT 鉴权/配额异常：{message}")
+            return []
+        subs = (data.get("sub") or {}).get("subs") or []
+        if isinstance(subs, dict):
+            subs = []
+        self.cache[cache_key] = (time.time(), subs)
+        return subs
+
     async def search(self, req: SubtitleRequest) -> list[SubCandidate]:
         token = (self.config.assrt_token or "").strip()
         if not token:
@@ -596,20 +638,14 @@ class AssrtSource(BaseSource):
         names = [req.title, req.en_title, *req.aliases]
         for keyword in req.keywords:
             try:
-                resp = await client.get_res(
-                    f"{ASSRT_ROOT}/sub/search",
-                    params={"q": keyword, "cnt": 15, "pos": 0, "token": token},
-                )
+                subs = await self._search_keyword(client, keyword, token)
+            except SourceCooldown:
+                raise
             except Exception as err:  # noqa: BLE001
                 logger.warning(f"ASSRT 检索失败（{keyword}）：{err}")
                 continue
-
-            data = self._json(resp)
-            if not isinstance(data, dict):
+            if not subs:
                 continue
-            subs = (data.get("sub") or {}).get("subs") or []
-            if isinstance(subs, dict):
-                subs = []
 
             cands: list[SubCandidate] = []
             for item in subs:
@@ -647,6 +683,8 @@ class AssrtSource(BaseSource):
         except Exception as err:  # noqa: BLE001
             logger.warning(f"ASSRT 详情失败：{err}")
             return ""
+        if getattr(resp, "status_code", 0) in (429, 509):
+            raise SourceCooldown("assrt", 1800, "ASSRT 详情限流")
         data = self._json(resp)
         if not isinstance(data, dict):
             return ""
@@ -774,6 +812,8 @@ class NativeSubtitleEngine:
         self.plugin = plugin
         self._lock: Optional[asyncio.Lock] = None
         self._lock_loop: Any = None
+        self._cooldowns: dict[str, float] = {}
+        self._source_cache: dict[str, Any] = {}
 
     def _get_lock(self) -> asyncio.Lock:
         """Return a lock bound to the current event loop (safe across reloads)."""
@@ -833,24 +873,43 @@ class NativeSubtitleEngine:
         exts = getattr(settings, "RMT_SUBEXT", None) or [".srt", ".ass", ".ssa", ".sup"]
         return {str(ext).lower() for ext in exts}
 
-    def active_sources(self) -> list[BaseSource]:
+    def _build_sources(self) -> list[BaseSource]:
         config = self.source_config()
         sources: list[BaseSource] = []
         if config.subtitle_best_api_key:
-            sources.append(SubtitleBestSource(config))
+            sources.append(SubtitleBestSource(config, self._source_cache))
         if config.assrt_token:
-            sources.append(AssrtSource(config))
+            sources.append(AssrtSource(config, self._source_cache))
         if config.xunlei_enabled:
-            sources.append(XunleiSource(config))
+            sources.append(XunleiSource(config, self._source_cache))
         if config.shooter_enabled:
-            sources.append(ShooterSource(config))
+            sources.append(ShooterSource(config, self._source_cache))
         return sources
+
+    def active_sources(self) -> list[BaseSource]:
+        """Sources that are configured and not in a rate-limit cooldown."""
+
+        now = time.time()
+        return [
+            source
+            for source in self._build_sources()
+            if self._cooldowns.get(source.key, 0) <= now
+        ]
+
+    def _cool(self, source: str, seconds: int, detail: str = "") -> None:
+        """Disable a provider for a while after it asks us to slow down."""
+
+        self._cooldowns[source] = time.time() + seconds
+        logger.warning(
+            f"字幕源 {SOURCE_LABEL.get(source, source)} 暂停 {max(1, seconds // 60)} 分钟：{detail}"
+        )
 
     def describe(self) -> list[dict[str, Any]]:
         """返回各来源的可用状态，供插件页面展示。"""
 
         config = self.source_config()
-        return [
+        now = time.time()
+        rows = [
             {
                 "key": "subtitle_best",
                 "name": SOURCE_LABEL["subtitle_best"],
@@ -876,6 +935,12 @@ class NativeSubtitleEngine:
                 "reason": "" if config.shooter_enabled else "已关闭",
             },
         ]
+        for row in rows:
+            until = self._cooldowns.get(row["key"], 0)
+            if until > now:
+                row["ready"] = False
+                row["reason"] = f"限流冷却中（{max(1, int((until - now) // 60))} 分钟）"
+        return rows
 
     def has_source(self) -> bool:
         return bool(self.active_sources())
@@ -1158,6 +1223,9 @@ class NativeSubtitleEngine:
         )
         merged: list[SubCandidate] = []
         for source, result in zip(sources, results):
+            if isinstance(result, SourceCooldown):
+                self._cool(result.source, result.seconds, result.detail)
+                continue
             if isinstance(result, BaseException):
                 logger.warning(f"{source.label} 检索异常：{result}")
                 continue
