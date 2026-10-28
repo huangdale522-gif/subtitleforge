@@ -92,3 +92,12 @@ health check (keeping its persistent queue, daily ledger, OpenSubtitles and
 custom providers); when the service is unreachable the built-in engine scans
 instead. `native_only` always scans with the built-in engine, `service_first`
 falls back to it, and `off` keeps the previous service-only behavior.
+
+## Pending queue
+
+Videos that still lack a requested language are stored in a persistent queue
+and rendered on the plugin page as a checkbox table (poster, type, title,
+season/episode, missing languages, status, last attempt). Select rows and press
+"下载选中" to retry them on demand, or use `POST /queue/download` with
+`{"keys": [...]}` / `{"all": true}`. `scan_dry_run` defaults to true, which is
+why a preview scan reports zero downloads — it only queues.

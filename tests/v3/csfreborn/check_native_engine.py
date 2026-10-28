@@ -140,6 +140,15 @@ class AsyncRequestUtils:
         )
 
 
+class _ResponseModel:
+    """极简 schemas.Response。"""
+
+    def __init__(self, success: bool = True, message: str = "", data=None):
+        self.success = success
+        self.message = message
+        self.data = data
+
+
 class _MetaInfo:
     def __init__(self, title: str = "", **kwargs):
         self.cn_name = title
@@ -171,6 +180,15 @@ class _PluginBase:
 
 
 def install_fake_host() -> None:
+    fastapi = types.ModuleType("fastapi")
+
+    class _Body:
+        def __init__(self, default=None, **kwargs):
+            self.default = default
+
+    fastapi.Body = _Body
+    sys.modules["fastapi"] = fastapi
+
     app = types.ModuleType("app")
     app.__path__ = []
     sys.modules["app"] = app
@@ -182,7 +200,7 @@ def install_fake_host() -> None:
         sys.modules[name] = module
         return module
 
-    make("app.schemas")
+    make("app.schemas", Response=_ResponseModel)
     make(
         "app.schemas.types",
         EventType=EventType,
@@ -707,6 +725,136 @@ def test_transfer_event(module, native, tmp: Path) -> None:
         server.wait(timeout=5)
 
 
+
+def test_queue(module, native, tmp: Path) -> None:
+    print("\n[7] 待补全队列与手动下载")
+
+    media = tmp / "queue-media"
+    media.mkdir()
+    video = media / "Queue.Movie.2024.1080p.mkv"
+    video.write_bytes(os.urandom(4096))
+
+    plugin = module.CSFReborn()
+    plugin.init_plugin(
+        {
+            "enabled": True,
+            "languages": ["zh-Hans"],
+            "native_mode": "native_only",
+            "notify": False,
+        }
+    )
+
+    scan_result = {
+        "status": "ok",
+        "items": [
+            {
+                "path": str(video),
+                "title": "Queue Movie",
+                "year": "2024",
+                "media_type": "movie",
+                "season": None,
+                "episode": None,
+                "missing": [native.LANG_CHS],
+                "status": "dry_run",
+                "downloaded": [],
+            }
+        ],
+    }
+    plugin._queue_sync_from_scan(scan_result)
+    queue = plugin._load_queue()
+    check("扫描后写入队列", len(queue) == 1 and queue[0]["title"] == "Queue Movie", str(queue))
+    check("队列条目含键与路径", bool(queue[0].get("key")) and queue[0]["path"] == str(video))
+
+    # 服务端 /v1/scan 的条目结构（video_path / missing_languages）也要能入队
+    service_video = media / "Service.Movie.2023.mkv"
+    service_video.write_bytes(os.urandom(2048))
+    plugin._queue_sync_from_scan(
+        {
+            "items": [
+                {
+                    "video_path": str(service_video),
+                    "title": "Service Movie",
+                    "year": 2023,
+                    "media_type": "movie",
+                    "status": "queued",
+                    "missing_languages": ["zh-Hans"],
+                    "errors": [],
+                }
+            ]
+        }
+    )
+    queue = plugin._load_queue()
+    check("服务端条目也能入队", len(queue) == 2, str(len(queue)))
+
+    page = json.dumps(plugin.get_page(), ensure_ascii=False)
+    check("页面渲染队列表格", "csf-queue" in page and "待补全" in page, page[:120])
+    check("页面含下载按钮", "下载选中" in page and "queue/download" in page)
+
+    calls: list[str] = []
+
+    async def fake_process(payload):
+        calls.append(payload["video_path"])
+        return {
+            "status": "downloaded",
+            "downloaded": [{"path": str(media / "Queue.Movie.2024.1080p.zh-CN.srt"), "language": "zh-Hans", "provider": "迅雷字幕"}],
+            "errors": [],
+            "missing": [],
+        }
+
+    plugin._process_payload = fake_process  # type: ignore[method-assign]
+
+    target = next(entry for entry in queue if entry["title"] == "Queue Movie")
+
+    async def run_selected():
+        response = await plugin.api_queue_download({"keys": [target["key"]]})
+        if plugin._queue_task is not None:
+            await plugin._queue_task
+        return response
+
+    response = asyncio.run(run_selected())
+    check("手动下载接口返回成功", response.success is True and "1" in response.message, response.message)
+    check("队列条目被调用", calls == [str(video)], str(calls))
+    remaining = plugin._load_queue()
+    check(
+        "下载成功后移出队列",
+        len(remaining) == 1 and remaining[0]["title"] == "Service Movie",
+        str(remaining),
+    )
+    check("手动下载写入历史", len(plugin._load_history()) == 1)
+
+    # 失败时保留在队列并累加尝试次数
+    async def fake_fail(payload):
+        return {"status": "not_found", "downloaded": [], "errors": ["未找到字幕"], "missing": [native.LANG_CHS]}
+
+    plugin._process_payload = fake_fail  # type: ignore[method-assign]
+    plugin._queue_sync_from_scan(scan_result)
+    queue = plugin._load_queue()
+
+    async def run_retry():
+        await plugin.api_queue_download({"all": True})
+        if plugin._queue_task is not None:
+            await plugin._queue_task
+
+    asyncio.run(run_retry())
+    queue = plugin._load_queue()
+    retried = next(entry for entry in queue if entry["title"] == "Queue Movie")
+    check("失败后仍在队列", len(queue) == 2 and retried["attempts"] == 1, str(len(queue)))
+    check("失败原因已记录", "未找到字幕" in (retried.get("reason") or ""), str(retried.get("reason")))
+
+    # 文件消失后清理
+    ghost = {
+        "path": str(media / "gone.mkv"),
+        "title": "Gone",
+        "missing": [native.LANG_CHS],
+        "status": "not_found",
+        "downloaded": [],
+    }
+    plugin._queue_sync_from_scan({"items": [ghost]})
+    cleared = asyncio.run(plugin.api_queue_clear())
+    check("清理失效条目", cleared.success is True and "1" in cleared.message, cleared.message)
+    check("仍缺字幕的条目保留", len(plugin._load_queue()) == 2, str(len(plugin._load_queue())))
+
+
 def main() -> int:
     install_fake_host()
     module = load_plugin()
@@ -719,6 +867,7 @@ def main() -> int:
         test_engine(native, tmp)
         test_orchestration(module, native, tmp)
         test_transfer_event(module, native, tmp)
+        test_queue(module, native, tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

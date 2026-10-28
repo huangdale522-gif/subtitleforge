@@ -59,6 +59,12 @@ LANG_ALIASES = {
     "cht": LANG_CHT,
     "tc": LANG_CHT,
     "chi_tra": LANG_CHT,
+    "简体中文": LANG_CHS,
+    "简体": LANG_CHS,
+    "繁體中文": LANG_CHT,
+    "繁体中文": LANG_CHT,
+    "繁體": LANG_CHT,
+    "繁体": LANG_CHT,
 }
 
 TRAD_CHARS = set(
@@ -864,6 +870,12 @@ class NativeSubtitleEngine:
     def has_source(self) -> bool:
         return bool(self.active_sources())
 
+    @staticmethod
+    def required_langs(values: Any) -> list[str]:
+        """Expose the language normalizer to the plugin."""
+
+        return required_langs(values)
+
     # -- 对外入口 -----------------------------------------------------
 
     async def process(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1021,26 +1033,13 @@ class NativeSubtitleEngine:
         errors: list[str] = []
 
         for video, missing in missing_items:
+            base = self.scan_item(video, missing)
             if dry_run:
-                items.append(
-                    {
-                        "title": video.stem,
-                        "status": "dry_run",
-                        "missing": missing,
-                        "downloaded": [],
-                    }
-                )
+                items.append({**base, "status": "dry_run", "downloaded": []})
                 continue
 
             if downloaded_total >= daily_limit:
-                items.append(
-                    {
-                        "title": video.stem,
-                        "status": "queued",
-                        "missing": missing,
-                        "downloaded": [],
-                    }
-                )
+                items.append({**base, "status": "queued", "downloaded": []})
                 continue
 
             result = await self._process(
@@ -1056,7 +1055,7 @@ class NativeSubtitleEngine:
             errors.extend(str(err) for err in result.get("errors") or [])
             items.append(
                 {
-                    "title": video.stem,
+                    **base,
                     "status": (
                         "downloaded"
                         if entries
@@ -1513,6 +1512,25 @@ class NativeSubtitleEngine:
         return dest
 
     # -- 扫描辅助 -----------------------------------------------------
+
+    @staticmethod
+    def scan_item(video: Path, missing: list[str]) -> dict[str, Any]:
+        """构造扫描条目（含路径与季集，供插件队列展示）。"""
+
+        season: Optional[int] = None
+        episode: Optional[int] = None
+        matched = re.search(r"[Ss](\d{1,2})[ ._-]?[Ee](\d{1,3})", video.stem)
+        if matched:
+            season, episode = int(matched.group(1)), int(matched.group(2))
+        year_match = re.search(r"(?:19|20)\d{2}", video.stem)
+        return {
+            "path": str(video),
+            "title": video.stem,
+            "year": year_match.group(0) if year_match else "",
+            "season": season,
+            "episode": episode,
+            "missing": missing,
+        }
 
     @staticmethod
     def iter_videos(root: Path, extensions: set[str]) -> Iterable[Path]:

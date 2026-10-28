@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>待补全字幕队列 · 预览</title>
+<style>
+  :root {
+    --bg: #12121c;
+    --card: #1c1c2b;
+    --line: rgba(255,255,255,.08);
+    --text: #e8e8f0;
+    --muted: #9a9ab0;
+    --primary: #7c6cf0;
+    --primary-soft: rgba(124,108,240,.18);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 18px;
+    background: radial-gradient(1200px 600px at 20% 0%, #241f45 0%, var(--bg) 55%);
+    color: var(--text);
+    font-family: -apple-system, "PingFang SC", "Noto Sans SC", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 16px 18px 18px;
+    max-width: 1080px;
+    margin: 0 auto;
+    box-shadow: 0 18px 50px rgba(0,0,0,.45);
+  }
+  .alert {
+    background: rgba(124,108,240,.14);
+    border-left: 3px solid var(--primary);
+    color: #cfcaff;
+    font-size: 13px;
+    line-height: 1.5;
+    padding: 9px 12px;
+    border-radius: 8px;
+    margin-bottom: 12px;
+  }
+  .chips { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+  .chip {
+    font-size: 12px; padding: 4px 10px; border-radius: 999px;
+    background: var(--primary-soft); color: #cfcaff; border: 1px solid rgba(124,108,240,.35);
+  }
+  .chip.plain { background: rgba(255,255,255,.05); color: var(--muted); border-color: var(--line); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th {
+    text-align: left; font-weight: 500; color: var(--muted);
+    padding: 8px 6px; border-bottom: 1px solid var(--line); white-space: nowrap;
+  }
+  td { padding: 8px 6px; border-bottom: 1px solid rgba(255,255,255,.05); vertical-align: middle; }
+  tr:hover td { background: rgba(255,255,255,.03); }
+  input[type=checkbox] { width: 15px; height: 15px; accent-color: var(--primary); }
+  .poster {
+    width: 40px; height: 60px; border-radius: 6px; object-fit: cover;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 10px; color: #dfdcff; letter-spacing: .5px;
+    border: 1px solid rgba(255,255,255,.12);
+  }
+  .p1 { background: linear-gradient(150deg,#3a2c6b,#7a4fb0); }
+  .p2 { background: linear-gradient(150deg,#1f3b5c,#3c7ba8); }
+  .p3 { background: linear-gradient(150deg,#4a2f2f,#a05a4a); }
+  .p4 { background: linear-gradient(150deg,#24402f,#4e8a63); }
+  .p5 { background: linear-gradient(150deg,#3d3a2a,#8b7a3f); }
+  .p6 { background: linear-gradient(150deg,#2c3550,#5b6b9c); }
+  .title { font-weight: 500; }
+  .sub { color: var(--muted); font-size: 12px; }
+  .badge { font-size: 11px; padding: 2px 7px; border-radius: 6px; white-space: nowrap; }
+  .b-wait { background: rgba(124,108,240,.18); color: #b9b1ff; }
+  .b-miss { background: rgba(255,167,38,.16); color: #ffc879; }
+  .b-part { background: rgba(255,193,7,.14); color: #ffd764; }
+  .b-fail { background: rgba(244,67,54,.16); color: #ff9b93; }
+  .actions { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
+  button {
+    font-size: 13px; padding: 8px 14px; border-radius: 9px; border: 1px solid transparent;
+    cursor: pointer; display: inline-flex; align-items: center; gap: 6px;
+  }
+  .primary { background: var(--primary); color: #fff; }
+  .tonal { background: rgba(255,255,255,.07); color: var(--text); border-color: var(--line); }
+  .text { background: transparent; color: var(--muted); }
+  .note { margin-top: 12px; color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="alert">
+      当前扫描为「仅预览」：只检查并写入队列，不会自动下载。可以勾选下面条目手动补字幕，
+      或在插件设置里关闭「仅预览」让扫描自动下载。
+    </div>
+    <div class="chips">
+      <span class="chip">待补全 6</span>
+      <span class="chip plain">字幕源 auto</span>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th><input type="checkbox" aria-label="全选"></th>
+          <th>海报</th><th>类型</th><th>标题</th><th>季集</th><th>缺失</th><th>状态</th><th>最近尝试</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><input type="checkbox" checked></td>
+          <td><div class="poster p1">电影</div></td>
+          <td>电影</td><td class="title">流浪地球2 <span class="sub">(2023)</span></td>
+          <td>-</td><td>简体中文</td>
+          <td><span class="badge b-miss">未找到</span></td>
+          <td class="sub">2026-10-28 14:44</td>
+        </tr>
+        <tr>
+          <td><input type="checkbox" checked></td>
+          <td><div class="poster p2">剧集</div></td>
+          <td>剧集</td><td class="title">黑镜 <span class="sub">(2023)</span></td>
+          <td>S06E02</td><td>简体中文</td>
+          <td><span class="badge b-wait">待下载</span></td>
+          <td class="sub">2026-10-28 14:44</td>
+        </tr>
+        <tr>
+          <td><input type="checkbox"></td>
+          <td><div class="poster p3">电影</div></td>
+          <td>电影</td><td class="title">沙丘2 <span class="sub">(2024)</span></td>
+          <td>-</td><td>繁體中文</td>
+          <td><span class="badge b-miss">未找到</span></td>
+          <td class="sub">2026-10-28 14:44</td>
+        </tr>
+        <tr>
+          <td><input type="checkbox"></td>
+          <td><div class="poster p4">剧集</div></td>
+          <td>剧集</td><td class="title">三体 <span class="sub">(2023)</span></td>
+          <td>S01E05</td><td>简体中文</td>
+          <td><span class="badge b-part">部分缺失</span></td>
+          <td class="sub">2026-10-28 14:40</td>
+        </tr>
+        <tr>
+          <td><input type="checkbox"></td>
+          <td><div class="poster p5">电影</div></td>
+          <td>电影</td><td class="title">奥本海默 <span class="sub">(2023)</span></td>
+          <td>-</td><td>简体中文</td>
+          <td><span class="badge b-wait">待下载</span></td>
+          <td class="sub">2026-10-28 14:39</td>
+        </tr>
+        <tr>
+          <td><input type="checkbox"></td>
+          <td><div class="poster p6">剧集</div></td>
+          <td>剧集</td><td class="title">繁花 <span class="sub">(2023)</span></td>
+          <td>S01E12</td><td>繁體中文</td>
+          <td><span class="badge b-fail">失败｜连接超时</span></td>
+          <td class="sub">2026-10-28 14:39</td>
+        </tr>
+      </tbody>
+    </table>
+    <div class="actions">
+      <button class="primary">⬇ 下载选中</button>
+      <button class="tonal">⟳ 全部重试</button>
+      <button class="text">🧹 清理队列</button>
+    </div>
+    <div class="note">勾选后点「下载选中」，插件会在后台逐个检索并下载，完成后自动移出队列并写入历史。</div>
+  </div>
+</body>
+</html>

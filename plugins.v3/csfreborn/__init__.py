@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import signal
@@ -10,11 +11,14 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from app.schemas.types import EventType
+from fastapi import Body
+
+from app import schemas
+from app.schemas.types import EventType, MediaType
 
 try:
     from app.schemas.types import MessageType
@@ -73,7 +77,7 @@ class CSFReborn(_PluginBase):
         "内置 SubtitleBest / ASSRT / 迅雷 / Shooter 字幕源，无需额外服务也能工作。"
     )
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.4.0"
+    plugin_version = "0.5.0"
     plugin_author = "SubtitleForge contributors"
     author_url = "https://github.com/"
     plugin_config_prefix = "csfreborn_"
@@ -124,6 +128,11 @@ class CSFReborn(_PluginBase):
         self._history_key = "download_history"
         self._latest_scan_key = "latest_scan"
         self._history_max = 30
+        # 待补全字幕队列（页面可勾选手动下载）
+        self._queue_key = "subtitle_queue"
+        self._queue_max = 200
+        self._queue_running = False
+        self._queue_task: Any = None
         # 内置字幕源（不依赖 SubtitleForge 服务）
         self._native_mode = "auto"
         self._native_xunlei = True
@@ -270,7 +279,7 @@ class CSFReborn(_PluginBase):
         ]
 
     def get_api(self) -> list[dict[str, Any]]:
-        """Expose health and manual scan endpoints."""
+        """Expose health, manual scan and pending-queue endpoints."""
 
         return [
             {
@@ -286,6 +295,29 @@ class CSFReborn(_PluginBase):
                 "methods": ["POST"],
                 "auth": "bear",
                 "summary": "立即扫描媒体库",
+            },
+            {
+                "path": "/queue",
+                "endpoint": self.api_queue,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "查看待补全字幕队列",
+                "description": "返回扫描/整理后仍缺字幕的视频清单。",
+            },
+            {
+                "path": "/queue/download",
+                "endpoint": self.api_queue_download,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "手动下载选中条目的字幕",
+                "description": "参数 keys：队列条目键列表；all=true 表示重试全部。",
+            },
+            {
+                "path": "/queue/clear",
+                "endpoint": self.api_queue_clear,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "清理队列中已解决或文件已不存在的条目",
             },
         ]
 
@@ -308,6 +340,76 @@ class CSFReborn(_PluginBase):
         """Run one scan using the saved preview/download settings."""
 
         return await self.scan_library(manual=True)
+
+    # -- 待补全队列 API -----------------------------------------------
+
+    def api_queue(self) -> list[dict[str, Any]]:
+        """Return the pending-subtitle queue."""
+
+        return self._load_queue()
+
+    async def api_queue_download(
+        self, payload: Optional[dict] = Body(default=None)
+    ) -> Any:
+        """Download subtitles for the selected queue entries (background task)."""
+
+        if not self._enabled:
+            return schemas.Response(success=False, message="插件未启用")
+        if self._queue_running:
+            return schemas.Response(
+                success=False, message="队列任务正在运行，请稍后再试"
+            )
+
+        payload = payload or {}
+        keys = [str(key) for key in payload.get("keys") or [] if str(key)]
+        retry_all = bool(payload.get("all"))
+        if not keys and not retry_all:
+            return schemas.Response(success=False, message="请先勾选要下载的条目")
+
+        queue = self._load_queue()
+        targets = [
+            entry for entry in queue if retry_all or entry.get("key") in keys
+        ]
+        if not targets:
+            return schemas.Response(success=False, message="队列中没有匹配的条目")
+
+        self._queue_task = asyncio.create_task(
+            self._queue_worker([str(entry.get("key")) for entry in targets])
+        )
+        return schemas.Response(
+            success=True,
+            message=f"已开始为 {len(targets)} 个视频补全字幕，稍后刷新页面查看结果",
+            data={"count": len(targets)},
+        )
+
+    async def api_queue_clear(self) -> Any:
+        """Drop queue entries whose file is gone or whose subtitles are complete."""
+
+        queue = self._load_queue()
+        engine = self._native_engine
+        keep: list[dict[str, Any]] = []
+        removed = 0
+        for entry in queue:
+            path = Path(str(entry.get("path") or ""))
+            if not path.is_file():
+                removed += 1
+                continue
+            if engine is not None and entry.get("missing"):
+                try:
+                    have = await engine.scan_existing(path)
+                    need = engine.required_langs(entry.get("missing") or [])
+                    if need and set(need) <= have:
+                        removed += 1
+                        continue
+                except Exception as err:  # noqa: BLE001 - cleanup is best effort
+                    logger.debug(f"队列清理检查失败：{err}")
+            keep.append(entry)
+        self._save_queue(keep)
+        return schemas.Response(
+            success=True,
+            message=f"已清理 {removed} 条，剩余 {len(keep)} 条",
+            data={"removed": removed, "remaining": len(keep)},
+        )
 
     @eventmanager.register(EventType.PluginAction)
     async def on_plugin_action(self, event: Event) -> None:
@@ -364,9 +466,11 @@ class CSFReborn(_PluginBase):
                 json.dumps(result, ensure_ascii=False),
             )
             logger.info(
-                "SubtitleForge 媒体库扫描完成："
+                "SubtitleForge 媒体库扫描完成"
+                f"{'（仅预览）' if result.get('dry_run') else ''}："
                 f"发现 {result.get('discovered', 0)}，"
                 f"检查 {result.get('checked', 0)}，"
+                f"缺失 {result.get('queued', 0)}，"
                 f"下载 {result.get('downloaded', 0)}"
             )
             if (
@@ -432,7 +536,13 @@ class CSFReborn(_PluginBase):
                     )
                     native_result = {"status": "error", "errors": [str(exc)]}
 
-        return self._merge_scan_results(native_result, service_result)
+        result = self._merge_scan_results(native_result, service_result)
+        try:
+            self._queue_sync_from_scan(result)
+            await self._enrich_queue_posters()
+        except Exception as err:  # noqa: BLE001 - queue bookkeeping must not fail the scan
+            logger.warning(f"更新待补全队列失败：{err}")
+        return result
 
     async def _call_service_scan(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Call the SubtitleForge scan endpoint; never raises."""
@@ -760,6 +870,7 @@ class CSFReborn(_PluginBase):
             "english_title": getattr(mediainfo, "en_title", None),
             "year": self._optional_int(getattr(mediainfo, "year", None)),
             "imdb_id": getattr(mediainfo, "imdb_id", None),
+            "poster": self._poster_url(getattr(mediainfo, "poster_path", None)),
             "tmdb_id": self._optional_int(getattr(mediainfo, "tmdb_id", None)),
             "media_type": media_type,
             "season": self._optional_int(getattr(meta, "begin_season", None)),
@@ -784,6 +895,7 @@ class CSFReborn(_PluginBase):
                 f"downloaded={len(result.get('downloaded') or [])}"
             )
             self._add_history(payload, result)
+            self._queue_sync_from_process(payload, result)
             aggregate["downloaded"].extend(result.get("downloaded") or [])
             aggregate["errors"].extend(result.get("errors") or [])
             if result.get("status") not in (None, "ok", "downloaded"):
@@ -1501,6 +1613,9 @@ class CSFReborn(_PluginBase):
         history = self._load_history()
         latest_scan = self._load_latest_scan()
         cards: list[dict] = []
+        queue = self._load_queue()
+        if queue:
+            cards.append(self._queue_card(queue))
         if self._native_engine is not None:
             sources = self._native_engine.describe()
             ready = [item["name"] for item in sources if item["ready"]]
@@ -1591,7 +1706,7 @@ class CSFReborn(_PluginBase):
                     ],
                 }
             )
-        if not history and not latest_scan:
+        if not history and not latest_scan and not queue:
             return [
                 {
                     "component": "VAlert",
@@ -1634,10 +1749,530 @@ class CSFReborn(_PluginBase):
             )
         return cards
 
+
+    # -- 队列页面 -----------------------------------------------------
+
+    def _queue_card(self, queue: list[dict[str, Any]]) -> dict[str, Any]:
+        """Render the pending queue with per-row checkboxes and actions."""
+
+        content: list[dict[str, Any]] = []
+        if self._scan_dry_run:
+            content.append(
+                {
+                    "component": "VAlert",
+                    "props": {
+                        "type": "info",
+                        "variant": "tonal",
+                        "class": "mb-2",
+                        "text": (
+                            "当前扫描为「仅预览」：只检查并写入队列，不会自动下载。"
+                            "可以勾选下面条目手动补字幕，或在插件设置里关闭「仅预览」让扫描自动下载。"
+                        ),
+                    },
+                }
+            )
+        content.append(
+            {
+                "component": "div",
+                "props": {"class": "d-flex flex-wrap align-center ga-2 mb-2"},
+                "content": [
+                    {
+                        "component": "VChip",
+                        "props": {"variant": "tonal", "color": "primary"},
+                        "text": f"待补全 {len(queue)}",
+                    },
+                    {
+                        "component": "VChip",
+                        "props": {"variant": "tonal"},
+                        "text": f"字幕源 {self._native_mode}",
+                    },
+                ],
+            }
+        )
+        content.append(self._queue_table(queue))
+        content.append(
+            {
+                "component": "div",
+                "props": {"class": "d-flex flex-wrap align-center ga-2 mt-3"},
+                "content": [
+                    {
+                        "component": "VBtn",
+                        "props": {
+                            "color": "primary",
+                            "variant": "flat",
+                            "prepend-icon": "mdi-download",
+                            "onclick": self._queue_onclick("download"),
+                        },
+                        "text": "下载选中",
+                    },
+                    {
+                        "component": "VBtn",
+                        "props": {
+                            "color": "secondary",
+                            "variant": "tonal",
+                            "prepend-icon": "mdi-refresh",
+                            "onclick": self._queue_onclick("retry"),
+                        },
+                        "text": "全部重试",
+                    },
+                    {
+                        "component": "VBtn",
+                        "props": {
+                            "color": "default",
+                            "variant": "text",
+                            "prepend-icon": "mdi-broom",
+                            "onclick": self._queue_onclick("clear"),
+                        },
+                        "text": "清理队列",
+                    },
+                ],
+            }
+        )
+        return {
+            "component": "VCard",
+            "props": {"class": "mb-3"},
+            "content": [{"component": "VCardText", "content": content}],
+        }
+
+    def _queue_table(self, queue: list[dict[str, Any]]) -> dict[str, Any]:
+        """Build the Vuetify table for the pending queue."""
+
+        headers = ["", "海报", "类型", "标题", "季集", "缺失", "状态", "最近尝试"]
+        status_labels = {
+            "dry_run": "待下载",
+            "queued": "排队中",
+            "not_found": "未找到",
+            "partial": "部分缺失",
+            "error": "失败",
+            "downloaded": "已下载",
+        }
+        rows: list[dict[str, Any]] = []
+        for entry in queue:
+            media_type = str(entry.get("media_type") or "movie")
+            season = entry.get("season")
+            episode = entry.get("episode")
+            if season is not None and episode is not None:
+                episode_label = f"S{int(season):02d}E{int(episode):02d}"
+            else:
+                episode_label = "-"
+            poster = str(entry.get("poster") or "")
+            title = str(entry.get("title") or Path(str(entry.get("path") or "")).stem)
+            year = str(entry.get("year") or "")
+            missing = "、".join(str(value) for value in entry.get("missing") or []) or "-"
+            status = status_labels.get(str(entry.get("status") or ""), str(entry.get("status") or "-"))
+            reason = str(entry.get("reason") or "")
+            rows.append(
+                {
+                    "component": "tr",
+                    "content": [
+                        {
+                            "component": "td",
+                            "content": [
+                                {
+                                    "component": "input",
+                                    "props": {
+                                        "type": "checkbox",
+                                        "class": "csf-queue",
+                                        "value": str(entry.get("key") or ""),
+                                        "aria-label": f"选择 {title}",
+                                    },
+                                }
+                            ],
+                        },
+                        {
+                            "component": "td",
+                            "content": [
+                                (
+                                    {
+                                        "component": "VImg",
+                                        "props": {
+                                            "src": poster,
+                                            "alt": title,
+                                            "width": 40,
+                                            "height": 60,
+                                            "cover": True,
+                                            "class": "rounded",
+                                        },
+                                    }
+                                    if poster
+                                    else {
+                                        "component": "span",
+                                        "props": {"class": "text-caption text-grey"},
+                                        "text": "—",
+                                    }
+                                )
+                            ],
+                        },
+                        {
+                            "component": "td",
+                            "text": "电影" if media_type != "tv" else "剧集",
+                        },
+                        {
+                            "component": "td",
+                            "text": f"{title} ({year})" if year else title,
+                        },
+                        {"component": "td", "text": episode_label},
+                        {"component": "td", "text": missing},
+                        {
+                            "component": "td",
+                            "text": f"{status}｜{reason}" if reason else status,
+                        },
+                        {
+                            "component": "td",
+                            "props": {"class": "text-caption text-grey"},
+                            "text": str(entry.get("updated") or "-"),
+                        },
+                    ],
+                }
+            )
+
+        select_all = {
+            "component": "input",
+            "props": {
+                "type": "checkbox",
+                "aria-label": "全选待补全条目",
+                "onclick": (
+                    "var checked=this.checked;"
+                    "Array.prototype.forEach.call("
+                    "document.querySelectorAll('input.csf-queue'),"
+                    "function(node){node.checked=checked;}"
+                    ");"
+                ),
+            },
+        }
+        return {
+            "component": "div",
+            "props": {"style": "overflow-x:auto"},
+            "content": [
+                {
+                    "component": "VTable",
+                    "props": {"density": "compact", "hover": True},
+                    "content": [
+                        {
+                            "component": "thead",
+                            "content": [
+                                {
+                                    "component": "tr",
+                                    "content": [
+                                        {"component": "th", "content": [select_all]},
+                                        *[
+                                            {"component": "th", "text": title}
+                                            for title in headers[1:]
+                                        ],
+                                    ],
+                                }
+                            ],
+                        },
+                        {"component": "tbody", "content": rows},
+                    ],
+                }
+            ],
+        }
+
+    def _queue_onclick(self, action: str) -> str:
+        """Build the inline JS for the queue buttons."""
+
+        api = json.dumps(f"plugin/{self.__class__.__name__}/queue/download")
+        clear_api = json.dumps(f"plugin/{self.__class__.__name__}/queue/clear")
+        if action == "clear":
+            return (
+                "(function(){"
+                "if(!confirm('清理文件已不存在或字幕已补齐的队列条目？')){return;}"
+                f"window.MoviePilotAPI.post({clear_api},{{}})"
+                ".then(function(r){alert((r&&r.message)||'已清理');location.reload();})"
+                ".catch(function(err){console.error(err);alert('清理失败');});"
+                "})()"
+            )
+
+        if action == "retry":
+            guard = ""
+            body = "{all:true}"
+            prompt = "将重试队列中全部条目，继续？"
+        else:
+            guard = "if(!keys.length){alert('请先勾选要补字幕的视频');return;}"
+            body = "{keys:keys}"
+            prompt = "为选中的视频补全字幕？"
+
+        return (
+            "(function(){"
+            "var nodes=document.querySelectorAll('input.csf-queue:checked');"
+            "var keys=Array.prototype.map.call(nodes,function(node){return node.value;});"
+            f"{guard}"
+            f"if(!confirm('{prompt}')){{return;}}"
+            f"window.MoviePilotAPI.post({api},{body})"
+            ".then(function(r){"
+            "if(!r||r.success===false){alert((r&&r.message)||'提交失败');return;}"
+            "alert(r.message||'已提交');"
+            "setTimeout(function(){location.reload();},1500);"
+            "}).catch(function(err){console.error(err);alert('请求失败');});"
+            "})()"
+        )
+
     def stop_service(self) -> None:
         """Stop the optional local service process owned by this plugin."""
 
         self._stop_managed_service()
+
+    # -- 待补全字幕队列 -----------------------------------------------
+
+    @staticmethod
+    def _queue_key_for(path: str) -> str:
+        """Stable short key for a video path (used by the page checkboxes)."""
+
+        return hashlib.md5(str(path).encode("utf-8")).hexdigest()[:12]
+
+    def _load_queue(self) -> list[dict[str, Any]]:
+        """Read the pending-subtitle queue."""
+
+        value = self.get_data(self._queue_key)
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                return []
+        return value if isinstance(value, list) else []
+
+    def _save_queue(self, queue: list[dict[str, Any]]) -> None:
+        """Persist the queue, newest first, bounded."""
+
+        self.save_data(
+            self._queue_key,
+            json.dumps(queue[: self._queue_max], ensure_ascii=False),
+        )
+
+    def _queue_upsert(
+        self,
+        queue: list[dict[str, Any]],
+        item: dict[str, Any],
+        status: str,
+        reason: str = "",
+    ) -> None:
+        """Insert or refresh one queue entry."""
+
+        path = str(item.get("path") or "")
+        if not path:
+            return
+        key = self._queue_key_for(path)
+        existing = next((entry for entry in queue if entry.get("key") == key), None)
+        entry = existing or {
+            "key": key,
+            "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "attempts": 0,
+        }
+        missing = [str(value) for value in (item.get("missing") or [])]
+        entry.update(
+            {
+                "path": path,
+                "title": str(item.get("title") or Path(path).stem),
+                "year": str(item.get("year") or ""),
+                "media_type": str(
+                    item.get("media_type")
+                    or ("tv" if item.get("episode") is not None else "movie")
+                ),
+                "season": item.get("season"),
+                "episode": item.get("episode"),
+                "missing": missing or entry.get("missing") or [],
+                "status": status,
+                "reason": reason,
+                "poster": str(item.get("poster") or entry.get("poster") or ""),
+                "updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+        )
+        if existing is None:
+            queue.insert(0, entry)
+
+    def _queue_drop(self, queue: list[dict[str, Any]], path: str) -> bool:
+        """Drop one entry by video path; returns whether something was removed."""
+
+        key = self._queue_key_for(path)
+        before = len(queue)
+        queue[:] = [entry for entry in queue if entry.get("key") != key]
+        return len(queue) != before
+
+    def _queue_sync_from_scan(self, result: dict[str, Any]) -> None:
+        """Reflect a scan result into the queue."""
+
+        items = [item for item in result.get("items") or [] if isinstance(item, dict)]
+        if not items:
+            return
+        queue = self._load_queue()
+        changed = False
+        for item in items:
+            # 内置引擎用 path/missing，服务端用 video_path/missing_languages
+            path = str(item.get("path") or item.get("video_path") or "")
+            if not path:
+                continue
+            if item.get("downloaded"):
+                changed = self._queue_drop(queue, path) or changed
+                continue
+            status = str(item.get("status") or "not_found")
+            if status in {"downloaded", "ok", "completed"}:
+                changed = self._queue_drop(queue, path) or changed
+                continue
+            normalized = {
+                "path": path,
+                "title": item.get("title") or "",
+                "year": item.get("year") or "",
+                "media_type": item.get("media_type") or "movie",
+                "season": item.get("season"),
+                "episode": item.get("episode"),
+                "missing": item.get("missing") or item.get("missing_languages") or [],
+                "poster": item.get("poster") or "",
+            }
+            reason = str(item.get("reason") or "") or "；".join(
+                str(err) for err in (item.get("errors") or [])[:2]
+            )
+            self._queue_upsert(queue, normalized, status, reason)
+            changed = True
+        if changed:
+            self._save_queue(queue)
+
+    def _queue_sync_from_process(
+        self, payload: dict[str, Any], result: dict[str, Any]
+    ) -> None:
+        """Reflect a single-file result into the queue."""
+
+        path = str(payload.get("video_path") or "")
+        if not path:
+            return
+        queue = self._load_queue()
+        if result.get("downloaded"):
+            if self._queue_drop(queue, path):
+                self._save_queue(queue)
+            return
+        if not (result.get("missing") or result.get("status") in {"not_found", "error"}):
+            return
+        item = {
+            "path": path,
+            "title": payload.get("title") or Path(path).stem,
+            "year": payload.get("year") or "",
+            "media_type": payload.get("media_type") or "movie",
+            "season": payload.get("season"),
+            "episode": payload.get("episode"),
+            "missing": [str(value) for value in result.get("missing") or []],
+            "poster": str(payload.get("poster") or ""),
+        }
+        reason = "；".join(str(err) for err in (result.get("errors") or [])[:2])
+        self._queue_upsert(queue, item, str(result.get("status") or "not_found"), reason)
+        self._save_queue(queue)
+
+    @staticmethod
+    def _poster_url(value: Any) -> str:
+        """Normalize a TMDB poster path into a browser-usable URL."""
+
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        if text.startswith("http"):
+            return text
+        try:
+            from app.sdk.config import settings as cfg
+        except ImportError:  # MoviePilot V2
+            from app.core.config import settings as cfg
+        builder = getattr(cfg, "TMDB_IMAGE_URL", None)
+        if callable(builder):
+            try:
+                return str(builder(text))
+            except Exception:  # noqa: BLE001 - fall back to the public domain
+                pass
+        return (
+            "https://image.tmdb.org/t/p/w500"
+            + (text if text.startswith("/") else f"/{text}")
+        )
+
+    async def _enrich_queue_posters(self) -> None:
+        """Fill missing posters for the first few queue entries (best effort)."""
+
+        queue = self._load_queue()
+        pending = [entry for entry in queue if not entry.get("poster")][:12]
+        if not pending:
+            return
+        chain = getattr(self, "chain", None)
+        if chain is None or not hasattr(chain, "async_match_tmdbinfo"):
+            return
+
+        changed = False
+        for entry in pending:
+            try:
+                info = await chain.async_match_tmdbinfo(
+                    name=str(entry.get("title") or ""),
+                    mtype=(
+                        MediaType.TV
+                        if entry.get("episode") is not None
+                        else MediaType.MOVIE
+                    ),
+                    year=str(entry.get("year") or "") or None,
+                )
+            except Exception as err:  # noqa: BLE001 - posters are optional
+                logger.debug(f"队列海报识别失败：{err}")
+                continue
+            poster = ""
+            if isinstance(info, dict):
+                poster = str(info.get("poster_path") or info.get("poster") or "")
+            elif info is not None:
+                poster = str(getattr(info, "poster_path", "") or "")
+            if not poster:
+                continue
+            entry["poster"] = self._poster_url(poster)
+            changed = True
+        if changed:
+            self._save_queue(queue)
+
+    async def _queue_worker(self, keys: list[str]) -> None:
+        """Download subtitles for the selected queue entries, one by one."""
+
+        self._queue_running = True
+        try:
+            for key in keys:
+                entry = next(
+                    (item for item in self._load_queue() if item.get("key") == key),
+                    None,
+                )
+                if entry is None:
+                    continue
+                payload = {
+                    "video_path": entry.get("path"),
+                    "title": entry.get("title") or "",
+                    "year": entry.get("year") or None,
+                    "media_type": entry.get("media_type") or "movie",
+                    "season": entry.get("season"),
+                    "episode": entry.get("episode"),
+                    "languages": entry.get("missing") or self._languages,
+                    "overwrite": self._overwrite,
+                    "dry_run": False,
+                }
+                try:
+                    result = await self._process_payload(payload)
+                except Exception as exc:  # noqa: BLE001 - keep the queue moving
+                    logger.error(f"队列下载失败：{type(exc).__name__}: {exc}")
+                    result = {"status": "error", "downloaded": [], "errors": [str(exc)]}
+
+                queue = self._load_queue()
+                current = next(
+                    (item for item in queue if item.get("key") == key), None
+                )
+                if current is not None:
+                    current["attempts"] = int(current.get("attempts") or 0) + 1
+                    current["updated"] = datetime.now().strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    )
+                if result.get("downloaded"):
+                    self._queue_drop(queue, str(entry.get("path") or ""))
+                    self._add_history(payload, result)
+                else:
+                    if current is not None:
+                        current["status"] = str(result.get("status") or "not_found")
+                        current["reason"] = "；".join(
+                            str(err) for err in (result.get("errors") or [])[:2]
+                        )
+                        current["missing"] = [
+                            str(value)
+                            for value in (result.get("missing") or current.get("missing") or [])
+                        ]
+                self._save_queue(queue)
+                await asyncio.sleep(max(0.5, self._native_request_delay))
+        finally:
+            self._queue_running = False
 
     def _load_history(self) -> list[dict]:
         """Read recent history from plugin data."""

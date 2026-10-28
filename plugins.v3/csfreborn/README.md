@@ -80,3 +80,23 @@ verified from subtitle content, and Xunlei/Shooter results are checked against
 the target episode and year before they are accepted.
 
 Self-check: `python3 tests/v3/csfreborn/check_native_engine.py`.
+
+## Pending queue and manual download
+
+Scans (including the default dry-run preview) write every video that still
+lacks the requested languages into a persistent queue. The plugin page renders
+it as a table with per-row checkboxes — poster, type, title, season/episode,
+missing languages, status and last attempt — so items that were not downloaded
+can be picked and retried by hand.
+
+- `POST /queue/download` with `{"keys": [...]}` or `{"all": true}` starts a
+  background worker; every video goes through the same native/service pipeline.
+- Successful items leave the queue and appear in the download history.
+- `POST /queue/clear` drops entries whose file is gone or whose subtitles are
+  now complete.
+- `GET /queue` returns the raw queue.
+
+A static preview of the layout is in `docs/queue-preview.html`.
+
+Note: `scan_dry_run` is enabled by default, so scheduled and manual scans only
+inspect and queue; turn it off to let scans download automatically.
