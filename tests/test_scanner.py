@@ -113,6 +113,33 @@ def test_parse_path_reads_imdb_from_kodi_nfo(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_scanner_status_reports_live_quota_and_queue(tmp_path: Path) -> None:
+    video = tmp_path / "Movie (2024)" / "Movie.2024.mkv"
+    video.parent.mkdir(parents=True)
+    video.write_bytes(b"video")
+    service = make_service(tmp_path)
+    store = ScanStore(service.settings.data_dir)
+    store.record_downloads(3)
+    store.upsert_queue_item(
+        video,
+        {
+            "video_path": str(video),
+            "title": "Movie",
+            "media_type": "movie",
+            "languages": ["zh-Hans"],
+        },
+    )
+    scanner = LibraryScanner(service, service.settings.data_dir)
+    try:
+        status = scanner.status(daily_download_limit=10)
+    finally:
+        await service.close()
+
+    assert status["quota"] == {"used": 3, "limit": 10, "remaining": 7}
+    assert status["queue"] == {"total": 1, "due": 1, "deferred": 0}
+
+
+@pytest.mark.asyncio
 async def test_library_scan_downloads_only_missing_subtitles(tmp_path: Path) -> None:
     root = tmp_path / "电影" / "外语电影"
     missing = root / "Movie (2024) {tmdbid=1}" / "Movie.2024.mkv"

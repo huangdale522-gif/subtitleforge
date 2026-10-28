@@ -47,7 +47,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(
         title="SubtitleForge",
-        version="0.3.0",
+        version="0.3.1",
         description="Provider-driven Chinese subtitle downloader for NAS and MoviePilot.",
         lifespan=lifespan,
     )
@@ -78,11 +78,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         service: SubtitleService = app.state.service
         return {
             "status": "ok",
-            "version": "0.3.0",
+            "version": "0.3.1",
             "providers": {
                 name: provider.configured
                 for name, provider in service.providers.items()
             },
+        }
+
+    @app.get("/v1/status")
+    async def runtime_status(
+        daily_download_limit: int = Query(default=10, ge=1, le=1000),
+        _: None = Depends(require_token),
+    ) -> dict[str, Any]:
+        """Return live quota, queue, and provider health for the plugin page."""
+
+        scanner: LibraryScanner = app.state.scanner
+        service: SubtitleService = app.state.service
+        return {
+            "status": "ok",
+            "version": "0.3.1",
+            **scanner.status(daily_download_limit),
+            "providers": service.status(),
         }
 
     @app.get("/", response_class=HTMLResponse)

@@ -36,7 +36,7 @@ class CSFReborn(_PluginBase):
         "接入 SubtitleBest、ASSRT、迅雷等中文字幕源，为电影、剧集和动漫自动补全字幕。"
     )
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.7.0"
+    plugin_version = "0.8.0"
     plugin_author = "SubtitleForge contributors"
     author_url = "https://github.com/"
     plugin_config_prefix = "csfreborn_"
@@ -1158,108 +1158,961 @@ class CSFReborn(_PluginBase):
         }
 
     def get_page(self) -> list[dict]:
-        """Render the latest library scan and recent processing history."""
+        """Render live quota, provider health, scan results, and history."""
 
         history = self._load_history()
         latest_scan = self._load_latest_scan()
-        cards: list[dict] = []
-        if latest_scan:
-            items = latest_scan.get("items") or []
-            missing = [
-                item
-                for item in items
-                if item.get("status")
-                in {"dry_run", "queued", "not_found", "partial", "error"}
-            ]
-            cards.append(
+        runtime, status_error = self._load_runtime_status()
+        quota = runtime.get("quota") if isinstance(runtime.get("quota"), dict) else {}
+        queue = runtime.get("queue") if isinstance(runtime.get("queue"), dict) else {}
+        used_today = int(
+            quota.get(
+                "used",
+                latest_scan.get("downloads_today", 0),
+            )
+            or 0
+        )
+        daily_limit = int(
+            quota.get("limit", self._scan_daily_download_limit)
+            or self._scan_daily_download_limit
+        )
+        queue_total = int(
+            queue.get("total", latest_scan.get("queue_remaining", 0)) or 0
+        )
+        queue_due = int(queue.get("due", 0) or 0)
+        queue_deferred = int(queue.get("deferred", 0) or 0)
+        service_online = bool(runtime)
+        quota_percent = min(100.0, used_today / max(1, daily_limit) * 100)
+        mode_text = "仅预览" if self._scan_dry_run else "自动补全"
+        schedule_text = (
+            f"每 {self._scan_interval_hours} 小时扫描"
+            if self._scan_enabled
+            else "定时扫描关闭"
+        )
+
+        page: list[dict] = [
+            {
+                "component": "VCard",
+                "props": {
+                    "class": "mb-3",
+                    "variant": "tonal",
+                    "color": "success" if self._enabled else "default",
+                },
+                "content": [
+                    {
+                        "component": "VCardText",
+                        "content": [
+                            {
+                                "component": "div",
+                                "props": {
+                                    "class": "d-flex flex-wrap align-center ga-2"
+                                },
+                                "content": [
+                                    {
+                                        "component": "VIcon",
+                                        "props": {
+                                            "icon": "mdi-subtitles",
+                                            "size": 32,
+                                        },
+                                    },
+                                    {
+                                        "component": "div",
+                                        "props": {"class": "flex-grow-1"},
+                                        "content": [
+                                            {
+                                                "component": "div",
+                                                "props": {
+                                                    "class": "text-h6 font-weight-bold"
+                                                },
+                                                "text": "SubtitleForge 字幕补全",
+                                            },
+                                            {
+                                                "component": "div",
+                                                "props": {
+                                                    "class": "text-caption"
+                                                },
+                                                "text": (
+                                                    f"扫描每日额度 {used_today}/"
+                                                    f"{daily_limit} · "
+                                                    f"队列 {queue_total} · "
+                                                    f"{schedule_text}"
+                                                ),
+                                            },
+                                        ],
+                                    },
+                                    self._chip(
+                                        "运行中" if self._enabled else "未启用",
+                                        "success" if self._enabled else "default",
+                                    ),
+                                    self._chip(mode_text, "info"),
+                                    self._chip(
+                                        "服务在线" if service_online else "服务离线",
+                                        "success" if service_online else "error",
+                                    ),
+                                ],
+                            },
+                            {
+                                "component": "div",
+                                "props": {"class": "text-caption mt-2"},
+                                "text": (
+                                    f"服务地址 {self._service_url} · "
+                                    "MoviePilot 通知 "
+                                    f"{'已开启' if self._notify else '已关闭'}"
+                                ),
+                            },
+                        ],
+                    }
+                ],
+            },
+            {
+                "component": "div",
+                "props": {
+                    "class": "d-flex flex-wrap align-center ga-2 my-3"
+                },
+                "content": [
+                    {
+                        "component": "VBtn",
+                        "props": {
+                            "color": "primary",
+                            "variant": "flat",
+                            "prepend-icon": "mdi-magnify-scan",
+                            "disabled": not self._enabled
+                            or self._scan_running,
+                            "onclick": self._scan_onclick(),
+                        },
+                        "text": (
+                            "扫描中..."
+                            if self._scan_running
+                            else (
+                                "立即扫描（仅预览）"
+                                if self._scan_dry_run
+                                else "立即扫描并补全"
+                            )
+                        ),
+                    },
+                    {
+                        "component": "VBtn",
+                        "props": {
+                            "color": "default",
+                            "variant": "tonal",
+                            "prepend-icon": "mdi-refresh",
+                            "onclick": "location.reload()",
+                        },
+                        "text": "刷新状态",
+                    },
+                    self._chip(
+                        f"今日扫描下载 {used_today}/{daily_limit}",
+                        (
+                            "warning"
+                            if used_today >= daily_limit
+                            else "primary"
+                        ),
+                    ),
+                    self._chip(f"待处理 {queue_total}", "default"),
+                    self._chip(
+                        f"到期 {queue_due} / 延后 {queue_deferred}",
+                        "default",
+                    ),
+                    self._chip(
+                        (
+                            f"迅雷 {'开启' if self._xunlei_enabled else '关闭'}"
+                        ),
+                        "success" if self._xunlei_enabled else "default",
+                    ),
+                    self._chip(
+                        f"Shooter {'开启' if self._shooter_enabled else '关闭'}",
+                        "success" if self._shooter_enabled else "default",
+                    ),
+                ],
+            },
+        ]
+        if status_error:
+            page.append(
+                self._alert(
+                    "warning",
+                    "实时状态服务暂不可用，以下额度与队列可能来自最近一次扫描。"
+                    "请先在插件设置中启用插件，并确认内置服务已启动。",
+                )
+            )
+        if not self._enabled:
+            page.append(
+                self._alert(
+                    "info",
+                    "插件当前未启用。启用后才能开始扫描，字幕源不会产生任何请求。",
+                )
+            )
+
+        page.extend(
+            [
+                {
+                    "component": "VRow",
+                    "props": {"class": "mb-1"},
+                    "content": [
+                        {
+                            "component": "VCol",
+                            "props": {"cols": 12, "sm": 6, "lg": 3},
+                            "content": [
+                                self._metric_card(
+                                    "今日扫描下载",
+                                    f"{used_today} / {daily_limit}",
+                                    f"剩余 {max(0, daily_limit - used_today)} 条",
+                                    "mdi-download-circle-outline",
+                                    "primary",
+                                    quota_percent,
+                                )
+                            ],
+                        },
+                        {
+                            "component": "VCol",
+                            "props": {"cols": 12, "sm": 6, "lg": 3},
+                            "content": [
+                                self._metric_card(
+                                    "待处理队列",
+                                    str(queue_total),
+                                    f"到期 {queue_due} · 延后 {queue_deferred}",
+                                    "mdi-tray-full",
+                                    "info",
+                                )
+                            ],
+                        },
+                        {
+                            "component": "VCol",
+                            "props": {"cols": 12, "sm": 6, "lg": 3},
+                            "content": [
+                                self._metric_card(
+                                    "最近扫描",
+                                    str(latest_scan.get("checked", 0)),
+                                    (
+                                        f"发现 {latest_scan.get('discovered', 0)} · "
+                                        f"已有 {latest_scan.get('existing', 0)} · "
+                                        f"缺失 {latest_scan.get('queued', 0)}"
+                                    ),
+                                    "mdi-library-shelves",
+                                    "secondary",
+                                )
+                            ],
+                        },
+                        {
+                            "component": "VCol",
+                            "props": {"cols": 12, "sm": 6, "lg": 3},
+                            "content": [
+                                self._metric_card(
+                                    "最近扫描时间",
+                                    str(latest_scan.get("time") or "尚未扫描"),
+                                    (
+                                        f"本轮下载 {latest_scan.get('downloaded', 0)} 条"
+                                        if latest_scan
+                                        else "等待首次媒体库扫描"
+                                    ),
+                                    "mdi-clock-outline",
+                                    "default",
+                                )
+                            ],
+                        },
+                    ],
+                },
                 {
                     "component": "VCard",
-                    "props": {"class": "mb-3", "variant": "tonal"},
+                    "props": {"class": "mb-3", "variant": "outlined"},
                     "content": [
+                        {
+                            "component": "VCardTitle",
+                            "props": {"class": "text-subtitle-1"},
+                            "text": "工作逻辑",
+                        },
                         {
                             "component": "VCardText",
                             "content": [
+                                self._logic_line(
+                                    "mdi-file-search-outline",
+                                    "1. 先全库检查",
+                                    (
+                                        "逐个检查外挂和内嵌中文字幕。只读本地文件，"
+                                        "这一步不访问任何字幕源。"
+                                    ),
+                                ),
+                                self._logic_line(
+                                    "mdi-tray-arrow-down",
+                                    "2. 缺失项排队",
+                                    (
+                                        "缺字幕的视频写入持久队列，按入队时间处理；"
+                                        "失败任务约 24 小时后再试。"
+                                    ),
+                                ),
+                                self._logic_line(
+                                    "mdi-source-branch",
+                                    "3. 按顺序故障切换",
+                                    (
+                                        "按下方字幕源顺序搜索。前一个源返回可用候选后，"
+                                        "后面的源不再搜索；候选还要通过标题、年份、"
+                                        "季集、语言和格式匹配。"
+                                    ),
+                                ),
+                                self._logic_line(
+                                    "mdi-counter",
+                                    "4. 成功下载才计额度",
+                                    (
+                                        f"媒体库扫描队列每天最多记录 {daily_limit} 个"
+                                        "成功字幕文件，是所有字幕源合计，不是每家各"
+                                        " 10 条。同一视频补齐简体和繁体各成功一次，"
+                                        "会分别计 2 条。"
+                                    ),
+                                ),
+                                self._logic_line(
+                                    "mdi-shield-alert-outline",
+                                    "5. 限流后自动冷却",
+                                    (
+                                        "某个源返回 429 或额度错误时，该源冷却 24 小时；"
+                                        "其他源继续。外部账号的每日额度仍由各站点控制，"
+                                        "本插件无法提前知道其剩余数量。"
+                                    ),
+                                ),
+                            ],
+                        },
+                    ],
+                },
+                self._alert(
+                    "warning",
+                    (
+                        "额度说明：每日上限只约束媒体库扫描队列，按“成功写入的"
+                        "字幕文件”计数，跨服务重启保留。MoviePilot 整理完成后调用"
+                        "的实时补全接口不经过扫描队列，因此不计入、也不受该上限约束。"
+                        "迅雷免账号；ASSRT、SubtitleBest、OpenSubtitles 等还会受"
+                        "各自账号、积分或频率限制，具体额度以服务方为准。命中限流"
+                        "会自动冷却，不会无限重试。"
+                    ),
+                ),
+            ]
+        )
+
+        provider_data = runtime.get("providers")
+        page.append(
+            {
+                "component": "VCard",
+                "props": {"class": "my-3", "variant": "outlined"},
+                "content": [
+                    {
+                        "component": "VCardTitle",
+                        "props": {"class": "text-subtitle-1"},
+                        "text": "字幕源状态与额度边界",
+                    },
+                    {
+                        "component": "VCardText",
+                        "props": {"class": "pt-0"},
+                        "content": [
+                            self._provider_table(
+                                provider_data
+                                if isinstance(provider_data, dict)
+                                else {}
+                            )
+                        ],
+                    },
+                ],
+            }
+        )
+
+        if latest_scan:
+            page.append(
+                {
+                    "component": "VCard",
+                    "props": {"class": "mb-3", "variant": "outlined"},
+                    "content": [
+                        {
+                            "component": "VCardTitle",
+                            "props": {
+                                "class": (
+                                    "text-subtitle-1 d-flex flex-wrap "
+                                    "align-center ga-2"
+                                )
+                            },
+                            "content": [
                                 {
-                                    "component": "div",
-                                    "props": {"class": "font-weight-bold"},
+                                    "component": "span",
                                     "text": (
-                                        f"媒体库扫描 · {latest_scan.get('time', '')} · "
-                                        f"{'仅预览' if latest_scan.get('dry_run') else '自动补全'}"
+                                        f"最近扫描 · "
+                                        f"{latest_scan.get('time') or '-'}"
                                     ),
                                 },
+                                self._chip(
+                                    "仅预览"
+                                    if latest_scan.get("dry_run")
+                                    else "自动补全",
+                                    "info",
+                                ),
+                                self._chip(
+                                    self._scan_status_label(
+                                        str(latest_scan.get("status") or "")
+                                    ),
+                                    "primary",
+                                ),
+                            ],
+                        },
+                        {
+                            "component": "VCardText",
+                            "props": {"class": "pt-0"},
+                            "content": [
                                 {
                                     "component": "div",
-                                    "props": {"class": "text-caption"},
+                                    "props": {
+                                        "class": "text-caption mb-2"
+                                    },
                                     "text": (
                                         f"发现 {latest_scan.get('discovered', 0)} · "
                                         f"检查 {latest_scan.get('checked', 0)} · "
                                         f"已有 {latest_scan.get('existing', 0)} · "
                                         f"缺失入队 {latest_scan.get('queued', 0)} · "
-                                        f"队列剩余 {latest_scan.get('queue_remaining', 0)} · "
-                                        f"下载 {latest_scan.get('downloaded', 0)} · "
-                                        f"今日 {latest_scan.get('downloads_today', 0)}/"
-                                        f"{latest_scan.get('daily_download_limit', 0)}"
+                                        f"本轮下载 {latest_scan.get('downloaded', 0)} · "
+                                        f"队列剩余 "
+                                        f"{latest_scan.get('queue_remaining', 0)}"
                                     ),
                                 },
-                                {
-                                    "component": "div",
-                                    "props": {"class": "text-caption mt-2"},
-                                    "text": (
-                                        "；".join(
-                                            f"{item.get('title', '')}: "
-                                            f"{item.get('status', '')}"
-                                            for item in missing[:5]
+                                (
+                                    self._scan_items_table(
+                                        [
+                                            item
+                                            for item in (
+                                                latest_scan.get("items") or []
+                                            )
+                                            if isinstance(item, dict)
+                                        ][:20]
+                                    )
+                                    if latest_scan.get("items")
+                                    else {
+                                        "component": "div",
+                                        "props": {"class": "text-caption"},
+                                        "text": "本轮没有可展示的条目明细。",
+                                    }
+                                ),
+                                *(
+                                    [
+                                        self._alert(
+                                            "error",
+                                            "扫描错误："
+                                            + "；".join(
+                                                str(error)
+                                                for error in (
+                                                    latest_scan.get("errors") or []
+                                                )[:10]
+                                            ),
                                         )
-                                        or "本轮没有发现需要补全的条目"
-                                    ),
-                                },
+                                    ]
+                                    if latest_scan.get("errors")
+                                    else []
+                                ),
                             ],
-                        }
+                        },
                     ],
                 }
             )
-        if not history and not latest_scan:
-            return [
-                {
-                    "component": "VAlert",
-                    "props": {
-                        "type": "info",
-                        "variant": "tonal",
-                        "text": "暂无记录。启用媒体库扫描后会定时检查外挂和内嵌中文字幕。",
-                    },
-                }
-            ]
-        for item in history:
-            result = item.get("result") or {}
-            downloaded = result.get("downloaded") or []
-            cards.append(
+        else:
+            page.append(
+                self._alert(
+                    "info",
+                    "尚未执行媒体库扫描。可先在设置中保持“仅预览”"
+                    "完成一次全库检查，确认识别结果后再关闭预览。",
+                )
+            )
+
+        if history:
+            page.append(
                 {
                     "component": "VCard",
-                    "props": {"class": "mb-2"},
+                    "props": {"class": "mb-3", "variant": "outlined"},
                     "content": [
                         {
+                            "component": "VCardTitle",
+                            "props": {"class": "text-subtitle-1"},
+                            "text": "整理完成后的最近处理",
+                        },
+                        {
                             "component": "VCardText",
+                            "props": {"class": "pt-0"},
+                            "content": [self._history_table(history[:10])],
+                        },
+                    ],
+                }
+            )
+        return page
+
+    def _load_runtime_status(self) -> tuple[dict[str, Any], str]:
+        """Read the live service status and degrade gracefully when offline."""
+
+        path = (
+            "/v1/status?daily_download_limit="
+            f"{max(1, int(self._scan_daily_download_limit))}"
+        )
+        try:
+            value = self._request_json("GET", path, None, timeout=2)
+        except Exception as exc:  # noqa: BLE001 - page rendering must survive
+            logger.debug(f"SubtitleForge 状态读取失败：{type(exc).__name__}: {exc}")
+            return {}, str(exc)
+        if not isinstance(value, dict):
+            return {}, "status response is not an object"
+        return value, ""
+
+    @staticmethod
+    def _chip(text: str, color: str = "default") -> dict[str, Any]:
+        """Build a compact status chip."""
+
+        return {
+            "component": "VChip",
+            "props": {
+                "variant": "tonal",
+                "color": color,
+                "size": "small",
+            },
+            "text": text,
+        }
+
+    @staticmethod
+    def _alert(alert_type: str, text: str) -> dict[str, Any]:
+        """Build a tonal alert used by the plugin status page."""
+
+        return {
+            "component": "VAlert",
+            "props": {
+                "type": alert_type,
+                "variant": "tonal",
+                "class": "mb-3",
+                "text": text,
+            },
+        }
+
+    @staticmethod
+    def _logic_line(icon: str, title: str, text: str) -> dict[str, Any]:
+        """Build one numbered workflow line."""
+
+        return {
+            "component": "div",
+            "props": {
+                "class": "d-flex align-start ga-3 py-2 border-b"
+            },
+            "content": [
+                {
+                    "component": "VIcon",
+                    "props": {"icon": icon, "color": "primary", "size": 22},
+                },
+                {
+                    "component": "div",
+                    "content": [
+                        {
+                            "component": "div",
+                            "props": {"class": "font-weight-medium"},
+                            "text": title,
+                        },
+                        {
+                            "component": "div",
+                            "props": {"class": "text-caption"},
+                            "text": text,
+                        },
+                    ],
+                },
+            ],
+        }
+
+    @staticmethod
+    def _metric_card(
+        title: str,
+        value: str,
+        subtitle: str,
+        icon: str,
+        color: str,
+        progress: float | None = None,
+    ) -> dict[str, Any]:
+        """Build a compact metric card."""
+
+        content: list[dict[str, Any]] = [
+            {
+                "component": "div",
+                "props": {
+                    "class": (
+                        "d-flex align-center justify-space-between "
+                        "text-caption text-medium-emphasis"
+                    )
+                },
+                "content": [
+                    {"component": "span", "text": title},
+                    {
+                        "component": "VIcon",
+                        "props": {"icon": icon, "color": color, "size": 20},
+                    },
+                ],
+            },
+            {
+                "component": "div",
+                "props": {"class": "text-h6 font-weight-bold mt-2"},
+                "text": value,
+            },
+            {
+                "component": "div",
+                "props": {"class": "text-caption text-medium-emphasis"},
+                "text": subtitle,
+            },
+        ]
+        if progress is not None:
+            content.append(
+                {
+                    "component": "VProgressLinear",
+                    "props": {
+                        "model-value": round(progress, 1),
+                        "color": color,
+                        "height": 5,
+                        "rounded": True,
+                        "class": "mt-3",
+                    },
+                }
+            )
+        return {
+            "component": "VCard",
+            "props": {"variant": "tonal", "class": "h-100"},
+            "content": [
+                {
+                    "component": "VCardText",
+                    "props": {"class": "py-3"},
+                    "content": content,
+                }
+            ],
+        }
+
+    def _provider_table(self, provider_data: dict[str, Any]) -> dict[str, Any]:
+        """Build the provider order, state, and quota-boundary table."""
+
+        runtime_items = provider_data.get("items")
+        runtime_by_name = {
+            str(item.get("name")): item
+            for item in (runtime_items if isinstance(runtime_items, list) else [])
+            if isinstance(item, dict) and item.get("name")
+        }
+        order = provider_data.get("order")
+        names = (
+            [str(name) for name in order]
+            if isinstance(order, list) and order
+            else self._split_list(self._provider_order)
+        )
+        if not names:
+            names = self._split_list(
+                "xunlei,assrt,subtitle_best,opensubtitles,custom,shooter"
+            )
+        meta = {
+            "xunlei": (
+                "迅雷",
+                "免账号，按视频文件指纹精确匹配",
+                "插件不设单源额度；服务方策略可能变化",
+            ),
+            "assrt": (
+                "ASSRT",
+                "中文电影/剧集字幕库",
+                "账号积分与频率由 ASSRT 控制",
+            ),
+            "subtitle_best": (
+                "SubtitleBest",
+                "share-sub 中文字幕索引",
+                "账号每日配额由 SubtitleBest 控制",
+            ),
+            "opensubtitles": (
+                "OpenSubtitles",
+                "官方 API，需完整账号才能下载",
+                "会员下载额度由 OpenSubtitles 控制",
+            ),
+            "custom": (
+                "自定义源",
+                "用户自建 JSON 字幕接口",
+                "额度取决于你自己的接口",
+            ),
+            "shooter": (
+                "Shooter",
+                "旧版文件指纹源，经常超时",
+                "默认关闭；公共接口可能限流",
+            ),
+        }
+        rows: list[dict[str, Any]] = []
+        for index, name in enumerate(names, start=1):
+            label, purpose, quota_note = meta.get(
+                name,
+                (name, "自定义字幕源", "额度取决于服务方"),
+            )
+            runtime_item = runtime_by_name.get(name, {})
+            configured = bool(
+                runtime_item.get(
+                    "configured",
+                    self._configured_provider_fallback(name),
+                )
+            )
+            cooling_down = bool(runtime_item.get("cooling_down"))
+            if cooling_down:
+                status_chip = self._chip("冷却中", "warning")
+            elif configured:
+                status_chip = self._chip("可用", "success")
+            else:
+                status_chip = self._chip("未启用/未配置", "default")
+            cooldown = (
+                self._cooldown_label(runtime_item.get("cooldown_until"))
+                if cooling_down
+                else "-"
+            )
+            rows.append(
+                {
+                    "component": "tr",
+                    "content": [
+                        {"component": "td", "text": str(index)},
+                        {
+                            "component": "td",
+                            "text": label,
+                            "props": {"class": "font-weight-medium"},
+                        },
+                        {"component": "td", "content": [status_chip]},
+                        {
+                            "component": "td",
                             "content": [
                                 {
                                     "component": "div",
-                                    "props": {"class": "font-weight-bold"},
-                                    "text": f"{item.get('time', '')} · {item.get('title', '')}",
+                                    "text": purpose,
                                 },
                                 {
                                     "component": "div",
                                     "props": {"class": "text-caption"},
-                                    "text": (
-                                        f"状态: {result.get('status', 'unknown')} · "
-                                        f"下载: {len(downloaded)} · "
-                                        f"错误: {len(result.get('errors') or [])}"
-                                    ),
+                                    "text": quota_note,
                                 },
                             ],
-                        }
+                        },
+                        {
+                            "component": "td",
+                            "text": cooldown,
+                            "props": {"class": "text-caption"},
+                        },
                     ],
                 }
             )
-        return cards
+        return self._table(
+            ["顺序", "字幕源", "状态", "用途 / 额度边界", "当前冷却"],
+            rows,
+        )
+
+    def _configured_provider_fallback(self, name: str) -> bool:
+        """Approximate provider readiness when the status API is unavailable."""
+
+        return {
+            "xunlei": self._xunlei_enabled,
+            "assrt": bool(self._assrt_token),
+            "subtitle_best": bool(
+                self._subtitle_best_api_key
+                and self._subtitle_best_header_token
+            ),
+            "opensubtitles": bool(
+                self._opensubtitles_api_key
+                and self._opensubtitles_username
+                and self._opensubtitles_password
+            ),
+            "custom": bool(self._custom_provider_url),
+            "shooter": self._shooter_enabled,
+        }.get(name, False)
+
+    @staticmethod
+    def _cooldown_label(value: Any) -> str:
+        """Format a provider cooldown deadline in the NAS local timezone."""
+
+        if not value:
+            return "-"
+        try:
+            deadline = datetime.fromisoformat(str(value))
+            return deadline.astimezone().strftime("%m-%d %H:%M")
+        except (TypeError, ValueError):
+            return str(value)
+
+    def _scan_items_table(self, items: list[dict[str, Any]]) -> dict[str, Any]:
+        """Build the latest scan item table."""
+
+        rows: list[dict[str, Any]] = []
+        for item in items:
+            media_type = (
+                "剧集"
+                if str(item.get("media_type") or "").lower() == "tv"
+                else "电影"
+            )
+            season = item.get("season")
+            episode = item.get("episode")
+            episode_label = (
+                f"S{int(season):02d}E{int(episode):02d}"
+                if season is not None and episode is not None
+                else "-"
+            )
+            missing = "、".join(
+                self._language_label(language)
+                for language in (item.get("missing_languages") or [])
+            ) or "-"
+            downloaded = "；".join(
+                (
+                    f"{Path(str(file.get('path') or '')).name} "
+                    f"[{self._language_label(file.get('language'))}/"
+                    f"{file.get('provider') or '-'}]"
+                )
+                for file in (item.get("downloaded") or [])
+                if isinstance(file, dict)
+            ) or "-"
+            errors = "；".join(
+                str(error) for error in (item.get("errors") or [])
+            )
+            rows.append(
+                {
+                    "component": "tr",
+                    "content": [
+                        {"component": "td", "text": media_type},
+                        {
+                            "component": "td",
+                            "text": str(item.get("title") or "-"),
+                            "props": {"class": "font-weight-medium"},
+                        },
+                        {"component": "td", "text": episode_label},
+                        {
+                            "component": "td",
+                            "text": self._scan_status_label(
+                                str(item.get("status") or "")
+                            ),
+                        },
+                        {"component": "td", "text": missing},
+                        {
+                            "component": "td",
+                            "text": downloaded,
+                            "props": {"class": "text-caption"},
+                        },
+                        {
+                            "component": "td",
+                            "text": (errors[:240] + "…")
+                            if len(errors) > 240
+                            else (errors or "-"),
+                            "props": {"class": "text-caption text-error"},
+                        },
+                    ],
+                }
+            )
+        return self._table(
+            ["类型", "标题", "季集", "状态", "缺失", "已下载", "错误"],
+            rows,
+        )
+
+    def _history_table(self, history: list[dict[str, Any]]) -> dict[str, Any]:
+        """Build a compact transfer-complete processing history table."""
+
+        rows: list[dict[str, Any]] = []
+        for item in history:
+            result = item.get("result")
+            result = result if isinstance(result, dict) else {}
+            downloaded = "；".join(
+                (
+                    f"{Path(str(file.get('path') or '')).name} "
+                    f"[{self._language_label(file.get('language'))}/"
+                    f"{file.get('provider') or '-'}]"
+                )
+                for file in (result.get("downloaded") or [])
+                if isinstance(file, dict)
+            ) or "-"
+            errors = result.get("errors") or []
+            rows.append(
+                {
+                    "component": "tr",
+                    "content": [
+                        {
+                            "component": "td",
+                            "text": str(item.get("time") or "-"),
+                            "props": {"class": "text-caption"},
+                        },
+                        {
+                            "component": "td",
+                            "text": str(item.get("title") or "-"),
+                        },
+                        {
+                            "component": "td",
+                            "text": self._scan_status_label(
+                                str(result.get("status") or "")
+                            ),
+                        },
+                        {
+                            "component": "td",
+                            "text": downloaded,
+                            "props": {"class": "text-caption"},
+                        },
+                        {
+                            "component": "td",
+                            "text": str(len(errors)),
+                        },
+                    ],
+                }
+            )
+        return self._table(
+            ["时间", "标题", "状态", "已下载", "错误"],
+            rows,
+        )
+
+    @staticmethod
+    def _table(headers: list[str], rows: list[dict[str, Any]]) -> dict[str, Any]:
+        """Build a compact table from header labels and row definitions."""
+
+        return {
+            "component": "VTable",
+            "props": {
+                "density": "compact",
+                "hover": True,
+                "class": "text-caption",
+            },
+            "content": [
+                {
+                    "component": "thead",
+                    "content": [
+                        {
+                            "component": "tr",
+                            "content": [
+                                {"component": "th", "text": header}
+                                for header in headers
+                            ],
+                        }
+                    ],
+                },
+                {"component": "tbody", "content": rows},
+            ],
+        }
+
+    @staticmethod
+    def _scan_status_label(status: str) -> str:
+        """Translate service status values for the page."""
+
+        return {
+            "completed": "已完成",
+            "skipped": "已有字幕",
+            "dry_run": "待下载（预览）",
+            "queued": "已入队",
+            "not_found": "未找到",
+            "partial": "部分完成",
+            "error": "错误",
+            "processing": "处理中",
+        }.get(status, status or "-")
+
+    @staticmethod
+    def _language_label(language: Any) -> str:
+        """Translate subtitle language codes for compact table cells."""
+
+        return {
+            "zh-Hans": "简中",
+            "zh-Hant": "繁中",
+            None: "-",
+        }.get(str(language) if language is not None else None, str(language))
+
+    def _scan_onclick(self) -> str:
+        """Build the manual scan button handler."""
+
+        api = json.dumps(f"plugin/{self.__class__.__name__}/scan")
+        return (
+            "(function(){"
+            "if(!confirm('立即扫描媒体库并按配置补全缺失字幕？')){return;}"
+            f"window.MoviePilotAPI.post({api},{{}})"
+            ".then(function(r){"
+            "if(!r||r.status==='error'||r.status==='disabled'||r.status==='busy'){"
+            "alert((r&&(r.message||r.errors&&r.errors[0]))||'扫描失败');return;}"
+            "alert('扫描完成：检查 '+(r.checked||0)+'，下载 '+(r.downloaded||0)+"
+            "'，今日 '+(r.downloads_today||0)+'/'+(r.daily_download_limit||0));"
+            "location.reload();"
+            "}).catch(function(err){console.error(err);alert('扫描失败');});"
+            "})()"
+        )
 
     def stop_service(self) -> None:
         """Stop the optional local service process owned by this plugin."""

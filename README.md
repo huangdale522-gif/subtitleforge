@@ -165,6 +165,13 @@ concurrent scan requests are serialized so they cannot overspend the daily
 ledger. The MoviePilot adapter can send the actual downloaded subtitle filenames
 through the user's configured Telegram/notification channel.
 
+`GET /v1/status?daily_download_limit=10` returns the current local-day success
+count, remaining quota, due/deferred queue counts, and sanitized provider
+configuration/cooldown state. The MoviePilot plugin uses this endpoint to render
+its live status dashboard. The daily cap is global across all providers; the
+external services may enforce separate account quotas that are not knowable in
+advance.
+
 ## Custom provider contract
 
 The service sends these query parameters:

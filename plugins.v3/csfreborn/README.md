@@ -53,6 +53,13 @@ that were downloaded successfully through MoviePilot's configured Telegram or
 other notification channel. An authenticated `POST
 /api/v1/plugin/CSFReborn/scan` starts a manual scan using saved settings.
 
+The plugin page reads `GET /v1/status` and shows the live local daily ledger,
+queue due/deferred counts, provider configuration, and any 24-hour rate-limit
+cooldowns. `scan_daily_download_limit` is one global cap across all providers,
+not a separate allowance for each source. ASSRT, SubtitleBest, OpenSubtitles,
+and custom sources can also enforce account quotas which this plugin cannot
+query in advance.
+
 When the bundled service is managed by the plugin, it uses the paths visible in
 the MoviePilot container. For the common MoviePilot layout, `media_roots` is
 `/plex,/media` and the scan paths start with `/plex`.

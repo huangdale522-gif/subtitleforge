@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import httpx
 
@@ -51,7 +53,7 @@ class SubtitleService:
         self._client = client or httpx.AsyncClient(
             timeout=settings.request_timeout_seconds,
             follow_redirects=True,
-            headers={"User-Agent": "SubtitleForge/0.3.0"},
+            headers={"User-Agent": "SubtitleForge/0.3.1"},
         )
         self.providers: dict[str, SubtitleProvider] = {
             "xunlei": XunleiProvider(
@@ -154,6 +156,33 @@ class SubtitleService:
         except OSError:
             # Quota protection still works for this process if persistence fails.
             pass
+
+    def status(self) -> dict[str, Any]:
+        """Return public provider configuration and cooldown state."""
+
+        order = self._provider_order()
+        items: list[dict[str, Any]] = []
+        for name in order:
+            provider = self.providers[name]
+            cooling_down = self._provider_in_cooldown(name)
+            deadline = self._provider_cooldowns.get(name)
+            items.append(
+                {
+                    "name": name,
+                    "configured": provider.configured,
+                    "cooling_down": cooling_down,
+                    "cooldown_until": (
+                        datetime.fromtimestamp(deadline, UTC).isoformat()
+                        if cooling_down and deadline is not None
+                        else None
+                    ),
+                }
+            )
+        return {
+            "order": order,
+            "cooldown_hours": max(0, self.settings.provider_cooldown_hours),
+            "items": items,
+        }
 
     async def search(
         self,

@@ -55,6 +55,12 @@ persistent queue; only queued items then consume provider downloads. Scheduled
 and manual scans share the same daily ledger, and simultaneous triggers are
 serialized.
 
+The plugin status page uses `GET /v1/status` to show the live local daily
+ledger, queue due/deferred counts, and provider cooldown state. The configured
+daily limit applies to all providers together. Quotas enforced by ASSRT,
+SubtitleBest, OpenSubtitles, or a custom source remain authoritative on those
+services and may change without notice.
+
 When `notify` is enabled, MoviePilot sends the scan summary through its
 configured Telegram or other notification channel. A successful scan message
 lists the actual subtitle filenames written beside the videos, including

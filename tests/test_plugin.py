@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import sys
 import types
 from pathlib import Path
@@ -111,3 +112,46 @@ def test_scan_notification_lists_actual_downloaded_files() -> None:
     assert "今日额度 3/10" in text
     assert "Some Show S02E03" in text
     assert "Some.Show.S02E03.chi.zh-cn.ass" in text
+
+
+def test_status_page_explains_quota_queue_and_provider_health() -> None:
+    plugin_module = load_moviepilot_plugin()
+    plugin = plugin_module.CSFReborn()
+    plugin._enabled = True
+    plugin._scan_dry_run = False
+    plugin._scan_enabled = True
+    plugin.get_data = lambda _key: None
+    plugin._request_json = lambda *_args, **_kwargs: {
+        "status": "ok",
+        "version": "0.3.1",
+        "quota": {"used": 3, "limit": 10, "remaining": 7},
+        "queue": {"total": 8, "due": 5, "deferred": 3},
+        "providers": {
+            "order": ["xunlei", "assrt"],
+            "items": [
+                {
+                    "name": "xunlei",
+                    "configured": True,
+                    "cooling_down": False,
+                    "cooldown_until": None,
+                },
+                {
+                    "name": "assrt",
+                    "configured": True,
+                    "cooling_down": True,
+                    "cooldown_until": "2026-10-29T00:00:00+00:00",
+                },
+            ],
+        },
+    }
+
+    rendered = json.dumps(plugin.get_page(), ensure_ascii=False)
+
+    assert "今日扫描下载" in rendered
+    assert "3 / 10" in rendered
+    assert "到期 5 · 延后 3" in rendered
+    assert "字幕源状态与额度边界" in rendered
+    assert "所有字幕源合计" in rendered
+    assert "整理完成后调用的实时补全接口" in rendered
+    assert "冷却中" in rendered
+    assert "ASSRT" in rendered

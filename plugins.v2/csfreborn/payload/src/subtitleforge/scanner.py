@@ -573,6 +573,21 @@ class LibraryScanner:
 
         return self._store.queue_status()
 
+    def status(self, daily_download_limit: int) -> dict[str, Any]:
+        """Return live queue and local daily-quota state for the plugin page."""
+
+        limit = max(1, int(daily_download_limit))
+        used_today = self._store.downloads_today()
+        return {
+            "day": datetime.now().date().isoformat(),
+            "quota": {
+                "used": used_today,
+                "limit": limit,
+                "remaining": max(0, limit - used_today),
+            },
+            "queue": self._store.queue_status(),
+        }
+
     async def scan(self, request: ScanRequest) -> ScanResult:
         """Serialize full scans so concurrent triggers cannot exceed daily quota."""
 
