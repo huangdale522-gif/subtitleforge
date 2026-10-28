@@ -78,7 +78,7 @@ class CSFReborn(_PluginBase):
         "内置 SubtitleBest / ASSRT / 迅雷 / Shooter 字幕源，无需额外服务也能工作。"
     )
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.6.3"
+    plugin_version = "0.6.4"
     plugin_author = "SubtitleForge contributors"
     author_url = "https://github.com/"
     plugin_config_prefix = "csfreborn_"
@@ -318,6 +318,14 @@ class CSFReborn(_PluginBase):
                 "description": "不返回任何密钥，仅返回布尔状态与最近几次处理结果。",
             },
             {
+                "path": "/inspect",
+                "endpoint": self.api_inspect,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "检查单个视频的字幕情况",
+                "description": "参数 path：视频绝对路径。返回目录内字幕文件、识别到的语言与内封字幕。",
+            },
+            {
                 "path": "/queue",
                 "endpoint": self.api_queue,
                 "methods": ["GET"],
@@ -400,6 +408,21 @@ class CSFReborn(_PluginBase):
                 "recent": recent,
             },
         )
+
+    async def api_inspect(self, path: str = "") -> Any:
+        """Inspect one video: subtitle files beside it and detected languages."""
+
+        video = Path(str(path or ""))
+        if not path or not video.is_file():
+            return schemas.Response(success=False, message=f"视频不存在：{path}")
+        if self._native_engine is None:
+            return schemas.Response(success=False, message="内置字幕引擎不可用")
+        try:
+            data = await self._native_engine.inspect(video)
+        except Exception as exc:  # noqa: BLE001
+            return schemas.Response(success=False, message=f"检查失败：{exc}")
+        data["required"] = self._native_engine.required_langs(self._languages)
+        return schemas.Response(success=True, message="检查完成", data=data)
 
     def api_queue(self) -> list[dict[str, Any]]:
         """Return the pending-subtitle queue."""
@@ -2410,6 +2433,12 @@ class CSFReborn(_PluginBase):
             path = str(item.get("path") or item.get("video_path") or "")
             if not path:
                 continue
+            if self._native_engine is not None and self._native_engine.is_bdmv_segment(
+                Path(path)
+            ):
+                logger.info(f"跳过蓝光原盘分片（按整盘处理）：{path}")
+                changed = self._queue_drop(queue, path) or changed
+                continue
             if item.get("downloaded"):
                 changed = self._queue_drop(queue, path) or changed
                 continue
@@ -2493,7 +2522,12 @@ class CSFReborn(_PluginBase):
 
     @staticmethod
     def _poster_from_nfo(video: Path) -> str:
-        """Read the poster URL from a scraped NFO beside the video."""
+        """
+        Read the poster URL from a scraped NFO beside the video.
+
+        NFOs also carry actor thumbs (`<actor><thumb>…</thumb></actor>`), so
+        those blocks are stripped first and only poster-ish tags are accepted.
+        """
 
         folder = video.parent
         candidates = [
@@ -2510,15 +2544,28 @@ class CSFReborn(_PluginBase):
                 text = nfo.read_text(encoding="utf-8", errors="ignore")
             except OSError:
                 continue
-            matched = re.search(
-                r'<thumb[^>]*aspect="poster"[^>]*>\s*([^<\s]+)\s*</thumb>',
-                text,
-                re.IGNORECASE,
-            ) or re.search(r"<thumb[^>]*>\s*([^<\s]+)\s*</thumb>", text, re.IGNORECASE)
-            if matched:
-                url = matched.group(1).strip()
-                if url.startswith("http"):
-                    return url
+
+            # 去掉演员、剧照等无关条目，避免把演员头像当海报
+            cleaned = text
+            for block in ("actor", "actor_list", "fanart"):
+                cleaned = re.sub(
+                    rf"<{block}\b[^>]*>.*?</{block}>",
+                    " ",
+                    cleaned,
+                    flags=re.IGNORECASE | re.DOTALL,
+                )
+
+            patterns = [
+                r'<thumb[^>]*aspect\s*=\s*"poster"[^>]*>\s*([^<\s]+)\s*</thumb>',
+                r"<poster[^>]*>\s*([^<\s]+)\s*</poster>",
+                r'<thumb[^>]*type\s*=\s*"poster"[^>]*>\s*([^<\s]+)\s*</thumb>',
+            ]
+            for pattern in patterns:
+                matched = re.search(pattern, cleaned, re.IGNORECASE)
+                if matched:
+                    url = matched.group(1).strip()
+                    if url.startswith("http"):
+                        return url
         return ""
 
     async def _enrich_queue_posters(self) -> None:
@@ -2575,6 +2622,14 @@ class CSFReborn(_PluginBase):
                     None,
                 )
                 if entry is None:
+                    continue
+                if self._native_engine is not None and self._native_engine.is_bdmv_segment(
+                    Path(str(entry.get("path") or ""))
+                ):
+                    logger.info(f"跳过蓝光原盘分片：{entry.get('path')}")
+                    queue = self._load_queue()
+                    self._queue_drop(queue, str(entry.get("path") or ""))
+                    self._save_queue(queue)
                     continue
                 payload = {
                     "video_path": entry.get("path"),

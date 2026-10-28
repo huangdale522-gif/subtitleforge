@@ -1535,6 +1535,61 @@ class NativeSubtitleEngine:
     # -- 扫描辅助 -----------------------------------------------------
 
     @staticmethod
+    def is_bdmv_segment(path: Path) -> bool:
+        """True for Blu-ray disc fragments (BDMV/STREAM/*.m2ts)."""
+
+        parts = [part.lower() for part in path.parts]
+        return "bdmv" in parts or "certificate" in parts
+
+    async def inspect(self, video: Path) -> dict[str, Any]:
+        """Report which subtitle files exist beside a video and how they parse."""
+
+        exts = self._subtitle_exts
+        stem_lower = video.stem.lower()
+        files: list[dict[str, Any]] = []
+        folders = [video.parent]
+        for extra in ("Subs", "subtitles", "Subtitles"):
+            candidate = video.parent / extra
+            if candidate.is_dir():
+                folders.append(candidate)
+
+        for folder in folders:
+            try:
+                entries = list(folder.iterdir())
+            except OSError:
+                continue
+            for entry in entries:
+                try:
+                    if not entry.is_file() or entry.suffix.lower() not in exts:
+                        continue
+                except OSError:
+                    continue
+                name_lower = entry.name.lower()
+                if not (
+                    name_lower.startswith(stem_lower)
+                    or stem_lower.startswith(entry.stem.lower())
+                ):
+                    continue
+                info = self._detect_file(entry)
+                files.append(
+                    {
+                        "name": entry.name,
+                        "detected": info.display,
+                        "variant": info.variant,
+                        "chinese": info.chinese,
+                        "size": entry.stat().st_size,
+                    }
+                )
+
+        return {
+            "video": str(video),
+            "exists": video.is_file(),
+            "files": files,
+            "embedded": sorted(await self.probe_embedded(video)),
+            "existing": sorted(await self.scan_existing(video)),
+        }
+
+    @staticmethod
     def scan_item(video: Path, missing: list[str]) -> dict[str, Any]:
         """构造扫描条目（含路径与季集，供插件队列展示）。"""
 
@@ -1559,7 +1614,9 @@ class NativeSubtitleEngine:
             dirs[:] = [
                 name
                 for name in dirs
-                if not name.startswith(".") and name.lower() not in {"@eadir", "#recycle"}
+                if not name.startswith(".")
+                and name.lower()
+                not in {"@eadir", "#recycle", "bdmv", "certificate"}
             ]
             for name in files:
                 if Path(name).suffix.lower() in extensions:

@@ -123,3 +123,14 @@ No extra configuration is needed for NFO-based posters.
 Queue items created by a library scan only carry the localized title, so the
 native engine also parses the filename with `MetaInfo` and adds the English
 title to the ASSRT keywords — that is what makes foreign films findable.
+
+## Blu-ray and per-file inspection
+
+BDMV/CERTIFICATE directories are skipped by the built-in scanner and any
+BDMV/STREAM segment that already sits in the queue is dropped, so a disc is
+never queued as several `.m2ts` fragments.
+
+`GET /inspect?path=/media/.../Movie.mkv` lists the subtitle files next to a
+video, the language detected from each file's content, embedded subtitle
+streams and the resulting satisfied languages. Use it when a download is
+reported but the video still shows as missing a subtitle.

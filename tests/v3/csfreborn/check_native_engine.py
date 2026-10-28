@@ -985,6 +985,8 @@ def test_titles_and_posters(module, native, tmp: Path) -> None:
     video.write_bytes(os.urandom(2048))
     (media / "movie.nfo").write_text(
         '<?xml version="1.0"?><movie><title>Alarum</title>'
+        "<actor><name>Actor One</name>"
+        "<thumb>https://image.tmdb.org/t/p/original/actor999.jpg</thumb></actor>"
         '<thumb aspect="poster">https://image.tmdb.org/t/p/original/abc123.jpg</thumb></movie>',
         encoding="utf-8",
     )
@@ -1017,8 +1019,57 @@ def test_titles_and_posters(module, native, tmp: Path) -> None:
     )
     page = json.dumps(plugin.get_page(), ensure_ascii=False)
     check("NFO 海报写入队列", "abc123.jpg" in page, page[:160])
+    check("不会误用演员头像", "actor999.jpg" not in page)
     saved = plugin._load_queue()[0]
     check("海报已持久化", saved.get("poster", "").endswith("abc123.jpg"), saved.get("poster"))
+
+
+
+def test_bdmv_and_inspect(module, native, tmp: Path) -> None:
+    print("\n[10] 蓝光分片与字幕检查")
+
+    plugin = module.CSFReborn()
+    plugin.init_plugin({"enabled": True, "languages": ["zh-Hans"]})
+
+    disc = tmp / "disc" / "BDMV" / "STREAM"
+    disc.mkdir(parents=True)
+    segment = disc / "00003.m2ts"
+    segment.write_bytes(os.urandom(2048))
+    plugin._queue_sync_from_scan(
+        {
+            "items": [
+                {
+                    "path": str(segment),
+                    "title": "电动维纳斯",
+                    "media_type": "movie",
+                    "missing": ["简体中文"],
+                    "status": "queued",
+                    "downloaded": [],
+                }
+            ]
+        }
+    )
+    check("蓝光分片不入队", plugin._load_queue() == [], str(plugin._load_queue()))
+
+    folder = tmp / "inspect"
+    folder.mkdir()
+    video = folder / "Movie.2024.1080p.mkv"
+    video.write_bytes(os.urandom(2048))
+    (folder / "Movie.2024.1080p.zh-CN.srt").write_text(
+        "1\n00:00:01,000 --> 00:00:03,000\n这是一个中文字幕测试。\n", encoding="utf-8"
+    )
+    (folder / "Movie.2024.1080p.chs.ass").write_text(
+        "[Script Info]\nTitle: test\n\nDialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,另一个中文字幕\n",
+        encoding="utf-8",
+    )
+    result = asyncio.run(plugin.api_inspect(str(video)))
+    check("检查接口成功", result.success is True, result.message)
+    check("识别到简体字幕", result.data.get("existing") == [native.LANG_CHS], str(result.data.get("existing")))
+    names = [item["name"] for item in result.data.get("files") or []]
+    check("列出目录内字幕", len(names) == 2 and any(n.endswith(".zh-CN.srt") for n in names), str(names))
+
+    missing = asyncio.run(plugin.api_inspect(str(folder / "nope.mkv")))
+    check("检查不存在文件报错", missing.success is False)
 
 
 def main() -> int:
@@ -1036,6 +1087,7 @@ def main() -> int:
         test_queue(module, native, tmp)
         test_scan_card(module, tmp)
         test_titles_and_posters(module, native, tmp)
+        test_bdmv_and_inspect(module, native, tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
