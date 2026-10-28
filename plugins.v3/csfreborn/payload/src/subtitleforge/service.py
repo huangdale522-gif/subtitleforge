@@ -27,6 +27,7 @@ from .providers import (
     OpenSubtitlesProvider,
     ProviderError,
     ProviderQuotaError,
+    ProviderUnavailableError,
     ShooterProvider,
     SubtitleBestProvider,
     SubtitleProvider,
@@ -53,7 +54,7 @@ class SubtitleService:
         self._client = client or httpx.AsyncClient(
             timeout=settings.request_timeout_seconds,
             follow_redirects=True,
-            headers={"User-Agent": "SubtitleForge/0.3.1"},
+            headers={"User-Agent": "SubtitleForge/0.3.2"},
         )
         self.providers: dict[str, SubtitleProvider] = {
             "xunlei": XunleiProvider(
@@ -102,7 +103,7 @@ class SubtitleService:
         return [name for name in names if name in self.providers]
 
     def _provider_in_cooldown(self, name: str) -> bool:
-        """Return whether a provider is cooling down after a quota error."""
+        """Return whether a provider is cooling down after an upstream error."""
 
         deadline = self._provider_cooldowns.get(name)
         if deadline is None:
@@ -113,16 +114,22 @@ class SubtitleService:
             return False
         return True
 
-    def _activate_provider_cooldown(self, name: str) -> None:
+    def _activate_provider_cooldown(
+        self,
+        name: str,
+        cooldown_seconds: int | None = None,
+    ) -> None:
         """Stop spending requests on a provider until its cooldown expires."""
 
-        cooldown_seconds = max(0, self.settings.provider_cooldown_hours) * 3600
+        if cooldown_seconds is None:
+            cooldown_seconds = max(0, self.settings.provider_cooldown_hours) * 3600
+        cooldown_seconds = max(0, int(cooldown_seconds))
         self._provider_cooldowns[name] = time.time() + cooldown_seconds
         self._save_provider_cooldowns()
 
     @property
     def _provider_cooldown_file(self) -> Path:
-        """Return the small local state file used for quota cooldowns."""
+        """Return the small local state file used for provider cooldowns."""
 
         return self.settings.data_dir / "provider_cooldowns.json"
 
@@ -144,7 +151,7 @@ class SubtitleService:
         }
 
     def _save_provider_cooldowns(self) -> None:
-        """Persist quota cooldowns without exposing provider credentials."""
+        """Persist provider cooldowns without exposing credentials."""
 
         path = self._provider_cooldown_file
         try:
@@ -181,6 +188,9 @@ class SubtitleService:
         return {
             "order": order,
             "cooldown_hours": max(0, self.settings.provider_cooldown_hours),
+            "temporary_cooldown_minutes": max(
+                0, self.settings.provider_unavailable_cooldown_minutes
+            ),
             "items": items,
         }
 
@@ -207,6 +217,14 @@ class SubtitleService:
             except ProviderQuotaError as exc:
                 errors.append(f"{name}: {exc}; cooling down")
                 self._activate_provider_cooldown(name)
+            except ProviderUnavailableError as exc:
+                minutes = max(
+                    0, self.settings.provider_unavailable_cooldown_minutes
+                )
+                errors.append(
+                    f"{name}: {exc}; cooling down for {minutes} minutes"
+                )
+                self._activate_provider_cooldown(name, minutes * 60)
             except ProviderError as exc:
                 errors.append(f"{name}: {exc}")
         ranked = rank_candidates(
@@ -321,6 +339,18 @@ class SubtitleService:
                         f"{candidate.provider}/{candidate.candidate_id}: {exc}"
                     )
                     self._activate_provider_cooldown(candidate.provider)
+                    break
+                except ProviderUnavailableError as exc:
+                    minutes = max(
+                        0, self.settings.provider_unavailable_cooldown_minutes
+                    )
+                    result.errors.append(
+                        f"{candidate.provider}/{candidate.candidate_id}: {exc}; "
+                        f"cooling down for {minutes} minutes"
+                    )
+                    self._activate_provider_cooldown(
+                        candidate.provider, minutes * 60
+                    )
                     break
                 except (ProviderError, ValueError, FileExistsError, OSError) as exc:
                     result.errors.append(

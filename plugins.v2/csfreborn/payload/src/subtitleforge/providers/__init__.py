@@ -1,7 +1,12 @@
 """Subtitle provider implementations."""
 
 from .assrt import AssrtProvider
-from .base import ProviderError, ProviderQuotaError, SubtitleProvider
+from .base import (
+    ProviderError,
+    ProviderQuotaError,
+    ProviderUnavailableError,
+    SubtitleProvider,
+)
 from .custom import CustomHttpProvider
 from .opensubtitles import OpenSubtitlesProvider
 from .shooter import ShooterProvider
@@ -14,6 +19,7 @@ __all__ = [
     "OpenSubtitlesProvider",
     "ProviderError",
     "ProviderQuotaError",
+    "ProviderUnavailableError",
     "ShooterProvider",
     "SubtitleBestProvider",
     "SubtitleProvider",

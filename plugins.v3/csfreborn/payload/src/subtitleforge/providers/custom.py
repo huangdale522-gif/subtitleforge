@@ -17,6 +17,7 @@ from .base import (
     ProviderError,
     ProviderNotConfigured,
     ProviderQuotaError,
+    ProviderUnavailableError,
     SubtitleProvider,
 )
 
@@ -90,11 +91,16 @@ class CustomHttpProvider(SubtitleProvider):
                 self._url, params=params, headers=self._headers()
             )
         except httpx.HTTPError as exc:
-            raise ProviderError(
+            raise ProviderUnavailableError(
                 f"Custom provider search failed: {type(exc).__name__}"
             ) from exc
         if response.status_code == 429:
             raise ProviderQuotaError("Custom provider search is rate limited")
+        if response.status_code >= 500:
+            raise ProviderUnavailableError(
+                "Custom provider search temporarily unavailable "
+                f"(HTTP {response.status_code})"
+            )
         if response.status_code >= 400:
             raise ProviderError(f"Custom provider returned HTTP {response.status_code}")
         try:
@@ -144,11 +150,16 @@ class CustomHttpProvider(SubtitleProvider):
         try:
             response = await self._client.get(url, headers=headers)
         except httpx.HTTPError as exc:
-            raise ProviderError(
+            raise ProviderUnavailableError(
                 f"Custom provider download failed: {type(exc).__name__}"
             ) from exc
         if response.status_code == 429:
             raise ProviderQuotaError("Custom provider download is rate limited")
+        if response.status_code >= 500:
+            raise ProviderUnavailableError(
+                "Custom provider download temporarily unavailable "
+                f"(HTTP {response.status_code})"
+            )
         if response.status_code >= 400:
             raise ProviderError(
                 f"Custom provider download returned HTTP {response.status_code}"

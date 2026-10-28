@@ -153,5 +153,6 @@ def test_status_page_explains_quota_queue_and_provider_health() -> None:
     assert "字幕源状态与额度边界" in rendered
     assert "所有字幕源合计" in rendered
     assert "整理完成后调用的实时补全接口" in rendered
+    assert "短暂冷却 15 分钟" in rendered
     assert "冷却中" in rendered
     assert "ASSRT" in rendered

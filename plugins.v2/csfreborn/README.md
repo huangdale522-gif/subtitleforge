@@ -45,9 +45,11 @@ subtitle source is queried. Blu-ray `BDMV/STREAM` fragments are ignored because
 they are not standalone media files. Existing Chinese subtitles are skipped
 unless `overwrite` is enabled; missing items are saved in a persistent queue.
 Providers are queried only while consuming that queue, in configured order, and
-later providers are skipped when the first one returns usable candidates. Rate-limit
-or quota responses put that provider into a 24-hour cooldown, and each video is
-limited to three download attempts. Cooldowns persist across service restarts.
+later providers are skipped when the first one returns usable candidates.
+Rate-limit or quota responses put that provider into a 24-hour cooldown; HTTP
+5xx, Cloudflare gateway errors, and connection failures use a 15-minute circuit
+break. Each video is limited to three download attempts, and cooldowns persist
+across service restarts.
 When `notify` is enabled, the notification lists the actual subtitle filenames
 that were downloaded successfully through MoviePilot's configured Telegram or
 other notification channel. An authenticated `POST

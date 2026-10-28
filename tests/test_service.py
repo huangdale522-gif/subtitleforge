@@ -11,7 +11,11 @@ from subtitleforge.models import (
     SubtitleCandidate,
     SubtitleLanguage,
 )
-from subtitleforge.providers.base import ProviderQuotaError, SubtitleProvider
+from subtitleforge.providers.base import (
+    ProviderQuotaError,
+    ProviderUnavailableError,
+    SubtitleProvider,
+)
 from subtitleforge.service import SubtitleService
 
 
@@ -76,6 +80,12 @@ class QuotaProvider(EmptyProvider):
     async def search(self, request: SearchRequest) -> list[SubtitleCandidate]:
         self.search_calls += 1
         raise ProviderQuotaError("quota exhausted")
+
+
+class UnavailableProvider(EmptyProvider):
+    async def search(self, request: SearchRequest) -> list[SubtitleCandidate]:
+        self.search_calls += 1
+        raise ProviderUnavailableError("upstream returned HTTP 522")
 
 
 class RejectingDownloadProvider(ResultProvider):
@@ -201,6 +211,43 @@ async def test_provider_quota_error_activates_cooldown(tmp_path: Path) -> None:
     assert first_errors and not second_errors
     assert quota_provider.search_calls == 1
     assert fallback.search_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_provider_temporary_outage_uses_short_cooldown(tmp_path: Path) -> None:
+    settings = Settings(
+        media_roots=str(tmp_path),
+        data_dir=tmp_path / "data",
+        provider_unavailable_cooldown_minutes=15,
+    )
+    service = SubtitleService(settings, client=httpx.AsyncClient())
+    unavailable = UnavailableProvider("subtitle_best")
+    fallback = ResultProvider("assrt")
+    service.providers.update(
+        {"subtitle_best": unavailable, "assrt": fallback}
+    )
+    order = ["subtitle_best", "assrt"]
+    try:
+        first, first_errors = await service.search(
+            SearchRequest(title="Movie"),
+            provider_order=order,
+            provider_failover=True,
+        )
+        second, second_errors = await service.search(
+            SearchRequest(title="Another Movie"),
+            provider_order=order,
+            provider_failover=True,
+        )
+        provider_status = service.status()
+    finally:
+        await service.close()
+
+    assert first and second
+    assert any("15 minutes" in error for error in first_errors)
+    assert not second_errors
+    assert unavailable.search_calls == 1
+    assert fallback.search_calls == 2
+    assert provider_status["temporary_cooldown_minutes"] == 15
 
 
 @pytest.mark.asyncio

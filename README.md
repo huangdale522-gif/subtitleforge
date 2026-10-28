@@ -152,10 +152,11 @@ metadata; it does not call subtitle providers, so a preview consumes no source
 quota and does not modify the download queue. Real runs use provider failover in
 configured order and stop querying after the first provider returns usable
 candidates. A provider that reports a rate limit or quota error enters a
-24-hour cooldown, and each video is limited to three subtitle download attempts
-to prevent a bad match from exhausting a source. Cooldown state is persisted
-locally so a service restart does not immediately spend the same exhausted quota
-again.
+24-hour cooldown. HTTP 5xx, Cloudflare gateway errors, and connection failures
+use a shorter 15-minute circuit break so a temporary outage does not prevent
+failover for the rest of the queue. Each video is limited to three subtitle
+download attempts, and cooldown state is persisted locally across service
+restarts.
 
 `max_files` limits one scan batch. `daily_download_limit` limits successful
 subtitle downloads for the local calendar day across every scanner instance

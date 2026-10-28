@@ -14,6 +14,7 @@ from .base import (
     ProviderError,
     ProviderNotConfigured,
     ProviderQuotaError,
+    ProviderUnavailableError,
     SubtitleProvider,
 )
 
@@ -91,11 +92,16 @@ class XunleiProvider(SubtitleProvider):
         try:
             response = await self._client.get(f"{self.base_url}/{cid}.json")
         except httpx.HTTPError as exc:
-            raise ProviderError(
+            raise ProviderUnavailableError(
                 f"Xunlei search failed: {type(exc).__name__}"
             ) from exc
         if response.status_code == 429:
             raise ProviderQuotaError("Xunlei search is rate limited")
+        if response.status_code >= 500:
+            raise ProviderUnavailableError(
+                f"Xunlei search temporarily unavailable "
+                f"(HTTP {response.status_code})"
+            )
         if response.status_code >= 400:
             raise ProviderError(
                 f"Xunlei search returned HTTP {response.status_code}"
@@ -152,11 +158,16 @@ class XunleiProvider(SubtitleProvider):
         try:
             response = await self._client.get(url, headers={"Accept": "*/*"})
         except httpx.HTTPError as exc:
-            raise ProviderError(
+            raise ProviderUnavailableError(
                 f"Xunlei download failed: {type(exc).__name__}"
             ) from exc
         if response.status_code == 429:
             raise ProviderQuotaError("Xunlei download is rate limited")
+        if response.status_code >= 500:
+            raise ProviderUnavailableError(
+                f"Xunlei download temporarily unavailable "
+                f"(HTTP {response.status_code})"
+            )
         if response.status_code >= 400:
             raise ProviderError(
                 f"Xunlei download returned HTTP {response.status_code}"

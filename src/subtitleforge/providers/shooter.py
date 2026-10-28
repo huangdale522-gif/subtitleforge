@@ -14,6 +14,7 @@ from .base import (
     ProviderError,
     ProviderNotConfigured,
     ProviderQuotaError,
+    ProviderUnavailableError,
     SubtitleProvider,
 )
 
@@ -88,11 +89,16 @@ class ShooterProvider(SubtitleProvider):
                 headers={"Accept": "application/json"},
             )
         except httpx.HTTPError as exc:
-            raise ProviderError(
+            raise ProviderUnavailableError(
                 f"Shooter search failed: {type(exc).__name__}"
             ) from exc
         if response.status_code == 429:
             raise ProviderQuotaError("Shooter search is rate limited")
+        if response.status_code >= 500:
+            raise ProviderUnavailableError(
+                f"Shooter search temporarily unavailable "
+                f"(HTTP {response.status_code})"
+            )
         if response.status_code >= 400:
             raise ProviderError(
                 f"Shooter search returned HTTP {response.status_code}"
@@ -148,11 +154,16 @@ class ShooterProvider(SubtitleProvider):
         try:
             response = await self._client.get(url, headers={"Accept": "*/*"})
         except httpx.HTTPError as exc:
-            raise ProviderError(
+            raise ProviderUnavailableError(
                 f"Shooter download failed: {type(exc).__name__}"
             ) from exc
         if response.status_code == 429:
             raise ProviderQuotaError("Shooter download is rate limited")
+        if response.status_code >= 500:
+            raise ProviderUnavailableError(
+                f"Shooter download temporarily unavailable "
+                f"(HTTP {response.status_code})"
+            )
         if response.status_code >= 400:
             raise ProviderError(
                 f"Shooter download returned HTTP {response.status_code}"

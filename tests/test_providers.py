@@ -5,6 +5,7 @@ import pytest
 
 from subtitleforge.models import ProcessRequest, SearchRequest, SubtitleLanguage
 from subtitleforge.providers.assrt import AssrtProvider
+from subtitleforge.providers.base import ProviderUnavailableError
 from subtitleforge.providers.custom import CustomHttpProvider
 from subtitleforge.providers.opensubtitles import OpenSubtitlesProvider
 from subtitleforge.providers.shooter import ShooterProvider
@@ -213,6 +214,26 @@ async def test_subtitle_best_searches_and_downloads_episode() -> None:
         for request in requests
         if request.url.host == "cdn.example"
     )
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_subtitle_best_522_is_classified_as_temporary_outage() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(522, text="origin timeout")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = SubtitleBestProvider(client, "account-key", "client-token")
+    with pytest.raises(ProviderUnavailableError, match="HTTP 522"):
+        await provider.search(
+            SearchRequest(
+                title="Example",
+                imdb_id="tt1234567",
+                media_type="tv",
+                season=1,
+                episode=8,
+            )
+        )
     await client.aclose()
 
 

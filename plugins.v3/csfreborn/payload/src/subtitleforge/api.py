@@ -47,7 +47,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(
         title="SubtitleForge",
-        version="0.3.1",
+        version="0.3.2",
         description="Provider-driven Chinese subtitle downloader for NAS and MoviePilot.",
         lifespan=lifespan,
     )
@@ -78,7 +78,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         service: SubtitleService = app.state.service
         return {
             "status": "ok",
-            "version": "0.3.1",
+            "version": "0.3.2",
             "providers": {
                 name: provider.configured
                 for name, provider in service.providers.items()
@@ -96,7 +96,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         service: SubtitleService = app.state.service
         return {
             "status": "ok",
-            "version": "0.3.1",
+            "version": "0.3.2",
             **scanner.status(daily_download_limit),
             "providers": service.status(),
         }

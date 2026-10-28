@@ -43,6 +43,7 @@ class Settings(BaseSettings):
     max_download_mb: int = 80
     max_download_attempts_per_file: int = 3
     provider_cooldown_hours: int = 24
+    provider_unavailable_cooldown_minutes: int = 15
     ffprobe_path: str = "ffprobe"
 
     @field_validator("data_dir", mode="before")

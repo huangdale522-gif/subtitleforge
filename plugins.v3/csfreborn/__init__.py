@@ -36,7 +36,7 @@ class CSFReborn(_PluginBase):
         "接入 SubtitleBest、ASSRT、迅雷等中文字幕源，为电影、剧集和动漫自动补全字幕。"
     )
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.8.0"
+    plugin_version = "0.8.1"
     plugin_author = "SubtitleForge contributors"
     author_url = "https://github.com/"
     plugin_config_prefix = "csfreborn_"
@@ -1165,6 +1165,11 @@ class CSFReborn(_PluginBase):
         runtime, status_error = self._load_runtime_status()
         quota = runtime.get("quota") if isinstance(runtime.get("quota"), dict) else {}
         queue = runtime.get("queue") if isinstance(runtime.get("queue"), dict) else {}
+        provider_data = runtime.get("providers")
+        provider_data = provider_data if isinstance(provider_data, dict) else {}
+        temporary_cooldown = int(
+            provider_data.get("temporary_cooldown_minutes", 15) or 0
+        )
         used_today = int(
             quota.get(
                 "used",
@@ -1463,8 +1468,10 @@ class CSFReborn(_PluginBase):
                                     "5. 限流后自动冷却",
                                     (
                                         "某个源返回 429 或额度错误时，该源冷却 24 小时；"
-                                        "其他源继续。外部账号的每日额度仍由各站点控制，"
-                                        "本插件无法提前知道其剩余数量。"
+                                        "HTTP 5xx、Cloudflare 522 或连接失败时短暂"
+                                        f"冷却 {temporary_cooldown} 分钟；其他源继续。"
+                                        "外部账号的每日额度仍由各站点控制，本插件"
+                                        "无法提前知道其剩余数量。"
                                     ),
                                 ),
                             ],
@@ -1485,7 +1492,6 @@ class CSFReborn(_PluginBase):
             ]
         )
 
-        provider_data = runtime.get("providers")
         page.append(
             {
                 "component": "VCard",
@@ -1502,8 +1508,6 @@ class CSFReborn(_PluginBase):
                         "content": [
                             self._provider_table(
                                 provider_data
-                                if isinstance(provider_data, dict)
-                                else {}
                             )
                         ],
                     },

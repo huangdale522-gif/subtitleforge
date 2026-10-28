@@ -18,6 +18,7 @@ from .base import (
     ProviderError,
     ProviderNotConfigured,
     ProviderQuotaError,
+    ProviderUnavailableError,
     SubtitleProvider,
 )
 
@@ -93,13 +94,17 @@ class SubtitleBestProvider(SubtitleProvider):
                 headers=self._headers(),
             )
         except httpx.HTTPError as exc:
-            raise ProviderError(
+            raise ProviderUnavailableError(
                 f"SubtitleBest request failed: {type(exc).__name__}"
             ) from exc
         if response.status_code in {401, 403}:
             raise ProviderError("SubtitleBest rejected the configured credentials")
         if response.status_code == 429:
             raise ProviderQuotaError("SubtitleBest is rate limited")
+        if response.status_code >= 500:
+            raise ProviderUnavailableError(
+                f"SubtitleBest temporarily unavailable (HTTP {response.status_code})"
+            )
         if response.status_code >= 400:
             raise ProviderError(
                 f"SubtitleBest returned HTTP {response.status_code}"
@@ -197,9 +202,14 @@ class SubtitleBestProvider(SubtitleProvider):
         try:
             response = await self._client.get(url, headers={"Accept": "*/*"})
         except httpx.HTTPError as exc:
-            raise ProviderError(
+            raise ProviderUnavailableError(
                 f"SubtitleBest download failed: {type(exc).__name__}"
             ) from exc
+        if response.status_code >= 500:
+            raise ProviderUnavailableError(
+                "SubtitleBest download temporarily unavailable "
+                f"(HTTP {response.status_code})"
+            )
         if response.status_code >= 400:
             raise ProviderError(
                 f"SubtitleBest download returned HTTP {response.status_code}"

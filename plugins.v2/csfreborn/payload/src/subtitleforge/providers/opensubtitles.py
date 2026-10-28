@@ -18,6 +18,7 @@ from .base import (
     ProviderError,
     ProviderNotConfigured,
     ProviderQuotaError,
+    ProviderUnavailableError,
     SubtitleProvider,
 )
 
@@ -34,7 +35,7 @@ class OpenSubtitlesProvider(SubtitleProvider):
         api_key: str,
         username: str = "",
         password: str = "",
-        user_agent: str = "SubtitleForge/0.3.1",
+        user_agent: str = "SubtitleForge/0.3.2",
     ) -> None:
         self._client = client
         self._api_key = api_key.strip()
@@ -155,13 +156,18 @@ class OpenSubtitlesProvider(SubtitleProvider):
                 headers=self._headers(),
             )
         except httpx.HTTPError as exc:
-            raise ProviderError(
+            raise ProviderUnavailableError(
                 f"OpenSubtitles search failed: {type(exc).__name__}"
             ) from exc
         if response.status_code in {401, 403}:
             raise ProviderError("OpenSubtitles rejected the API key")
         if response.status_code == 429:
             raise ProviderQuotaError("OpenSubtitles search is rate limited")
+        if response.status_code >= 500:
+            raise ProviderUnavailableError(
+                f"OpenSubtitles search temporarily unavailable "
+                f"(HTTP {response.status_code})"
+            )
         if response.status_code >= 400:
             raise ProviderError(
                 f"OpenSubtitles search returned HTTP {response.status_code}"
@@ -229,9 +235,14 @@ class OpenSubtitlesProvider(SubtitleProvider):
                     headers=self._headers(),
                 )
             except httpx.HTTPError as exc:
-                raise ProviderError(
+                raise ProviderUnavailableError(
                     f"OpenSubtitles login failed: {type(exc).__name__}"
                 ) from exc
+            if response.status_code >= 500:
+                raise ProviderUnavailableError(
+                    "OpenSubtitles login temporarily unavailable "
+                    f"(HTTP {response.status_code})"
+                )
             if response.status_code >= 400:
                 raise ProviderError(
                     f"OpenSubtitles login returned HTTP {response.status_code}"
@@ -269,6 +280,11 @@ class OpenSubtitlesProvider(SubtitleProvider):
                 )
             if response.status_code == 429:
                 raise ProviderQuotaError("OpenSubtitles download quota is exhausted")
+            if response.status_code >= 500:
+                raise ProviderUnavailableError(
+                    "OpenSubtitles download temporarily unavailable "
+                    f"(HTTP {response.status_code})"
+                )
             if response.status_code >= 400:
                 raise ProviderError(
                     f"OpenSubtitles download returned HTTP {response.status_code}"
@@ -281,13 +297,18 @@ class OpenSubtitlesProvider(SubtitleProvider):
                 payload.get("file_name") or candidate.release_name or "subtitle.srt"
             )
             file_response = await self._client.get(link)
+            if file_response.status_code >= 500:
+                raise ProviderUnavailableError(
+                    "OpenSubtitles file download temporarily unavailable "
+                    f"(HTTP {file_response.status_code})"
+                )
             if file_response.status_code >= 400:
                 raise ProviderError(
                     f"OpenSubtitles file download returned HTTP {file_response.status_code}"
                 )
             return DownloadedAsset(content=file_response.content, file_name=file_name)
         except httpx.HTTPError as exc:
-            raise ProviderError(
+            raise ProviderUnavailableError(
                 f"OpenSubtitles download failed: {type(exc).__name__}"
             ) from exc
 

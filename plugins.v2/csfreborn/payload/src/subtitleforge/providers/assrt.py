@@ -12,6 +12,7 @@ from .base import (
     ProviderError,
     ProviderNotConfigured,
     ProviderQuotaError,
+    ProviderUnavailableError,
     SubtitleProvider,
 )
 
@@ -86,13 +87,18 @@ class AssrtProvider(SubtitleProvider):
                     headers=self._headers(),
                 )
             except httpx.HTTPError as exc:
-                raise ProviderError(
+                raise ProviderUnavailableError(
                     f"ASSRT search failed: {type(exc).__name__}"
                 ) from exc
             if response.status_code in {401, 403}:
                 raise ProviderError("ASSRT rejected the token")
             if response.status_code == 429:
                 raise ProviderQuotaError("ASSRT search is rate limited")
+            if response.status_code >= 500:
+                raise ProviderUnavailableError(
+                    f"ASSRT search temporarily unavailable "
+                    f"(HTTP {response.status_code})"
+                )
             if response.status_code >= 400:
                 raise ProviderError(
                     f"ASSRT search returned HTTP {response.status_code}"
@@ -148,6 +154,11 @@ class AssrtProvider(SubtitleProvider):
             if response.status_code >= 400:
                 if response.status_code == 429:
                     raise ProviderQuotaError("ASSRT download is rate limited")
+                if response.status_code >= 500:
+                    raise ProviderUnavailableError(
+                        f"ASSRT detail temporarily unavailable "
+                        f"(HTTP {response.status_code})"
+                    )
                 raise ProviderError(
                     f"ASSRT detail returned HTTP {response.status_code}"
                 )
@@ -174,6 +185,11 @@ class AssrtProvider(SubtitleProvider):
             if file_response.status_code >= 400:
                 if file_response.status_code == 429:
                     raise ProviderQuotaError("ASSRT file download is rate limited")
+                if file_response.status_code >= 500:
+                    raise ProviderUnavailableError(
+                        f"ASSRT file download temporarily unavailable "
+                        f"(HTTP {file_response.status_code})"
+                    )
                 raise ProviderError(
                     f"ASSRT file download returned HTTP {file_response.status_code}"
                 )
@@ -181,7 +197,9 @@ class AssrtProvider(SubtitleProvider):
         except (httpx.HTTPError, ValueError, AttributeError) as exc:
             if isinstance(exc, ProviderError):
                 raise
-            raise ProviderError(f"ASSRT download failed: {type(exc).__name__}") from exc
+            raise ProviderUnavailableError(
+                f"ASSRT download failed: {type(exc).__name__}"
+            ) from exc
 
 
 def _as_float(value: Any) -> float:

@@ -15,6 +15,10 @@ class ProviderQuotaError(ProviderError):
     """A provider rejected a request because its quota or rate limit was hit."""
 
 
+class ProviderUnavailableError(ProviderError):
+    """A provider is temporarily unavailable due to a network or server error."""
+
+
 class ProviderNotConfigured(ProviderError):
     """Raised when a provider has no usable credentials."""
 
