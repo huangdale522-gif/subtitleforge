@@ -772,7 +772,17 @@ class NativeSubtitleEngine:
 
     def __init__(self, plugin: Any) -> None:
         self.plugin = plugin
-        self._lock = asyncio.Lock()
+        self._lock: Optional[asyncio.Lock] = None
+        self._lock_loop: Any = None
+
+    def _get_lock(self) -> asyncio.Lock:
+        """Return a lock bound to the current event loop (safe across reloads)."""
+
+        loop = asyncio.get_running_loop()
+        if self._lock is None or self._lock_loop is not loop:
+            self._lock = asyncio.Lock()
+            self._lock_loop = loop
+        return self._lock
 
     # -- 配置 ---------------------------------------------------------
 
@@ -881,7 +891,7 @@ class NativeSubtitleEngine:
     async def process(self, payload: dict[str, Any]) -> dict[str, Any]:
         """处理单个视频，返回与 `/v1/process` 一致的结构。"""
 
-        async with self._lock:
+        async with self._get_lock():
             return await self._process(payload)
 
     async def _process(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -975,10 +985,11 @@ class NativeSubtitleEngine:
     async def scan(self, payload: dict[str, Any]) -> dict[str, Any]:
         """扫描媒体库并补全，返回与 `/v1/scan` 一致的结构。"""
 
-        if self._lock.locked():
+        lock = self._get_lock()
+        if lock.locked():
             return {"status": "busy", "message": "内置字幕引擎正在处理其他任务"}
 
-        async with self._lock:
+        async with lock:
             return await self._scan(payload)
 
     async def _scan(self, payload: dict[str, Any]) -> dict[str, Any]:

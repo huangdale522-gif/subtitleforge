@@ -85,9 +85,9 @@ Self-check: `python3 tests/v3/csfreborn/check_native_engine.py`.
 
 Scans (including the default dry-run preview) write every video that still
 lacks the requested languages into a persistent queue. The plugin page renders
-it as a table with per-row checkboxes — poster, type, title, season/episode,
-missing languages, status and last attempt — so items that were not downloaded
-can be picked and retried by hand.
+it as two checkbox tables: one row per movie, and one row per TV season
+(episode list, missing languages, status, last attempt). Selecting a season
+row retries every missing episode of that season.
 
 - `POST /queue/download` with `{"keys": [...]}` or `{"all": true}` starts a
   background worker; every video goes through the same native/service pipeline.

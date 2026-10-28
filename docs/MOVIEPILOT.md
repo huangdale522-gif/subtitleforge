@@ -95,9 +95,12 @@ falls back to it, and `off` keeps the previous service-only behavior.
 
 ## Pending queue
 
-Videos that still lack a requested language are stored in a persistent queue
-and rendered on the plugin page as a checkbox table (poster, type, title,
-season/episode, missing languages, status, last attempt). Select rows and press
-"下载选中" to retry them on demand, or use `POST /queue/download` with
-`{"keys": [...]}` / `{"all": true}`. `scan_dry_run` defaults to true, which is
-why a preview scan reports zero downloads — it only queues.
+Videos that still lack a requested language are stored in a persistent queue.
+The plugin page renders two checkbox tables: movies (one row each) and TV
+seasons (one row per season with the missing episode list). Selecting a season
+retries all of its missing episodes.
+
+Press "下载选中" to retry, or use `POST /queue/download` with `{"keys": [...]}`
+(movie row id `m:<key>` or season row id `s:<hash>`) or `{"all": true}`.
+`scan_dry_run` defaults to true, which is why a preview scan reports zero
+downloads — it only queues.

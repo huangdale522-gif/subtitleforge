@@ -77,7 +77,7 @@ class CSFReborn(_PluginBase):
         "内置 SubtitleBest / ASSRT / 迅雷 / Shooter 字幕源，无需额外服务也能工作。"
     )
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.5.0"
+    plugin_version = "0.6.0"
     plugin_author = "SubtitleForge contributors"
     author_url = "https://github.com/"
     plugin_config_prefix = "csfreborn_"
@@ -222,6 +222,18 @@ class CSFReborn(_PluginBase):
             self._scan_daily_download_limit = 10
         if not self._api_token:
             self._api_token = self._read_service_token()
+        # 服务 .env 里已配置的字幕源凭据直接复用，避免重复填写
+        service_env = self._read_service_env()
+        if not self._subtitle_best_api_key:
+            self._subtitle_best_api_key = service_env.get(
+                "SF_SUBTITLE_BEST_API_KEY", ""
+            )
+        if not self._subtitle_best_header_token:
+            self._subtitle_best_header_token = service_env.get(
+                "SF_SUBTITLE_BEST_HEADER_TOKEN", ""
+            )
+        if not self._assrt_token:
+            self._assrt_token = service_env.get("SF_ASSRT_TOKEN", "")
         # 内置字幕源：默认读取插件已有的 SubtitleBest / ASSRT 凭据，无需重复配置
         self._native_mode = str(config.get("native_mode") or "auto")
         if self._native_mode not in {"auto", "native_only", "service_first", "off"}:
@@ -348,6 +360,31 @@ class CSFReborn(_PluginBase):
 
         return self._load_queue()
 
+    def _resolve_queue_entries(
+        self,
+        queue: list[dict[str, Any]],
+        ids: list[str],
+        retry_all: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Resolve checkbox ids (movie row or season row) to queue entries."""
+
+        if retry_all:
+            return list(queue)
+        if not ids:
+            return []
+        selected = set(ids)
+        result: list[dict[str, Any]] = []
+        for entry in queue:
+            key = str(entry.get("key") or "")
+            group = (
+                self._season_group_id(entry)
+                if str(entry.get("media_type") or "movie") == "tv"
+                else "m:" + key
+            )
+            if group in selected or key in selected:
+                result.append(entry)
+        return result
+
     async def api_queue_download(
         self, payload: Optional[dict] = Body(default=None)
     ) -> Any:
@@ -367,15 +404,34 @@ class CSFReborn(_PluginBase):
             return schemas.Response(success=False, message="请先勾选要下载的条目")
 
         queue = self._load_queue()
-        targets = [
-            entry for entry in queue if retry_all or entry.get("key") in keys
-        ]
+        targets = self._resolve_queue_entries(queue, keys, retry_all)
         if not targets:
-            return schemas.Response(success=False, message="队列中没有匹配的条目")
+            return schemas.Response(
+                success=False,
+                message=f"队列中没有匹配的条目（收到 {len(keys)} 个选择）",
+            )
 
-        self._queue_task = asyncio.create_task(
-            self._queue_worker([str(entry.get("key")) for entry in targets])
+        if self._native_mode != "off" and not self._native_ready:
+            healthy = await asyncio.to_thread(self._service_healthy)
+            if not healthy:
+                return schemas.Response(
+                    success=False,
+                    message=(
+                        "没有可用的字幕源：请填写 SubtitleBest API Key / ASSRT Token，"
+                        "或启用迅雷字幕，或启动 SubtitleForge 服务"
+                    ),
+                )
+
+        logger.info(
+            f"SubtitleForge 队列手动下载：选择 {len(keys)} 项，匹配 {len(targets)} 个视频"
         )
+        try:
+            self._queue_task = asyncio.get_running_loop().create_task(
+                self._queue_worker([str(entry.get("key")) for entry in targets])
+            )
+        except RuntimeError as err:
+            logger.error(f"无法启动队列任务：{err}")
+            return schemas.Response(success=False, message=f"无法启动后台任务：{err}")
         return schemas.Response(
             success=True,
             message=f"已开始为 {len(targets)} 个视频补全字幕，稍后刷新页面查看结果",
@@ -784,6 +840,23 @@ class CSFReborn(_PluginBase):
             logger.error(f"SubtitleForge: 无法保存字幕源配置: {exc}")
             return False
 
+    def _read_service_env(self) -> dict[str, str]:
+        """Read the service's private .env so native providers can reuse it."""
+
+        env_file = self._service_dir / ".env"
+        values: dict[str, str] = {}
+        try:
+            lines = env_file.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return values
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            values[key.strip()] = value.strip().strip('"').strip("'")
+        return values
+
     def _read_service_token(self) -> str:
         """Read the service token from its private env file when not overridden."""
 
@@ -990,6 +1063,8 @@ class CSFReborn(_PluginBase):
         missing = service.get("missing") or native.get("missing") or []
         if downloaded:
             status = "downloaded"
+        elif "error" in {native.get("status"), service.get("status")}:
+            status = "error"
         elif missing:
             status = "not_found"
         else:
@@ -1752,10 +1827,101 @@ class CSFReborn(_PluginBase):
 
     # -- 队列页面 -----------------------------------------------------
 
-    def _queue_card(self, queue: list[dict[str, Any]]) -> dict[str, Any]:
-        """Render the pending queue with per-row checkboxes and actions."""
+    @staticmethod
+    def _season_group_id(entry: dict[str, Any]) -> str:
+        """Stable id for one (title, season) group."""
 
+        season = entry.get("season")
+        raw = f"{entry.get('title') or ''}|{int(season) if season is not None else 0}"
+        return "s:" + hashlib.md5(raw.encode("utf-8")).hexdigest()[:10]
+
+    @staticmethod
+    def _status_rank(status: str) -> int:
+        order = {"error": 4, "not_found": 3, "partial": 2, "queued": 1, "dry_run": 0}
+        return order.get(str(status or ""), 0)
+
+    def _queue_groups(
+        self, queue: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Split the queue into movie rows and one row per TV season."""
+
+        movies: list[dict[str, Any]] = []
+        buckets: dict[str, list[dict[str, Any]]] = {}
+
+        for entry in queue:
+            if str(entry.get("media_type") or "movie") != "tv":
+                movies.append(
+                    {
+                        "id": "m:" + str(entry.get("key") or ""),
+                        "kind": "movie",
+                        "title": entry.get("title") or "",
+                        "year": entry.get("year") or "",
+                        "season": None,
+                        "episodes": [],
+                        "poster": entry.get("poster") or "",
+                        "missing": sorted(set(entry.get("missing") or [])),
+                        "status": str(entry.get("status") or ""),
+                        "updated": str(entry.get("updated") or ""),
+                        "entries": [entry],
+                    }
+                )
+                continue
+            buckets.setdefault(self._season_group_id(entry), []).append(entry)
+
+        seasons: list[dict[str, Any]] = []
+        for group_id, entries in buckets.items():
+            entries.sort(key=lambda item: int(item.get("episode") or 0))
+            episodes = sorted(
+                int(item["episode"])
+                for item in entries
+                if item.get("episode") is not None
+            )
+            worst = max(entries, key=lambda item: self._status_rank(item.get("status")))
+            seasons.append(
+                {
+                    "id": group_id,
+                    "kind": "season",
+                    "title": entries[0].get("title") or "",
+                    "year": entries[0].get("year") or "",
+                    "season": entries[0].get("season"),
+                    "episodes": episodes,
+                    "poster": next(
+                        (item.get("poster") for item in entries if item.get("poster")),
+                        "",
+                    ),
+                    "missing": sorted(
+                        {lang for item in entries for lang in item.get("missing") or []}
+                    ),
+                    "status": str(worst.get("status") or ""),
+                    "updated": max(str(item.get("updated") or "") for item in entries),
+                    "entries": entries,
+                }
+            )
+
+        movies.sort(key=lambda item: item.get("updated") or "", reverse=True)
+        seasons.sort(
+            key=lambda item: (item.get("title") or "", int(item.get("season") or 0))
+        )
+        return movies, seasons
+
+    @staticmethod
+    def _format_episodes(episodes: list[int]) -> str:
+        """Compact episode list, e.g. 3 集（E01、E05、E09）."""
+
+        if not episodes:
+            return "-"
+        shown = "、".join(f"E{episode:02d}" for episode in episodes[:6])
+        if len(episodes) > 6:
+            shown += f" 等 {len(episodes)} 集"
+        return f"{len(episodes)} 集（{shown}）"
+
+    def _queue_card(self, queue: list[dict[str, Any]]) -> dict[str, Any]:
+        """Render the pending queue grouped by movies and TV seasons."""
+
+        movies, seasons = self._queue_groups(queue)
+        episode_count = sum(len(item["entries"]) for item in seasons)
         content: list[dict[str, Any]] = []
+
         if self._scan_dry_run:
             content.append(
                 {
@@ -1779,7 +1945,7 @@ class CSFReborn(_PluginBase):
                     {
                         "component": "VChip",
                         "props": {"variant": "tonal", "color": "primary"},
-                        "text": f"待补全 {len(queue)}",
+                        "text": f"待补全 {len(movies)} 部电影 · {len(seasons)} 季 {episode_count} 集",
                     },
                     {
                         "component": "VChip",
@@ -1789,7 +1955,26 @@ class CSFReborn(_PluginBase):
                 ],
             }
         )
-        content.append(self._queue_table(queue))
+
+        if movies:
+            content.append(
+                {
+                    "component": "div",
+                    "props": {"class": "text-subtitle-2 mt-2 mb-1"},
+                    "text": f"电影（{len(movies)}）",
+                }
+            )
+            content.append(self._queue_table(movies, season_view=False))
+        if seasons:
+            content.append(
+                {
+                    "component": "div",
+                    "props": {"class": "text-subtitle-2 mt-4 mb-1"},
+                    "text": f"剧集 · 按季（{len(seasons)} 季）",
+                }
+            )
+            content.append(self._queue_table(seasons, season_view=True))
+
         content.append(
             {
                 "component": "div",
@@ -1834,10 +2019,11 @@ class CSFReborn(_PluginBase):
             "content": [{"component": "VCardText", "content": content}],
         }
 
-    def _queue_table(self, queue: list[dict[str, Any]]) -> dict[str, Any]:
-        """Build the Vuetify table for the pending queue."""
+    def _queue_table(
+        self, groups: list[dict[str, Any]], season_view: bool
+    ) -> dict[str, Any]:
+        """Build one table (movies or TV seasons)."""
 
-        headers = ["", "海报", "类型", "标题", "季集", "缺失", "状态", "最近尝试"]
         status_labels = {
             "dry_run": "待下载",
             "queued": "排队中",
@@ -1846,85 +2032,102 @@ class CSFReborn(_PluginBase):
             "error": "失败",
             "downloaded": "已下载",
         }
+        headers = ["", "海报", "标题"]
+        if season_view:
+            headers += ["季", "缺失集数"]
+        headers += ["缺失语言", "状态", "最近尝试"]
+
         rows: list[dict[str, Any]] = []
-        for entry in queue:
-            media_type = str(entry.get("media_type") or "movie")
-            season = entry.get("season")
-            episode = entry.get("episode")
-            if season is not None and episode is not None:
-                episode_label = f"S{int(season):02d}E{int(episode):02d}"
-            else:
-                episode_label = "-"
-            poster = str(entry.get("poster") or "")
-            title = str(entry.get("title") or Path(str(entry.get("path") or "")).stem)
-            year = str(entry.get("year") or "")
-            missing = "、".join(str(value) for value in entry.get("missing") or []) or "-"
-            status = status_labels.get(str(entry.get("status") or ""), str(entry.get("status") or "-"))
-            reason = str(entry.get("reason") or "")
-            rows.append(
+        for group in groups:
+            title = str(group.get("title") or "")
+            year = str(group.get("year") or "")
+            poster = str(group.get("poster") or "")
+            status = status_labels.get(
+                str(group.get("status") or ""), str(group.get("status") or "-")
+            )
+            reason = ""
+            for entry in group.get("entries") or []:
+                if entry.get("reason"):
+                    reason = str(entry.get("reason"))
+                    break
+            cells: list[dict[str, Any]] = [
                 {
-                    "component": "tr",
+                    "component": "td",
                     "content": [
                         {
-                            "component": "td",
-                            "content": [
-                                {
-                                    "component": "input",
-                                    "props": {
-                                        "type": "checkbox",
-                                        "class": "csf-queue",
-                                        "value": str(entry.get("key") or ""),
-                                        "aria-label": f"选择 {title}",
-                                    },
-                                }
-                            ],
-                        },
-                        {
-                            "component": "td",
-                            "content": [
-                                (
-                                    {
-                                        "component": "VImg",
-                                        "props": {
-                                            "src": poster,
-                                            "alt": title,
-                                            "width": 40,
-                                            "height": 60,
-                                            "cover": True,
-                                            "class": "rounded",
-                                        },
-                                    }
-                                    if poster
-                                    else {
-                                        "component": "span",
-                                        "props": {"class": "text-caption text-grey"},
-                                        "text": "—",
-                                    }
-                                )
-                            ],
-                        },
-                        {
-                            "component": "td",
-                            "text": "电影" if media_type != "tv" else "剧集",
-                        },
-                        {
-                            "component": "td",
-                            "text": f"{title} ({year})" if year else title,
-                        },
-                        {"component": "td", "text": episode_label},
-                        {"component": "td", "text": missing},
-                        {
-                            "component": "td",
-                            "text": f"{status}｜{reason}" if reason else status,
-                        },
-                        {
-                            "component": "td",
-                            "props": {"class": "text-caption text-grey"},
-                            "text": str(entry.get("updated") or "-"),
-                        },
+                            "component": "input",
+                            "props": {
+                                "type": "checkbox",
+                                "class": "csf-queue",
+                                "value": str(group.get("id") or ""),
+                                "aria-label": f"选择 {title}",
+                            },
+                        }
                     ],
+                },
+                {
+                    "component": "td",
+                    "content": [
+                        (
+                            {
+                                "component": "VImg",
+                                "props": {
+                                    "src": poster,
+                                    "alt": title,
+                                    "width": 40,
+                                    "height": 60,
+                                    "cover": True,
+                                    "class": "rounded",
+                                },
+                            }
+                            if poster
+                            else {
+                                "component": "span",
+                                "props": {"class": "text-caption text-grey"},
+                                "text": "—",
+                            }
+                        )
+                    ],
+                },
+                {
+                    "component": "td",
+                    "text": f"{title} ({year})" if year else title,
+                },
+            ]
+            if season_view:
+                season = group.get("season")
+                cells.append(
+                    {
+                        "component": "td",
+                        "text": f"第{int(season)}季" if season is not None else "未标季",
+                    }
+                )
+                cells.append(
+                    {
+                        "component": "td",
+                        "text": self._format_episodes(group.get("episodes") or []),
+                    }
+                )
+            cells.append(
+                {
+                    "component": "td",
+                    "text": "、".join(group.get("missing") or []) or "-",
                 }
             )
+            cells.append(
+                {
+                    "component": "td",
+                    "text": f"{status}｜{reason}" if reason else status,
+                }
+            )
+            cells.append(
+                {
+                    "component": "td",
+                    "props": {"class": "text-caption text-grey"},
+                    "text": str(group.get("updated") or "-"),
+                }
+            )
+            rows.append({"component": "tr", "content": cells})
 
         select_all = {
             "component": "input",
@@ -1956,8 +2159,8 @@ class CSFReborn(_PluginBase):
                                     "content": [
                                         {"component": "th", "content": [select_all]},
                                         *[
-                                            {"component": "th", "text": title}
-                                            for title in headers[1:]
+                                            {"component": "th", "text": name}
+                                            for name in headers[1:]
                                         ],
                                     ],
                                 }
@@ -2260,11 +2463,16 @@ class CSFReborn(_PluginBase):
                     self._queue_drop(queue, str(entry.get("path") or ""))
                     self._add_history(payload, result)
                 else:
+                    reason = "；".join(
+                        str(err) for err in (result.get("errors") or [])[:2]
+                    )
+                    logger.warning(
+                        f"SubtitleForge 队列补全失败：{entry.get('title')}"
+                        f" -> {result.get('status')} {reason}"
+                    )
                     if current is not None:
                         current["status"] = str(result.get("status") or "not_found")
-                        current["reason"] = "；".join(
-                            str(err) for err in (result.get("errors") or [])[:2]
-                        )
+                        current["reason"] = reason
                         current["missing"] = [
                             str(value)
                             for value in (result.get("missing") or current.get("missing") or [])

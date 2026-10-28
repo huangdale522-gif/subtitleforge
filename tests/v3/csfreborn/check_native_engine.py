@@ -786,8 +786,37 @@ def test_queue(module, native, tmp: Path) -> None:
     queue = plugin._load_queue()
     check("服务端条目也能入队", len(queue) == 2, str(len(queue)))
 
+    # 剧集按季分组：同季多集只显示一行
+    show_dir = media / "Show"
+    show_dir.mkdir()
+    episodes = []
+    for episode in (1, 2, 3):
+        path = show_dir / f"Show.S02E{episode:02d}.1080p.mkv"
+        path.write_bytes(os.urandom(1024))
+        episodes.append(
+            {
+                "path": str(path),
+                "title": "Show",
+                "year": "2024",
+                "media_type": "tv",
+                "season": 2,
+                "episode": episode,
+                "missing": [native.LANG_CHS],
+                "status": "dry_run",
+                "downloaded": [],
+            }
+        )
+    plugin._queue_sync_from_scan({"items": episodes})
+    groups_movies, groups_seasons = plugin._queue_groups(plugin._load_queue())
+    season_group = next(item for item in groups_seasons if item["title"] == "Show")
+    check("剧集按季合并为一行", len(groups_seasons) == 1 and season_group["episodes"] == [1, 2, 3], str(season_group["episodes"]))
+    check("电影与剧集分开", len(groups_movies) == 2, str(len(groups_movies)))
+    resolved = plugin._resolve_queue_entries(plugin._load_queue(), [season_group["id"]])
+    check("勾选整季选中所有集", len(resolved) == 3, str(len(resolved)))
+
     page = json.dumps(plugin.get_page(), ensure_ascii=False)
     check("页面渲染队列表格", "csf-queue" in page and "待补全" in page, page[:120])
+    check("页面分电影与剧集", "电影（" in page and "剧集 · 按季" in page, page[:160])
     check("页面含下载按钮", "下载选中" in page and "queue/download" in page)
 
     calls: list[str] = []
@@ -804,9 +833,10 @@ def test_queue(module, native, tmp: Path) -> None:
     plugin._process_payload = fake_process  # type: ignore[method-assign]
 
     target = next(entry for entry in queue if entry["title"] == "Queue Movie")
+    movie_row_id = "m:" + target["key"]
 
     async def run_selected():
-        response = await plugin.api_queue_download({"keys": [target["key"]]})
+        response = await plugin.api_queue_download({"keys": [movie_row_id]})
         if plugin._queue_task is not None:
             await plugin._queue_task
         return response
@@ -817,8 +847,8 @@ def test_queue(module, native, tmp: Path) -> None:
     remaining = plugin._load_queue()
     check(
         "下载成功后移出队列",
-        len(remaining) == 1 and remaining[0]["title"] == "Service Movie",
-        str(remaining),
+        len(remaining) == 4 and all(item["title"] != "Queue Movie" for item in remaining),
+        str([item["title"] for item in remaining]),
     )
     check("手动下载写入历史", len(plugin._load_history()) == 1)
 
@@ -838,7 +868,7 @@ def test_queue(module, native, tmp: Path) -> None:
     asyncio.run(run_retry())
     queue = plugin._load_queue()
     retried = next(entry for entry in queue if entry["title"] == "Queue Movie")
-    check("失败后仍在队列", len(queue) == 2 and retried["attempts"] == 1, str(len(queue)))
+    check("失败后仍在队列", len(queue) == 5 and retried["attempts"] == 1, str(len(queue)))
     check("失败原因已记录", "未找到字幕" in (retried.get("reason") or ""), str(retried.get("reason")))
 
     # 文件消失后清理
@@ -852,7 +882,7 @@ def test_queue(module, native, tmp: Path) -> None:
     plugin._queue_sync_from_scan({"items": [ghost]})
     cleared = asyncio.run(plugin.api_queue_clear())
     check("清理失效条目", cleared.success is True and "1" in cleared.message, cleared.message)
-    check("仍缺字幕的条目保留", len(plugin._load_queue()) == 2, str(len(plugin._load_queue())))
+    check("仍缺字幕的条目保留", len(plugin._load_queue()) == 5, str(len(plugin._load_queue())))
 
 
 def main() -> int:
