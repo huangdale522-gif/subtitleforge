@@ -28,15 +28,52 @@ except ImportError:
     from app.schemas.types import NotificationType as MessageType
 
 
+def _load_native_engine() -> Any:
+    """Load the in-process subtitle engine in package, module or file layout."""
+
+    try:
+        from .native import NativeSubtitleEngine
+
+        return NativeSubtitleEngine
+    except ImportError:
+        pass
+    try:
+        from native import NativeSubtitleEngine  # type: ignore[no-redef]
+
+        return NativeSubtitleEngine
+    except ImportError:
+        pass
+    import importlib.util
+
+    path = Path(__file__).resolve().parent / "native.py"
+    spec = importlib.util.spec_from_file_location("csfreborn_native", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"无法加载内置字幕引擎：{path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.NativeSubtitleEngine
+
+
+try:
+    NativeSubtitleEngine: Any = _load_native_engine()
+except Exception as _native_import_error:  # noqa: BLE001 - plugin must still load
+    NativeSubtitleEngine = None
+    logger.warning(
+        "SubtitleForge 内置字幕引擎加载失败："
+        f"{type(_native_import_error).__name__}: {_native_import_error}"
+    )
+
+
 class CSFReborn(_PluginBase):
     """Complete subtitles after transfers and during scheduled library scans."""
 
     plugin_name = "SubtitleForge 字幕补全"
     plugin_desc = (
-        "监听 MoviePilot 整理完成事件，并定时扫描媒体库，为缺少中文字幕的视频自动补全。"
+        "监听整理完成事件并定时扫描媒体库，为缺少中文字幕的视频自动补全；"
+        "内置 SubtitleBest / ASSRT / 迅雷 / Shooter 字幕源，无需额外服务也能工作。"
     )
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.3.5"
+    plugin_version = "0.4.0"
     plugin_author = "SubtitleForge contributors"
     author_url = "https://github.com/"
     plugin_config_prefix = "csfreborn_"
@@ -87,6 +124,16 @@ class CSFReborn(_PluginBase):
         self._history_key = "download_history"
         self._latest_scan_key = "latest_scan"
         self._history_max = 30
+        # 内置字幕源（不依赖 SubtitleForge 服务）
+        self._native_mode = "auto"
+        self._native_xunlei = True
+        self._native_shooter = False
+        self._native_tag_style = "iso"
+        self._native_auto_sync = False
+        self._native_encoding = True
+        self._native_max_subs = 2
+        self._native_request_delay = 1.0
+        self._native_engine: Any = None
 
     def init_plugin(self, config: dict | None = None) -> None:
         """Load configuration; safe to call repeatedly."""
@@ -166,6 +213,30 @@ class CSFReborn(_PluginBase):
             self._scan_daily_download_limit = 10
         if not self._api_token:
             self._api_token = self._read_service_token()
+        # 内置字幕源：默认读取插件已有的 SubtitleBest / ASSRT 凭据，无需重复配置
+        self._native_mode = str(config.get("native_mode") or "auto")
+        if self._native_mode not in {"auto", "native_only", "service_first", "off"}:
+            self._native_mode = "auto"
+        self._native_xunlei = bool(config.get("native_xunlei", True))
+        self._native_shooter = bool(config.get("native_shooter", False))
+        self._native_tag_style = str(config.get("native_tag_style") or "iso")
+        self._native_auto_sync = bool(config.get("native_auto_sync", False))
+        self._native_encoding = bool(config.get("native_encoding", True))
+        try:
+            self._native_max_subs = min(
+                5, max(1, int(config.get("native_max_subs") or 2))
+            )
+        except (TypeError, ValueError):
+            self._native_max_subs = 2
+        try:
+            self._native_request_delay = max(
+                0.0, float(config.get("native_request_delay") or 1.0)
+            )
+        except (TypeError, ValueError):
+            self._native_request_delay = 1.0
+        self._native_engine = (
+            NativeSubtitleEngine(self) if NativeSubtitleEngine is not None else None
+        )
         try:
             self._timeout = max(10, int(config.get("timeout") or 180))
         except (TypeError, ValueError):
@@ -285,13 +356,7 @@ class CSFReborn(_PluginBase):
             ),
         }
         try:
-            result = await asyncio.to_thread(
-                self._request_json,
-                "POST",
-                "/v1/scan",
-                payload,
-                3600,
-            )
+            result = await self._run_scan(payload)
             result["time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             result["trigger"] = "manual" if manual else "schedule"
             self.save_data(
@@ -321,6 +386,103 @@ class CSFReborn(_PluginBase):
             return {"status": "error", "errors": [message]}
         finally:
             self._scan_running = False
+
+    async def _run_scan(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """按 native_mode 执行扫描，返回与 `/v1/scan` 一致的结构。
+
+        - auto：服务可用时沿用服务扫描（保留持久队列、每日额度以及
+          OpenSubtitles/自定义源），服务不可用时改用内置引擎扫描。
+        - native_only：只用内置引擎。
+        - service_first：先服务，失败后再用内置引擎。
+        - off：只用服务，保持原有行为。
+        """
+
+        mode = self._native_mode
+        native_result: dict[str, Any] | None = None
+        service_result: dict[str, Any] | None = None
+
+        use_service = mode in {"off", "service_first"}
+        use_native = mode == "native_only"
+        if mode == "auto":
+            use_service = self._service_healthy()
+            use_native = not use_service
+
+        if use_service:
+            service_result = await self._call_service_scan(payload)
+            if mode == "service_first" and service_result.get("status") == "error":
+                use_native = True
+
+        if use_native:
+            if not self._native_ready:
+                logger.warning(
+                    "SubtitleForge 内置扫描跳过：没有可用的内置字幕源"
+                    "（请填写 SubtitleBest API Key / ASSRT Token，或启用迅雷字幕）"
+                )
+            else:
+                try:
+                    native_result = await self._native_engine.scan(payload)
+                    logger.info(
+                        "SubtitleForge 内置扫描完成："
+                        f"检查 {native_result.get('checked', 0)}，"
+                        f"下载 {native_result.get('downloaded', 0)}"
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.error(
+                        f"SubtitleForge 内置扫描失败：{type(exc).__name__}: {exc}"
+                    )
+                    native_result = {"status": "error", "errors": [str(exc)]}
+
+        return self._merge_scan_results(native_result, service_result)
+
+    async def _call_service_scan(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Call the SubtitleForge scan endpoint; never raises."""
+
+        try:
+            return await asyncio.to_thread(
+                self._request_json, "POST", "/v1/scan", payload, 3600
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"SubtitleForge 服务扫描失败：{type(exc).__name__}: {exc}")
+            return {"status": "error", "errors": [str(exc)]}
+
+    @staticmethod
+    def _merge_scan_results(
+        native: dict[str, Any] | None, service: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        """Merge native and service scan summaries without double counting."""
+
+        if native is None and service is None:
+            return {"status": "error", "errors": ["没有可用的字幕来源"]}
+        if native is None:
+            return service or {}
+        if service is None:
+            return native
+
+        def number(source: dict[str, Any], key: str) -> int:
+            try:
+                return int(source.get(key) or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        return {
+            "status": "ok",
+            "dry_run": bool(native.get("dry_run") or service.get("dry_run")),
+            "discovered": max(number(native, "discovered"), number(service, "discovered")),
+            "checked": max(number(native, "checked"), number(service, "checked")),
+            "existing": max(number(native, "existing"), number(service, "existing")),
+            "queued": max(number(native, "queued"), number(service, "queued")),
+            "queue_remaining": number(service, "queue_remaining"),
+            "downloaded": number(native, "downloaded") + number(service, "downloaded"),
+            "downloads_today": max(
+                number(native, "downloads_today"), number(service, "downloads_today")
+            ),
+            "daily_download_limit": max(
+                number(native, "daily_download_limit"),
+                number(service, "daily_download_limit"),
+            ),
+            "items": list(native.get("items") or []) + list(service.get("items") or []),
+            "errors": list(native.get("errors") or []) + list(service.get("errors") or []),
+        }
 
     @staticmethod
     def _scan_notification_text(result: dict[str, Any]) -> str:
@@ -616,13 +778,7 @@ class CSFReborn(_PluginBase):
         }
         for path in paths:
             payload = {**common_payload, "video_path": str(path)}
-            try:
-                result = await asyncio.to_thread(
-                    self._request_json, "POST", "/v1/process", payload
-                )
-            except Exception as exc:  # noqa: BLE001 - handlers must not crash the host
-                logger.error(f"SubtitleForge 处理失败：{type(exc).__name__}: {exc}")
-                result = {"status": "error", "errors": [str(exc)]}
+            result = await self._process_payload(payload)
             logger.info(
                 f"SubtitleForge: {payload['title']} -> {result.get('status')}, "
                 f"downloaded={len(result.get('downloaded') or [])}"
@@ -644,6 +800,94 @@ class CSFReborn(_PluginBase):
                 title=f"字幕已补全 - {common_payload['title']}",
                 text=f"已下载字幕文件：\n{names}",
             )
+
+    # -- 内置字幕源与服务编排 -----------------------------------------
+
+    @property
+    def _native_ready(self) -> bool:
+        """内置引擎是否至少有一个可用来源。"""
+
+        engine = self._native_engine
+        return engine is not None and bool(engine.has_source())
+
+    async def _process_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """按 native_mode 决定内置源与服务的先后顺序，并合并结果。"""
+
+        mode = self._native_mode
+        native_result: dict[str, Any] | None = None
+        service_result: dict[str, Any] | None = None
+
+        if mode in {"auto", "native_only"} and self._native_ready:
+            try:
+                native_result = await self._native_engine.process(payload)
+                logger.info(
+                    f"SubtitleForge 内置源：{payload.get('title')} -> "
+                    f"{native_result.get('status')}，"
+                    f"下载 {len(native_result.get('downloaded') or [])}"
+                )
+            except Exception as exc:  # noqa: BLE001 - one path must not break the run
+                logger.error(
+                    f"SubtitleForge 内置源处理失败：{type(exc).__name__}: {exc}"
+                )
+                native_result = {
+                    "status": "error",
+                    "downloaded": [],
+                    "errors": [str(exc)],
+                }
+
+        needs_service = mode in {"off", "service_first"} or (
+            mode == "auto" and bool((native_result or {}).get("missing"))
+        )
+        if needs_service:
+            service_result = await self._call_service_process(payload)
+
+        return self._merge_process_results(native_result, service_result)
+
+    async def _call_service_process(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Call the SubtitleForge service; never raises."""
+
+        try:
+            return await asyncio.to_thread(
+                self._request_json, "POST", "/v1/process", payload
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"SubtitleForge 服务处理失败：{type(exc).__name__}: {exc}")
+            return {"status": "error", "downloaded": [], "errors": [str(exc)]}
+
+    @staticmethod
+    def _merge_process_results(
+        native: dict[str, Any] | None, service: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        """Merge native and service results into one service-shaped result."""
+
+        if native is None and service is None:
+            return {
+                "status": "error",
+                "downloaded": [],
+                "errors": ["没有可用的字幕来源"],
+            }
+        if native is None:
+            return service or {}
+        if service is None:
+            return native
+
+        downloaded = list(native.get("downloaded") or []) + list(
+            service.get("downloaded") or []
+        )
+        errors = list(native.get("errors") or []) + list(service.get("errors") or [])
+        missing = service.get("missing") or native.get("missing") or []
+        if downloaded:
+            status = "downloaded"
+        elif missing:
+            status = "not_found"
+        else:
+            status = native.get("status") or service.get("status") or "ok"
+        return {
+            "status": status,
+            "downloaded": downloaded,
+            "errors": errors,
+            "missing": missing,
+        }
 
     @staticmethod
     def _extract_video_paths(transferinfo: Any) -> list[str]:
@@ -916,6 +1160,156 @@ class CSFReborn(_PluginBase):
                         },
                     },
                     {
+                        "component": "VAlert",
+                        "props": {
+                            "type": "success",
+                            "variant": "tonal",
+                            "text": "内置字幕源：SubtitleBest、ASSRT、迅雷、Shooter 直接在 MoviePilot 进程内检索，不需要 SubtitleForge 服务；下面填写的 SubtitleBest API Key 与 ASSRT Token 会同时供内置源使用，无需重复配置。默认「自动」：整理完成时先用内置源、仍缺语言再交给服务；定时扫描在服务可用时沿用服务（保留队列与额度），服务不可用时改用内置源。",
+                        },
+                    },
+                    {
+                        "component": "VSelect",
+                        "props": {
+                            "model": "native_mode",
+                            "label": "内置源与服务的使用顺序",
+                            "items": [
+                                {
+                                    "title": "自动：内置源优先，服务兜底（推荐）",
+                                    "value": "auto",
+                                },
+                                {
+                                    "title": "仅内置源：完全不依赖 SubtitleForge 服务",
+                                    "value": "native_only",
+                                },
+                                {
+                                    "title": "服务优先：服务失败后再用内置源",
+                                    "value": "service_first",
+                                },
+                                {
+                                    "title": "仅服务：保持原有行为",
+                                    "value": "off",
+                                },
+                            ],
+                        },
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "native_xunlei",
+                                            "label": "迅雷字幕（文件 cid）",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "native_shooter",
+                                            "label": "Shooter（文件 hash）",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "native_auto_sync",
+                                            "label": "自动调轴（需 ffsubsync）",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "native_encoding",
+                                            "label": "字幕转 UTF-8",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VSelect",
+                                        "props": {
+                                            "model": "native_tag_style",
+                                            "label": "内置源字幕语言标签",
+                                            "items": [
+                                                {
+                                                    "title": "zh-CN / zh-TW（Emby、Jellyfin）",
+                                                    "value": "iso",
+                                                },
+                                                {
+                                                    "title": "chs / cht（老播放器）",
+                                                    "value": "legacy",
+                                                },
+                                                {
+                                                    "title": "zh-Hans / zh-Hant（Plex）",
+                                                    "value": "plex",
+                                                },
+                                            ],
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "native_max_subs",
+                                            "label": "每个视频最多下载条数",
+                                            "type": "number",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "native_request_delay",
+                                            "label": "请求间隔（秒）",
+                                            "type": "number",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
                         "component": "VTextField",
                         "props": {
                             "model": "subtitle_best_api_key",
@@ -1091,6 +1485,14 @@ class CSFReborn(_PluginBase):
             "scan_dry_run": True,
             "scan_provider_order": "",
             "scan_languages": ["zh-Hans"],
+            "native_mode": "auto",
+            "native_xunlei": True,
+            "native_shooter": False,
+            "native_tag_style": "iso",
+            "native_auto_sync": False,
+            "native_encoding": True,
+            "native_max_subs": 2,
+            "native_request_delay": 1.0,
         }
 
     def get_page(self) -> list[dict]:
@@ -1099,6 +1501,41 @@ class CSFReborn(_PluginBase):
         history = self._load_history()
         latest_scan = self._load_latest_scan()
         cards: list[dict] = []
+        if self._native_engine is not None:
+            sources = self._native_engine.describe()
+            ready = [item["name"] for item in sources if item["ready"]]
+            mode_label = {
+                "auto": "自动（内置源优先）",
+                "native_only": "仅内置源",
+                "service_first": "服务优先",
+                "off": "仅服务",
+            }.get(self._native_mode, self._native_mode)
+            cards.append(
+                {
+                    "component": "VCard",
+                    "props": {"class": "mb-3", "variant": "tonal"},
+                    "content": [
+                        {
+                            "component": "VCardText",
+                            "content": [
+                                {
+                                    "component": "div",
+                                    "props": {"class": "font-weight-bold"},
+                                    "text": f"字幕源 · {mode_label}",
+                                },
+                                {
+                                    "component": "div",
+                                    "props": {"class": "text-caption"},
+                                    "text": (
+                                        "内置可用："
+                                        + ("、".join(ready) if ready else "无（填写 SubtitleBest API Key 或 ASSRT Token 即可启用）")
+                                    ),
+                                },
+                            ],
+                        }
+                    ],
+                }
+            )
         if latest_scan:
             items = latest_scan.get("items") or []
             missing = [

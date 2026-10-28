@@ -51,3 +51,32 @@ other notification channel. An authenticated `POST
 Both containers must see the media library at the same path. For example, if
 MoviePilot sees a file as `/media/movies/Film.mkv`, SubtitleForge must also see
 `/media/movies/Film.mkv`.
+
+## Built-in providers (0.4.0+)
+
+The plugin can now complete subtitles without a running SubtitleForge service.
+SubtitleBest (IMDb, including season packages), ASSRT (title search), Xunlei
+(file `cid` fingerprint) and Shooter (file hash fingerprint) run inside the
+MoviePilot process and reuse the existing `subtitle_best_api_key` /
+`assrt_token` fields — no new configuration is required.
+
+`native_mode` controls the order:
+
+- `auto` (default): built-in providers first for transfer events; the service is
+  only called when a requested language is still missing afterwards. Scheduled
+  scans use the service while it is healthy (keeping its queue and quota) and
+  fall back to the built-in engine when it is not.
+- `native_only`: never call the service.
+- `service_first`: service first, built-in providers as fallback.
+- `off`: previous behavior, service only.
+
+Additional options: `native_xunlei`, `native_shooter`, `native_tag_style`
+(`zh-CN/zh-TW`, `chs/cht`, `zh-Hans/zh-Hant`), `native_auto_sync` (requires
+`ffsubsync`), `native_encoding` (GBK/BIG5 to UTF-8), `native_max_subs` and
+`native_request_delay`.
+
+Subtitles are written beside the video as `<video>.<lang>.<ext>`. Language is
+verified from subtitle content, and Xunlei/Shooter results are checked against
+the target episode and year before they are accepted.
+
+Self-check: `python3 tests/v3/csfreborn/check_native_engine.py`.

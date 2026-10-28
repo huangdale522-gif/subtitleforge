@@ -64,20 +64,31 @@ Provider failures are returned in the job result and displayed in plugin
 history. A failed subtitle search does not roll back the media transfer and
 does not crash MoviePilot.
 
-## Standalone plugin (no service)
+## Built-in providers (no service required)
 
-`plugins.v3/chinesesubfinder` is a self-contained alternative to the adapter
-above. It never calls the SubtitleForge service: the subtitle providers run
-inside the MoviePilot process.
+Since 0.4.0 the plugin also embeds the ChineseSubFinder subtitle sources, so it
+works without a running SubtitleForge service.
 
-- Sources: SubtitleBest (IMDb, including season packages), ASSRT (title search),
-  Xunlei (file `cid` fingerprint), Shooter (file hash fingerprint).
-- Triggers: `TransferComplete`, cron library scan, manual API
-  (`/download`, `/scan`, `/history`, `/sources`).
+- Sources: SubtitleBest (IMDb, including season packages), ASSRT (title
+  search), Xunlei (file `cid` fingerprint), Shooter (file hash fingerprint).
+- Credentials are the existing `subtitle_best_api_key` / `assrt_token`
+  fields — no extra configuration.
 - Language is decided from subtitle content, not from site labels; GBK/BIG5
   files are converted to UTF-8.
 - Optional: `ffsubsync` for timeline correction, `7z`/`unrar`/`bsdtar` for
   rar/7z archives (zip works out of the box).
 
-Enable only one of `CSFReborn` / `ChineseSubFinder` to avoid duplicate
-downloads for the same video.
+`native_mode` selects the order:
+
+| Value | Behavior |
+| --- | --- |
+| `auto` (default) | Native providers first; the service is called only when a requested language is still missing. |
+| `native_only` | Never call the service. |
+| `service_first` | Call the service first; fall back to native on failure. |
+| `off` | Previous behavior: service only. |
+
+Scanning: in `auto` the service scan is used while the service answers its
+health check (keeping its persistent queue, daily ledger, OpenSubtitles and
+custom providers); when the service is unreachable the built-in engine scans
+instead. `native_only` always scans with the built-in engine, `service_first`
+falls back to it, and `off` keeps the previous service-only behavior.

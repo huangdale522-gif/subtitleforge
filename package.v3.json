@@ -1,14 +1,15 @@
 {
   "CSFReborn": {
     "name": "SubtitleForge 字幕补全",
-    "description": "监听整理完成事件，并定时扫描媒体库，为缺少外挂或内嵌中文字幕的视频自动补全。",
+    "description": "监听整理完成事件并定时扫描媒体库，为缺少外挂或内嵌中文字幕的视频自动补全；内置 SubtitleBest / ASSRT / 迅雷 / Shooter 字幕源，无需部署 SubtitleForge 服务也能工作。",
     "labels": "字幕,自动化",
-    "version": "0.3.5",
+    "version": "0.4.0",
     "icon": "Moviepilot_A.png",
     "author": "SubtitleForge contributors",
     "level": 1,
     "system_version": ">=3",
     "history": {
+      "v0.4.0": "合并内置字幕引擎：SubtitleBest（含整季包）、ASSRT、迅雷 cid 指纹、Shooter hash 指纹直接在插件进程内检索下载，复用已有 API Key / Token；默认自动模式先内置源、不足再交给服务，无需新增插件或重新配置。",
       "v0.3.5": "跳过蓝光镜像 BDMV/STREAM 分片并清理旧队列中的这类条目，避免把盘内分片误判为电影、下载错配字幕或浪费额度。",
       "v0.3.4": "全库先扫描并把缺失字幕写入持久队列，再按每次和每日额度下载；新增并发保护、今日额度统计，并在 Telegram 等 MoviePilot 通知中列出实际下载的字幕文件。",
       "v0.3.3": "增加字幕源额度熔断：命中限流后冷却 24 小时，单文件最多下载尝试 3 次，ASSRT 命中后停止重复搜索。",
@@ -39,21 +40,6 @@
       "v1.2.0": "新增按季清理：整季已看完时只生成一个季级候选，Emby、Jellyfin 和 Plex 均按季删除，Telegram 年度询问也改为整季确认。",
       "v1.1.0": "新增 Telegram 扫描/删除推送，以及已观看内容入库超过一年后的定时询问；支持 Telegram 按钮删除或保留，删除仍受预演、白名单和二次校验保护。",
       "v1.0.0": "首版：支持电影、单集、整剧和动漫扫描，人工勾选、预演、二次确认、路径白名单和审计记录。"
-    }
-  },
-  "ChineseSubFinder": {
-    "name": "ChineseSubFinder 字幕",
-    "description": "整理入库/定时扫描时，自动从 SubtitleBest、Assrt、迅雷、Shooter 检索并下载中文字幕，纯内嵌实现，无需额外服务端。",
-    "labels": "字幕,自动化",
-    "version": "1.0.0",
-    "icon": "chinesesubfinder.png",
-    "author": "huangdale522-gif",
-    "level": 1,
-    "release": true,
-    "system_version": ">=3.0.0",
-    "v3t": false,
-    "history": {
-      "v1.0.0": "首个版本：原生实现 SubtitleBest / Assrt / 迅雷 / Shooter 四个字幕来源，支持简繁内容判定、GBK/BIG5 转 UTF-8、ffsubsync 调轴与定时全库补齐。"
     }
   }
 }
