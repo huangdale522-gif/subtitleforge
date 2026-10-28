@@ -40,5 +40,20 @@
       "v1.1.0": "新增 Telegram 扫描/删除推送，以及已观看内容入库超过一年后的定时询问；支持 Telegram 按钮删除或保留，删除仍受预演、白名单和二次校验保护。",
       "v1.0.0": "首版：支持电影、单集、整剧和动漫扫描，人工勾选、预演、二次确认、路径白名单和审计记录。"
     }
+  },
+  "ChineseSubFinder": {
+    "name": "ChineseSubFinder 字幕",
+    "description": "整理入库/定时扫描时，自动从 SubtitleBest、Assrt、迅雷、Shooter 检索并下载中文字幕，纯内嵌实现，无需额外服务端。",
+    "labels": "字幕,自动化",
+    "version": "1.0.0",
+    "icon": "chinesesubfinder.png",
+    "author": "huangdale522-gif",
+    "level": 1,
+    "release": true,
+    "system_version": ">=3.0.0",
+    "v3t": false,
+    "history": {
+      "v1.0.0": "首个版本：原生实现 SubtitleBest / Assrt / 迅雷 / Shooter 四个字幕来源，支持简繁内容判定、GBK/BIG5 转 UTF-8、ffsubsync 调轴与定时全库补齐。"
+    }
   }
 }

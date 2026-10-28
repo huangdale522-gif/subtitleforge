@@ -63,3 +63,21 @@ filename format.
 Provider failures are returned in the job result and displayed in plugin
 history. A failed subtitle search does not roll back the media transfer and
 does not crash MoviePilot.
+
+## Standalone plugin (no service)
+
+`plugins.v3/chinesesubfinder` is a self-contained alternative to the adapter
+above. It never calls the SubtitleForge service: the subtitle providers run
+inside the MoviePilot process.
+
+- Sources: SubtitleBest (IMDb, including season packages), ASSRT (title search),
+  Xunlei (file `cid` fingerprint), Shooter (file hash fingerprint).
+- Triggers: `TransferComplete`, cron library scan, manual API
+  (`/download`, `/scan`, `/history`, `/sources`).
+- Language is decided from subtitle content, not from site labels; GBK/BIG5
+  files are converted to UTF-8.
+- Optional: `ffsubsync` for timeline correction, `7z`/`unrar`/`bsdtar` for
+  rar/7z archives (zip works out of the box).
+
+Enable only one of `CSFReborn` / `ChineseSubFinder` to avoid duplicate
+downloads for the same video.

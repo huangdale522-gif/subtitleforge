@@ -21,6 +21,10 @@ installation logic, or MoviePilot integration.
 - Safe ZIP extraction and atomic subtitle placement.
 - SQLite job history.
 - MoviePilot V3 adapter that listens for `TransferComplete`.
+- A standalone, service-free MoviePilot V3 plugin at `plugins.v3/chinesesubfinder`
+  that embeds the ChineseSubFinder subtitle sources (SubtitleBest, ASSRT,
+  Xunlei, Shooter) directly in the MoviePilot process — no sidecar service,
+  no API token between plugin and service.
 - Full-library scans with external and embedded Chinese subtitle detection,
   a persistent missing-subtitle queue, exclusions, and dry-run preview.
 - Blu-ray `BDMV/STREAM` segments are ignored so disc fragments are not treated

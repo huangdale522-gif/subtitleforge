@@ -1,0 +1,6 @@
+[project]
+name = "moviepilot-plugin-chinesesubfinder"
+version = "1.0.0"
+description = "ChineseSubFinder 字幕：整理入库/定时扫描时自动检索并下载中文字幕"
+requires-python = ">=3.11"
+dependencies = []
