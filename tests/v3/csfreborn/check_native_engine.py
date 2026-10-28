@@ -150,25 +150,35 @@ class _ResponseModel:
 
 
 class _MetaInfo:
-    """极简 MetaInfo：从文件名里拆出英文名与年份。"""
+    """极简 MetaInfo：拆英文名、季集、年份，并去掉发布组信息。"""
 
     def __init__(self, title: str = "", **kwargs):
         import re as _re
 
-        self.cn_name = title
-        self.name = title
+        season_episode = _re.search(r"[Ss](\d{1,2})\s*[Ee](\d{1,3})", title)
+        self.begin_season = int(season_episode.group(1)) if season_episode else None
+        self.begin_episode = int(season_episode.group(2)) if season_episode else None
+
         cleaned = _re.sub(r"[._]+", " ", title)
         cleaned = _re.sub(
-            r"\b(19|20)\d{2}\b|\b(1080|2160|720)p\b|\b(WEB-DL|WEBRip|BluRay|HDTV)\b",
+            r"\b(1080p|2160p|720p|480p|WEB-?DL|WEBRip|BluRay|BDRip|H\.?26[45]|HEVC|"
+            r"x26[45]|DDP|DTS|Atmos|HDR10?|REMUX)\b",
             " ",
             cleaned,
             flags=_re.IGNORECASE,
         )
-        self.en_name = " ".join(cleaned.split())
-        match = _re.search(r"\b(19|20)\d{2}\b", title)
-        self.year = match.group(0) if match else ""
-        self.begin_season = None
-        self.begin_episode = None
+        cleaned = _re.sub(r"[Ss]\d{1,2}\s*[Ee]\d{1,3}", " ", cleaned)
+        parts = [
+            part
+            for part in cleaned.split()
+            if not _re.fullmatch(r"[A-Z0-9][A-Z0-9-]{3,}", part)
+        ]
+        name = " ".join(parts).strip()
+        self.cn_name = name or title
+        self.name = self.cn_name
+        self.en_name = name if name.isascii() else ""
+        year = _re.search(r"\b(19|20)\d{2}\b", title)
+        self.year = year.group(0) if year else ""
 
 
 class _PluginBase:
@@ -1072,6 +1082,54 @@ def test_bdmv_and_inspect(module, native, tmp: Path) -> None:
     check("检查不存在文件报错", missing.success is False)
 
 
+
+def test_title_cleanup(module, native, tmp: Path) -> None:
+    print("\n[11] 文件名标题清理")
+
+    plugin = module.CSFReborn()
+    plugin.init_plugin({"enabled": True, "languages": ["zh-Hans"]})
+
+    folder = tmp / "cleanup"
+    folder.mkdir()
+    episode = folder / "如果我是一只动物 S01E43 1080p.FROGWeb.mkv"
+    episode.write_bytes(os.urandom(2048))
+    movie = folder / "狩猎场 (2025) - 1080p.AVC.DDP 5.1 3Audios.QHstudIo.mkv"
+    movie.write_bytes(os.urandom(2048))
+
+    plugin._queue_sync_from_scan(
+        {
+            "items": [
+                {
+                    "path": str(episode),
+                    "title": episode.stem,
+                    "media_type": "movie",
+                    "missing": ["简体中文"],
+                    "status": "queued",
+                    "downloaded": [],
+                },
+                {
+                    "path": str(movie),
+                    "title": movie.stem,
+                    "media_type": "movie",
+                    "missing": ["简体中文"],
+                    "status": "queued",
+                    "downloaded": [],
+                },
+            ]
+        }
+    )
+    queue = {item["path"]: item for item in plugin._load_queue()}
+    show = queue[str(episode)]
+    check("标题去掉发布信息", show["title"] == "如果我是一只动物", show["title"])
+    check("从文件名补出季集", show["season"] == 1 and show["episode"] == 43, f"{show['season']}/{show['episode']}")
+    check("识别为剧集", show["media_type"] == "tv", show["media_type"])
+    check("电影标题清理", queue[str(movie)]["title"] == "狩猎场", queue[str(movie)]["title"])
+
+    movies, seasons = plugin._queue_groups(plugin._load_queue())
+    check("剧集归入按季分组", len(seasons) == 1 and seasons[0]["season"] == 1, str(seasons))
+    check("电影单独一行", len(movies) == 1, str(movies))
+
+
 def main() -> int:
     install_fake_host()
     module = load_plugin()
@@ -1088,6 +1146,7 @@ def main() -> int:
         test_scan_card(module, tmp)
         test_titles_and_posters(module, native, tmp)
         test_bdmv_and_inspect(module, native, tmp)
+        test_title_cleanup(module, native, tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

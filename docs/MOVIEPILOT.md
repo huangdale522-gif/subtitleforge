@@ -134,3 +134,11 @@ never queued as several `.m2ts` fragments.
 video, the language detected from each file's content, embedded subtitle
 streams and the resulting satisfied languages. Use it when a download is
 reported but the video still shows as missing a subtitle.
+
+## Queue titles
+
+Queue rows show a cleaned title: release tags, episode markers and years are
+stripped from the filename (`如果我是一只动物 S01E43 1080p.FROGWeb` becomes
+`如果我是一只动物` plus S01E43), and the entry is grouped as a TV season. The
+poster is re-read from the NFO on every render, so a stale or wrong poster
+(actor portrait) heals itself without clearing the queue.

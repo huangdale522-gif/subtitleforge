@@ -78,7 +78,7 @@ class CSFReborn(_PluginBase):
         "内置 SubtitleBest / ASSRT / 迅雷 / Shooter 字幕源，无需额外服务也能工作。"
     )
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.6.4"
+    plugin_version = "0.6.5"
     plugin_author = "SubtitleForge contributors"
     author_url = "https://github.com/"
     plugin_config_prefix = "csfreborn_"
@@ -2037,10 +2037,8 @@ class CSFReborn(_PluginBase):
         # 页面渲染时先尝试本地 NFO 海报，避免依赖 TMDB 接口
         poster_changed = False
         for entry in queue:
-            if entry.get("poster"):
-                continue
             poster = self._poster_from_nfo(Path(str(entry.get("path") or "")))
-            if poster:
+            if poster and entry.get("poster") != poster:
                 entry["poster"] = poster
                 poster_changed = True
         if poster_changed:
@@ -2219,6 +2217,7 @@ class CSFReborn(_PluginBase):
                 },
                 {
                     "component": "td",
+                    "props": {"style": "max-width: 220px; white-space: normal"},
                     "text": f"{title} ({year})" if year else title,
                 },
             ]
@@ -2371,6 +2370,83 @@ class CSFReborn(_PluginBase):
             json.dumps(queue[: self._queue_max], ensure_ascii=False),
         )
 
+    @staticmethod
+    def _looks_like_filename(text: str) -> bool:
+        """True when a queue title is really a release filename."""
+
+        value = str(text or "")
+        if not value:
+            return False
+        if re.search(r"\.(mkv|mp4|avi|ts|m2ts|rmvb|mov|wmv)$", value, re.IGNORECASE):
+            return True
+        return bool(
+            re.search(
+                r"\b(1080p|2160p|720p|480p|WEB-?DL|WEBRip|BluRay|BDRip|H\.?26[45]|HEVC|"
+                r"x26[45]|DDP|DTS|Atmos|HDR10?|REMUX)\b",
+                value,
+                re.IGNORECASE,
+            )
+        )
+
+    @staticmethod
+    def _clean_title(title: str) -> str:
+        """Strip release tags, episode markers and years from a display title."""
+
+        original = str(title or "").strip()
+        text = re.sub(r"\.(mkv|mp4|avi|ts|m2ts|rmvb|mov|wmv)$", "", original, flags=re.I)
+        text = re.sub(r"[Ss]\d{1,2}\s*[Ee]\d{1,3}.*$", "", text)
+        text = re.sub(r"\((19|20)\d{2}\).*$", "", text)
+        text = re.sub(r"\b(19|20)\d{2}\b.*$", "", text)
+        text = re.sub(
+            r"\b(1080p|2160p|720p|480p|WEB-?DL|WEBRip|BluRay|BDRip|H\.?26[45]|HEVC|"
+            r"x26[45]|DDP|DTS|Atmos|HDR10?|REMUX)\b.*$",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
+        text = re.sub(r"[._]+", " ", text)
+        text = re.sub(r"\s{2,}", " ", text).strip(" -")
+        # 中文标题后面常跟发布组英文名，截到最后一个中文/数字为止
+        if re.search(r"[\u4e00-\u9fff]", text):
+            matches = list(re.finditer(r"[\u4e00-\u9fff0-9：:·、！？!?]", text))
+            if matches:
+                text = text[: matches[-1].end()].strip(" -")
+        return text or original
+
+    def _normalize_queue_item(self, item: dict[str, Any]) -> dict[str, Any]:
+        """Turn a raw filename into a clean title plus season/episode."""
+
+        path = str(item.get("path") or "")
+        if not path:
+            return item
+        title = str(item.get("title") or "").strip()
+        needs_parse = (
+            not title
+            or self._looks_like_filename(title)
+            or (item.get("season") is None and item.get("episode") is None)
+        )
+        if needs_parse and self._native_engine is not None:
+            try:
+                req = self._native_engine.request_from_payload(
+                    {"video_path": path, "title": ""}
+                )
+            except Exception as err:  # noqa: BLE001 - normalization is best effort
+                logger.debug(f"队列标题解析失败：{err}")
+                req = None
+            if req is not None:
+                if not title or self._looks_like_filename(title):
+                    title = self._clean_title(req.title or Path(path).stem)
+                if item.get("season") is None:
+                    item["season"] = req.season
+                if item.get("episode") is None:
+                    item["episode"] = req.episode
+                if not item.get("year"):
+                    item["year"] = req.year
+                if req.episode is not None:
+                    item["media_type"] = "tv"
+        item["title"] = title or Path(path).stem
+        return item
+
     def _queue_upsert(
         self,
         queue: list[dict[str, Any]],
@@ -2380,6 +2456,7 @@ class CSFReborn(_PluginBase):
     ) -> None:
         """Insert or refresh one queue entry."""
 
+        item = self._normalize_queue_item(item)
         path = str(item.get("path") or "")
         if not path:
             return
