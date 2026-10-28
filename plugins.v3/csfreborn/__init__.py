@@ -77,7 +77,7 @@ class CSFReborn(_PluginBase):
         "内置 SubtitleBest / ASSRT / 迅雷 / Shooter 字幕源，无需额外服务也能工作。"
     )
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.6.1"
+    plugin_version = "0.6.2"
     plugin_author = "SubtitleForge contributors"
     author_url = "https://github.com/"
     plugin_config_prefix = "csfreborn_"
@@ -595,8 +595,8 @@ class CSFReborn(_PluginBase):
     async def _run_scan(self, payload: dict[str, Any]) -> dict[str, Any]:
         """按 native_mode 执行扫描，返回与 `/v1/scan` 一致的结构。
 
-        - auto：服务可用时沿用服务扫描（保留持久队列、每日额度以及
-          OpenSubtitles/自定义源），服务不可用时改用内置引擎扫描。
+        - auto（默认）：内置源可用时用内置引擎扫描（与「内置源优先」一致），
+          内置源不可用或扫描异常时才交给服务。
         - native_only：只用内置引擎。
         - service_first：先服务，失败后再用内置引擎。
         - off：只用服务，保持原有行为。
@@ -606,36 +606,28 @@ class CSFReborn(_PluginBase):
         native_result: dict[str, Any] | None = None
         service_result: dict[str, Any] | None = None
 
-        use_service = mode in {"off", "service_first"}
-        use_native = mode == "native_only"
-        if mode == "auto":
-            use_service = self._service_healthy()
-            use_native = not use_service
-
-        if use_service:
+        if mode == "off":
             service_result = await self._call_service_scan(payload)
-            if mode == "service_first" and service_result.get("status") == "error":
-                use_native = True
-
-        if use_native:
-            if not self._native_ready:
-                logger.warning(
-                    "SubtitleForge 内置扫描跳过：没有可用的内置字幕源"
-                    "（请填写 SubtitleBest API Key / ASSRT Token，或启用迅雷字幕）"
-                )
+        elif mode == "service_first":
+            service_result = await self._call_service_scan(payload)
+            if service_result.get("status") == "error":
+                native_result = await self._native_scan(payload)
+        elif mode == "native_only":
+            native_result = await self._native_scan(payload)
+        else:  # auto
+            if self._native_ready:
+                native_result = await self._native_scan(payload)
+                if (
+                    native_result.get("status") == "error"
+                    and await asyncio.to_thread(self._service_healthy)
+                ):
+                    service_result = await self._call_service_scan(payload)
             else:
-                try:
-                    native_result = await self._native_engine.scan(payload)
-                    logger.info(
-                        "SubtitleForge 内置扫描完成："
-                        f"检查 {native_result.get('checked', 0)}，"
-                        f"下载 {native_result.get('downloaded', 0)}"
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    logger.error(
-                        f"SubtitleForge 内置扫描失败：{type(exc).__name__}: {exc}"
-                    )
-                    native_result = {"status": "error", "errors": [str(exc)]}
+                logger.warning(
+                    "SubtitleForge 内置源不可用（未配置 SubtitleBest API Key / ASSRT Token，"
+                    "且迅雷源已关闭），本次扫描交给服务"
+                )
+                service_result = await self._call_service_scan(payload)
 
         result = self._merge_scan_results(native_result, service_result)
         try:
@@ -644,6 +636,24 @@ class CSFReborn(_PluginBase):
         except Exception as err:  # noqa: BLE001 - queue bookkeeping must not fail the scan
             logger.warning(f"更新待补全队列失败：{err}")
         return result
+
+    async def _native_scan(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Run one native library scan; never raises."""
+
+        if not self._native_ready:
+            return {"status": "error", "errors": ["没有可用的内置字幕源"]}
+        try:
+            result = await self._native_engine.scan(payload)
+            logger.info(
+                "SubtitleForge 内置扫描完成："
+                f"检查 {result.get('checked', 0)}，"
+                f"缺失 {result.get('queued', 0)}，"
+                f"下载 {result.get('downloaded', 0)}"
+            )
+            return result
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"SubtitleForge 内置扫描失败：{type(exc).__name__}: {exc}")
+            return {"status": "error", "errors": [str(exc)]}
 
     async def _call_service_scan(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Call the SubtitleForge scan endpoint; never raises."""
@@ -1398,7 +1408,7 @@ class CSFReborn(_PluginBase):
                         "props": {
                             "type": "success",
                             "variant": "tonal",
-                            "text": "内置字幕源：SubtitleBest、ASSRT、迅雷、Shooter 直接在 MoviePilot 进程内检索，不需要 SubtitleForge 服务；下面填写的 SubtitleBest API Key 与 ASSRT Token 会同时供内置源使用，无需重复配置。默认「自动」：整理完成时先用内置源、仍缺语言再交给服务；定时扫描在服务可用时沿用服务（保留队列与额度），服务不可用时改用内置源。",
+                            "text": "内置字幕源：SubtitleBest、ASSRT、迅雷、Shooter 直接在 MoviePilot 进程内检索，不需要 SubtitleForge 服务；下面填写的 SubtitleBest API Key 与 ASSRT Token 会同时供内置源使用，也会自动读取服务 .env 里的同名配置。默认「自动」：整理和扫描都先用内置源，内置源不可用或出错时才交给服务。",
                         },
                     },
                     {

@@ -624,7 +624,7 @@ def test_orchestration(module, native, tmp: Path) -> None:
 
 
 
-    # 扫描路由：服务健康时沿用服务扫描
+    # 扫描路由：auto 且内置源可用 → 内置扫描
     plugin._native_mode = "auto"
     plugin._service_healthy = lambda: True  # type: ignore[method-assign]
     service_scan_calls: list[str] = []
@@ -634,11 +634,6 @@ def test_orchestration(module, native, tmp: Path) -> None:
         return {"status": "ok", "discovered": 5, "checked": 5, "downloaded": 1, "items": []}
 
     plugin._call_service_scan = fake_service_scan  # type: ignore[method-assign]
-    scan_result = asyncio.run(plugin._run_scan({"paths": ["/tmp"]}))
-    check("自动模式服务健康时走服务扫描", service_scan_calls == ["service"] and scan_result["downloaded"] == 1, str(scan_result))
-
-    # 扫描路由：服务不可用时走内置扫描
-    plugin._service_healthy = lambda: False  # type: ignore[method-assign]
     native_scan_calls: list[str] = []
 
     class _EngineScan:
@@ -653,9 +648,25 @@ def test_orchestration(module, native, tmp: Path) -> None:
             return []
 
     plugin._native_engine = _EngineScan()
+    scan_result = asyncio.run(plugin._run_scan({"paths": ["/tmp"]}))
+    check(
+        "自动模式内置源优先扫描",
+        native_scan_calls == ["native"] and not service_scan_calls and scan_result["downloaded"] == 2,
+        f"{native_scan_calls} {service_scan_calls} {scan_result}",
+    )
+
+    # 扫描路由：auto 但内置源不可用 → 服务扫描
+    plugin._native_engine = types.SimpleNamespace(
+        has_source=lambda: False, describe=lambda: []
+    )
     service_scan_calls.clear()
     scan_result = asyncio.run(plugin._run_scan({"paths": ["/tmp"]}))
-    check("服务不可用时走内置扫描", native_scan_calls == ["native"] and not service_scan_calls and scan_result["downloaded"] == 2, str(scan_result))
+    check(
+        "内置源不可用时走服务扫描",
+        service_scan_calls == ["service"] and scan_result["downloaded"] == 1,
+        f"{service_scan_calls} {scan_result}",
+    )
+
 
 def test_transfer_event(module, native, tmp: Path) -> None:
     print("\n[6] 整理完成事件全链路")

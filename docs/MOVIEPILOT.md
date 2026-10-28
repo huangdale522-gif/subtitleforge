@@ -87,11 +87,11 @@ works without a running SubtitleForge service.
 | `service_first` | Call the service first; fall back to native on failure. |
 | `off` | Previous behavior: service only. |
 
-Scanning: in `auto` the service scan is used while the service answers its
-health check (keeping its persistent queue, daily ledger, OpenSubtitles and
-custom providers); when the service is unreachable the built-in engine scans
-instead. `native_only` always scans with the built-in engine, `service_first`
-falls back to it, and `off` keeps the previous service-only behavior.
+Scanning follows the same order: in `auto` the built-in engine scans the
+library and the service is only used when no built-in source is available or
+the native scan fails. `native_only` always uses the built-in engine,
+`service_first` calls the service first and falls back, and `off` keeps the
+previous service-only behavior.
 
 ## Pending queue
 
