@@ -104,3 +104,12 @@ Press "下载选中" to retry, or use `POST /queue/download` with `{"keys": [...
 (movie row id `m:<key>` or season row id `s:<hash>`) or `{"all": true}`.
 `scan_dry_run` defaults to true, which is why a preview scan reports zero
 downloads — it only queues.
+
+## Diagnostics
+
+`GET /diagnose` returns a secret-free self-check: active mode, provider
+readiness, service reachability, queue size and the last five results with
+their `errors` and `notes`. Candidate-level skips (wrong language, unparsable
+archive) are reported as `notes`, not `errors`; a history entry with
+`下载 1 · 错误 0 · 提示 1` means the subtitle was written and one candidate was
+skipped.

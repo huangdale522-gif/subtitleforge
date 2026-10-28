@@ -871,7 +871,41 @@ def test_queue(module, native, tmp: Path) -> None:
     check("失败后仍在队列", len(queue) == 5 and retried["attempts"] == 1, str(len(queue)))
     check("失败原因已记录", "未找到字幕" in (retried.get("reason") or ""), str(retried.get("reason")))
 
+    # 候选级失败写入 notes 而不是 errors
+    async def fake_partial(payload):
+        return {
+            "status": "downloaded",
+            "downloaded": [{"path": "/x.srt", "language": "zh-Hans", "provider": "ASSRT"}],
+            "errors": [],
+            "notes": ["迅雷字幕: 语言不符（繁體中文）"],
+            "missing": [],
+        }
+
+    plugin._process_payload = fake_partial  # type: ignore[method-assign]
+    plugin._queue_sync_from_scan(scan_result)
+    async def run_partial():
+        await plugin.api_queue_download({"all": True})
+        if plugin._queue_task is not None:
+            await plugin._queue_task
+    asyncio.run(run_partial())
+    last = plugin._load_history()[0]
+    check("候选失败记入 notes", not (last["result"].get("errors")) and last["result"].get("notes"), str(last["result"]))
+    page = json.dumps(plugin.get_page(), ensure_ascii=False)
+    check("历史卡片显示提示", "提示:" in page and "语言不符" in page, page[:120])
+
+    diag = asyncio.run(plugin.api_diagnose())
+    check("诊断接口可用", diag.success is True and diag.data.get("mode") == plugin._native_mode, str(diag.data)[:120])
+
     # 文件消失后清理
+    still_missing = {
+        "path": str(video),
+        "title": "Queue Movie",
+        "year": "2024",
+        "media_type": "movie",
+        "missing": [native.LANG_CHS],
+        "status": "not_found",
+        "downloaded": [],
+    }
     ghost = {
         "path": str(media / "gone.mkv"),
         "title": "Gone",
@@ -879,10 +913,10 @@ def test_queue(module, native, tmp: Path) -> None:
         "status": "not_found",
         "downloaded": [],
     }
-    plugin._queue_sync_from_scan({"items": [ghost]})
+    plugin._queue_sync_from_scan({"items": [still_missing, ghost]})
     cleared = asyncio.run(plugin.api_queue_clear())
     check("清理失效条目", cleared.success is True and "1" in cleared.message, cleared.message)
-    check("仍缺字幕的条目保留", len(plugin._load_queue()) == 5, str(len(plugin._load_queue())))
+    check("仍缺字幕的条目保留", len(plugin._load_queue()) == 1, str(len(plugin._load_queue())))
 
 
 def main() -> int:

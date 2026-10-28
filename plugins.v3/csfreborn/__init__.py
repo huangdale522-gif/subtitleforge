@@ -77,7 +77,7 @@ class CSFReborn(_PluginBase):
         "内置 SubtitleBest / ASSRT / 迅雷 / Shooter 字幕源，无需额外服务也能工作。"
     )
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.6.0"
+    plugin_version = "0.6.1"
     plugin_author = "SubtitleForge contributors"
     author_url = "https://github.com/"
     plugin_config_prefix = "csfreborn_"
@@ -309,6 +309,14 @@ class CSFReborn(_PluginBase):
                 "summary": "立即扫描媒体库",
             },
             {
+                "path": "/diagnose",
+                "endpoint": self.api_diagnose,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "自检：字幕源、服务连通性与最近错误",
+                "description": "不返回任何密钥，仅返回布尔状态与最近几次处理结果。",
+            },
+            {
                 "path": "/queue",
                 "endpoint": self.api_queue,
                 "methods": ["GET"],
@@ -354,6 +362,43 @@ class CSFReborn(_PluginBase):
         return await self.scan_library(manual=True)
 
     # -- 待补全队列 API -----------------------------------------------
+
+    async def api_diagnose(self) -> Any:
+        """Self-check report: sources, service reachability, recent errors."""
+
+        native = self._native_engine.describe() if self._native_engine else []
+        healthy = await asyncio.to_thread(self._service_healthy)
+        history = self._load_history()
+        recent = []
+        for item in history[:5]:
+            result = item.get("result") or {}
+            recent.append(
+                {
+                    "title": item.get("title"),
+                    "status": result.get("status"),
+                    "downloaded": len(result.get("downloaded") or []),
+                    "errors": result.get("errors") or [],
+                    "notes": result.get("notes") or [],
+                }
+            )
+        return schemas.Response(
+            success=True,
+            message="诊断完成",
+            data={
+                "mode": self._native_mode,
+                "native_ready": self._native_ready,
+                "native_sources": native,
+                "subtitle_best_key": bool(self._subtitle_best_api_key),
+                "assrt_token": bool(self._assrt_token),
+                "xunlei": self._native_xunlei,
+                "shooter": self._native_shooter,
+                "service_url": self._service_url,
+                "service_healthy": healthy,
+                "scan_dry_run": self._scan_dry_run,
+                "queue": len(self._load_queue()),
+                "recent": recent,
+            },
+        )
 
     def api_queue(self) -> list[dict[str, Any]]:
         """Return the pending-subtitle queue."""
@@ -1060,6 +1105,7 @@ class CSFReborn(_PluginBase):
             service.get("downloaded") or []
         )
         errors = list(native.get("errors") or []) + list(service.get("errors") or [])
+        notes = list(native.get("notes") or []) + list(service.get("notes") or [])
         missing = service.get("missing") or native.get("missing") or []
         if downloaded:
             status = "downloaded"
@@ -1073,6 +1119,7 @@ class CSFReborn(_PluginBase):
             "status": status,
             "downloaded": downloaded,
             "errors": errors,
+            "notes": notes,
             "missing": missing,
         }
 
@@ -1814,7 +1861,27 @@ class CSFReborn(_PluginBase):
                                     "text": (
                                         f"状态: {result.get('status', 'unknown')} · "
                                         f"下载: {len(downloaded)} · "
-                                        f"错误: {len(result.get('errors') or [])}"
+                                        f"错误: {len(result.get('errors') or [])} · "
+                                        f"提示: {len(result.get('notes') or [])}"
+                                    ),
+                                },
+                                {
+                                    "component": "div",
+                                    "props": {"class": "text-caption mt-1"},
+                                    "text": "\n".join(
+                                        [
+                                            f"· {Path(str(item.get('path') or '')).name} "
+                                            f"[{item.get('language', '')}]"
+                                            for item in downloaded[:3]
+                                            if isinstance(item, dict)
+                                        ]
+                                        + [
+                                            f"！{message}"
+                                            for message in (
+                                                (result.get("errors") or [])
+                                                + (result.get("notes") or [])
+                                            )[:2]
+                                        ]
                                     ),
                                 },
                             ],
@@ -2355,7 +2422,10 @@ class CSFReborn(_PluginBase):
             "missing": [str(value) for value in result.get("missing") or []],
             "poster": str(payload.get("poster") or ""),
         }
-        reason = "；".join(str(err) for err in (result.get("errors") or [])[:2])
+        reason = "；".join(
+            str(err)
+            for err in ((result.get("errors") or []) + (result.get("notes") or []))[:2]
+        )
         self._queue_upsert(queue, item, str(result.get("status") or "not_found"), reason)
         self._save_queue(queue)
 
@@ -2464,7 +2534,10 @@ class CSFReborn(_PluginBase):
                     self._add_history(payload, result)
                 else:
                     reason = "；".join(
-                        str(err) for err in (result.get("errors") or [])[:2]
+                        str(err)
+                        for err in (
+                            (result.get("errors") or []) + (result.get("notes") or [])
+                        )[:2]
                     )
                     logger.warning(
                         f"SubtitleForge 队列补全失败：{entry.get('title')}"

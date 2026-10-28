@@ -935,7 +935,7 @@ class NativeSubtitleEngine:
             }
 
         downloaded: list[dict[str, Any]] = []
-        errors: list[str] = []
+        notes: list[str] = []
         for cand in candidates:
             if not missing or len(downloaded) >= self._max_subs:
                 break
@@ -946,16 +946,16 @@ class NativeSubtitleEngine:
             try:
                 dests, detected = await self.download_and_place(cand, req)
             except Exception as err:  # noqa: BLE001 - keep going with other candidates
-                errors.append(f"{cand.source}: {err}")
+                notes.append(f"{cand.source}: {err}")
                 continue
 
             if not dests or detected is None:
-                errors.append(f"{cand.source}: 下载或解析失败（{cand.title}）")
+                notes.append(f"{cand.source}: 下载或解析失败（{cand.title}）")
                 continue
 
             covered = {lang for lang in missing if detected.covers([lang])}
             if not covered:
-                errors.append(f"{cand.source}: 语言不符（{detected.display}）")
+                notes.append(f"{cand.source}: 语言不符（{detected.display}）")
                 continue
 
             missing -= covered
@@ -978,7 +978,8 @@ class NativeSubtitleEngine:
         return {
             "status": status,
             "downloaded": downloaded,
-            "errors": errors,
+            "errors": [],
+            "notes": notes,
             "missing": sorted(missing),
         }
 
