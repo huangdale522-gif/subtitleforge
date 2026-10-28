@@ -1,14 +1,15 @@
 {
   "CSFReborn": {
     "name": "SubtitleForge 字幕补全",
-    "description": "监听整理完成事件，并定时扫描媒体库，为缺少外挂或内嵌中文字幕的视频自动补全。",
+    "description": "复用 MoviePilot 媒体元数据，通过 SubtitleBest、ASSRT、迅雷等字幕源为电影、剧集和动漫补全中文字幕。",
     "labels": "字幕,自动化",
-    "version": "0.3.5",
+    "version": "0.7.0",
     "icon": "Moviepilot_A.png",
     "author": "SubtitleForge contributors",
     "level": 1,
     "system_version": ">=2.15.0,<3",
     "history": {
+      "v0.7.0": "按 ChineseSubFinder 作者项目补齐字幕源协议：ASSRT 直接使用 MoviePilot 标题与 IMDb 信息，不再依赖 NFO；新增迅雷文件指纹源和可选 Shooter 源，默认关闭经常超时的 Shooter。插件可随 MoviePilot 启动本机服务，并自动写入媒体根目录与现有凭据配置。",
       "v0.3.5": "跳过蓝光镜像 BDMV/STREAM 分片并清理旧队列中的这类条目，避免把盘内分片误判为电影、下载错配字幕或浪费额度。",
       "v0.3.4": "全库先扫描并把缺失字幕写入持久队列，再按每次和每日额度下载；新增并发保护、今日额度统计，并在 Telegram 等 MoviePilot 通知中列出实际下载的字幕文件。",
       "v0.3.3": "增加字幕源额度熔断：命中限流后冷却 24 小时，单文件最多下载尝试 3 次，ASSRT 命中后停止重复搜索。",

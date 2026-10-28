@@ -26,13 +26,16 @@ class Settings(BaseSettings):
     api_token: str = ""
     media_roots: str = "/media"
     data_dir: Path = Path("/data")
-    provider_order: str = "subtitle_best,opensubtitles,assrt,custom"
+    provider_order: str = "xunlei,assrt,subtitle_best,opensubtitles,custom,shooter"
     subtitle_best_api_key: str = ""
-    subtitle_best_header_token: str = ""
+    # Public client token used by the ChineseSubFinder upstream share-sub API.
+    subtitle_best_header_token: str = "5akwmGAbuFWqgaZf9QwT"
     opensubtitles_api_key: str = ""
     opensubtitles_username: str = ""
     opensubtitles_password: str = ""
     assrt_token: str = ""
+    xunlei_enabled: bool = True
+    shooter_enabled: bool = False
     custom_provider_url: str = ""
     custom_provider_token: str = ""
     allow_machine_translated: bool = False

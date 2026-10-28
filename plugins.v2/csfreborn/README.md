@@ -1,12 +1,13 @@
 # SubtitleForge MoviePilot Adapter
 
 This plugin listens for `TransferComplete` events and can also scan the media
-library on a schedule. It calls a running SubtitleForge service and does not
-embed website scrapers in the MoviePilot process.
+library on a schedule. It can start the bundled SubtitleForge service inside the
+MoviePilot container and uses MoviePilot's own title, year and IMDb metadata.
 
 Configuration:
 
 - `service_url`: the URL reachable from the MoviePilot container.
+- `media_roots`: comma-separated media paths that the service may read.
 - `api_token`: the same token as `SF_API_TOKEN`.
 - `languages`: `zh-Hans` and/or `zh-Hant`.
 - `overwrite`: re-download even when a matching external subtitle exists.
@@ -33,6 +34,10 @@ Configuration:
 - Provider credentials for SubtitleBest, ASSRT, OpenSubtitles, and an optional
   custom JSON source. Blank credential fields preserve values already stored in
   the service's private `.env` file.
+- `xunlei_enabled`: credential-free exact-file fingerprint source, enabled by
+  default.
+- `shooter_enabled`: optional upstream Shooter fingerprint source, disabled by
+  default because its endpoint frequently times out.
 
 The scan recognizes external subtitles by filename/content and embedded
 subtitles through `ffprobe`. Every configured video is inspected before any
@@ -48,6 +53,6 @@ that were downloaded successfully through MoviePilot's configured Telegram or
 other notification channel. An authenticated `POST
 /api/v1/plugin/CSFReborn/scan` starts a manual scan using saved settings.
 
-Both containers must see the media library at the same path. For example, if
-MoviePilot sees a file as `/media/movies/Film.mkv`, SubtitleForge must also see
-`/media/movies/Film.mkv`.
+When the bundled service is managed by the plugin, it uses the paths visible in
+the MoviePilot container. For the common MoviePilot layout, `media_roots` is
+`/plex,/media` and the scan paths start with `/plex`.

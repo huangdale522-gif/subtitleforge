@@ -3,11 +3,13 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from subtitleforge.models import SearchRequest, SubtitleLanguage
+from subtitleforge.models import ProcessRequest, SearchRequest, SubtitleLanguage
 from subtitleforge.providers.assrt import AssrtProvider
 from subtitleforge.providers.custom import CustomHttpProvider
 from subtitleforge.providers.opensubtitles import OpenSubtitlesProvider
+from subtitleforge.providers.shooter import ShooterProvider
 from subtitleforge.providers.subtitle_best import SubtitleBestProvider
+from subtitleforge.providers.xunlei import XunleiProvider
 
 
 @pytest.mark.asyncio
@@ -211,4 +213,93 @@ async def test_subtitle_best_searches_and_downloads_episode() -> None:
         for request in requests
         if request.url.host == "cdn.example"
     )
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_xunlei_matches_exact_file_and_downloads(tmp_path) -> None:
+    video = tmp_path / "Movie.2024.mkv"
+    video.write_bytes(b"x" * 0x10000)
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.host == "sub.xmp.sandai.net":
+            return httpx.Response(
+                200,
+                json={
+                    "sublist": [
+                        {
+                            "scid": "sub-1",
+                            "sname": "Movie.2024.chs.ass",
+                            "language": "简体&英文",
+                            "rate": "5",
+                            "surl": "http://cdn.example/movie.ass",
+                            "svote": 120,
+                            "roffset": 250,
+                        }
+                    ]
+                },
+            )
+        if request.url.host == "cdn.example":
+            return httpx.Response(200, content=b"subtitle")
+        return httpx.Response(404)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = XunleiProvider(client)
+    request = ProcessRequest(
+        video_path=str(video),
+        title="Movie",
+        year=2024,
+        languages=[SubtitleLanguage.SIMPLIFIED],
+    )
+    candidates = await provider.search(request)
+    assert len(candidates) == 1
+    assert candidates[0].language is SubtitleLanguage.SIMPLIFIED
+    assert candidates[0].download_ref["exact_file_match"] is True
+    asset = await provider.download(candidates[0])
+    assert asset.content == b"subtitle"
+    assert any(item.url.host == "sub.xmp.sandai.net" for item in requests)
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_shooter_matches_exact_file_and_downloads(tmp_path) -> None:
+    video = tmp_path / "Movie.2024.mkv"
+    video.write_bytes(b"x" * 0x10000)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "www.shooter.cn":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "desc": "Movie.2024.1080p",
+                        "delay": 150,
+                        "files": [
+                            {
+                                "ext": "srt",
+                                "link": "https://cdn.example/movie.srt",
+                            }
+                        ],
+                    }
+                ],
+            )
+        if request.url.host == "cdn.example":
+            return httpx.Response(200, content=b"subtitle")
+        return httpx.Response(404)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = ShooterProvider(client, enabled=True)
+    request = ProcessRequest(
+        video_path=str(video),
+        title="Movie",
+        year=2024,
+        languages=[SubtitleLanguage.SIMPLIFIED],
+    )
+    candidates = await provider.search(request)
+    assert len(candidates) == 1
+    assert candidates[0].download_ref["exact_file_match"] is True
+    asset = await provider.download(candidates[0])
+    assert asset.content == b"subtitle"
     await client.aclose()

@@ -33,10 +33,10 @@ class CSFReborn(_PluginBase):
 
     plugin_name = "SubtitleForge 字幕补全"
     plugin_desc = (
-        "监听 MoviePilot 整理完成事件，并定时扫描媒体库，为缺少中文字幕的视频自动补全。"
+        "接入 SubtitleBest、ASSRT、迅雷等中文字幕源，为电影、剧集和动漫自动补全字幕。"
     )
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.3.5"
+    plugin_version = "0.7.0"
     plugin_author = "SubtitleForge contributors"
     author_url = "https://github.com/"
     plugin_config_prefix = "csfreborn_"
@@ -49,22 +49,27 @@ class CSFReborn(_PluginBase):
 
         super().__init__()
         self._enabled = False
-        self._service_url = "http://subtitleforge:8600"
+        self._service_url = "http://127.0.0.1:8600"
         self._api_token = ""
+        self._media_roots = "/plex,/media"
         self._languages = ["zh-Hans", "zh-Hant"]
         self._overwrite = False
         self._dry_run = False
         self._notify = True
         self._timeout = 180
-        self._manage_service = False
+        self._manage_service = True
         self._service_dir = Path("/config/subtitleforge")
-        self._provider_order = "subtitle_best,opensubtitles,assrt,custom"
+        self._provider_order = (
+            "xunlei,assrt,subtitle_best,opensubtitles,custom,shooter"
+        )
         self._subtitle_best_api_key = ""
-        self._subtitle_best_header_token = ""
+        self._subtitle_best_header_token = "5akwmGAbuFWqgaZf9QwT"
         self._opensubtitles_api_key = ""
         self._opensubtitles_username = ""
         self._opensubtitles_password = ""
         self._assrt_token = ""
+        self._xunlei_enabled = True
+        self._shooter_enabled = False
         self._custom_provider_url = ""
         self._custom_provider_token = ""
         self._scan_enabled = False
@@ -94,24 +99,25 @@ class CSFReborn(_PluginBase):
         config = config or {}
         self._enabled = bool(config.get("enabled"))
         self._service_url = str(
-            config.get("service_url") or "http://subtitleforge:8600"
+            config.get("service_url") or "http://127.0.0.1:8600"
         ).rstrip("/")
         self._api_token = str(config.get("api_token") or "")
+        self._media_roots = str(config.get("media_roots") or "/plex,/media")
         self._languages = list(config.get("languages") or ["zh-Hans", "zh-Hant"])
         self._overwrite = bool(config.get("overwrite", False))
         self._dry_run = bool(config.get("dry_run", False))
         self._notify = bool(config.get("notify", True))
-        self._manage_service = bool(config.get("manage_service", False))
+        self._manage_service = bool(config.get("manage_service", True))
         self._service_dir = Path(
             str(config.get("service_dir") or "/config/subtitleforge")
         ).expanduser()
         self._provider_order = str(
             config.get("provider_order")
-            or "subtitle_best,opensubtitles,assrt,custom"
+            or "xunlei,assrt,subtitle_best,opensubtitles,custom,shooter"
         )
         self._subtitle_best_api_key = str(config.get("subtitle_best_api_key") or "")
         self._subtitle_best_header_token = str(
-            config.get("subtitle_best_header_token") or ""
+            config.get("subtitle_best_header_token") or "5akwmGAbuFWqgaZf9QwT"
         )
         self._opensubtitles_api_key = str(
             config.get("opensubtitles_api_key") or ""
@@ -123,6 +129,8 @@ class CSFReborn(_PluginBase):
             config.get("opensubtitles_password") or ""
         )
         self._assrt_token = str(config.get("assrt_token") or "")
+        self._xunlei_enabled = bool(config.get("xunlei_enabled", True))
+        self._shooter_enabled = bool(config.get("shooter_enabled", False))
         self._custom_provider_url = str(config.get("custom_provider_url") or "")
         self._custom_provider_token = str(
             config.get("custom_provider_token") or ""
@@ -466,6 +474,7 @@ class CSFReborn(_PluginBase):
         """Persist provider settings to the private service env file."""
 
         values = {
+            "SF_MEDIA_ROOTS": self._media_roots,
             "SF_PROVIDER_ORDER": self._provider_order,
             "SF_SUBTITLE_BEST_API_KEY": self._subtitle_best_api_key,
             "SF_SUBTITLE_BEST_HEADER_TOKEN": self._subtitle_best_header_token,
@@ -473,6 +482,8 @@ class CSFReborn(_PluginBase):
             "SF_OPENSUBTITLES_USERNAME": self._opensubtitles_username,
             "SF_OPENSUBTITLES_PASSWORD": self._opensubtitles_password,
             "SF_ASSRT_TOKEN": self._assrt_token,
+            "SF_XUNLEI_ENABLED": str(self._xunlei_enabled).lower(),
+            "SF_SHOOTER_ENABLED": str(self._shooter_enabled).lower(),
             "SF_CUSTOM_PROVIDER_URL": self._custom_provider_url,
             "SF_CUSTOM_PROVIDER_TOKEN": self._custom_provider_token,
         }
@@ -904,15 +915,53 @@ class CSFReborn(_PluginBase):
                         "props": {
                             "model": "provider_order",
                             "label": "字幕源顺序",
-                            "placeholder": "subtitle_best,opensubtitles,assrt,custom",
+                            "placeholder": (
+                                "xunlei,assrt,subtitle_best,"
+                                "opensubtitles,custom,shooter"
+                            ),
                         },
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "xunlei_enabled",
+                                            "label": "启用迅雷文件指纹字幕源",
+                                            "hint": "免费、按视频文件指纹精确匹配；部分冷门内容可能无结果",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "shooter_enabled",
+                                            "label": "启用 Shooter 指纹源",
+                                            "hint": "上游项目仍保留，但当前网络环境经常超时，默认关闭",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
                     },
                     {
                         "component": "VAlert",
                         "props": {
                             "type": "info",
                             "variant": "tonal",
-                            "text": "字幕源密码留空表示保留 NAS 上已有的值。保存后插件会重载服务，健康页会显示每个源是否已配置。",
+                            "text": "ASSRT 使用 MoviePilot 的标题、年份和 IMDb 信息直接搜索，不再要求视频目录存在 NFO。字幕源密码留空表示保留已有值。",
                         },
                     },
                     {
@@ -927,7 +976,7 @@ class CSFReborn(_PluginBase):
                         "component": "VTextField",
                         "props": {
                             "model": "subtitle_best_header_token",
-                            "label": "SubtitleBest 客户端 Token",
+                            "label": "SubtitleBest 客户端 Token（通常无需修改）",
                             "type": "password",
                         },
                     },
@@ -982,7 +1031,17 @@ class CSFReborn(_PluginBase):
                         "props": {
                             "model": "service_url",
                             "label": "SubtitleForge 服务地址",
-                            "placeholder": "http://subtitleforge:8600",
+                            "placeholder": "http://127.0.0.1:8600",
+                        },
+                    },
+                    {
+                        "component": "VTextField",
+                        "props": {
+                            "model": "media_roots",
+                            "label": "允许扫描的媒体根目录",
+                            "hint": "多个目录用英文逗号分隔；必须与 MoviePilot 容器内路径一致",
+                            "placeholder": "/plex,/media",
+                            "persistent-hint": True,
                         },
                     },
                     {
@@ -1058,22 +1117,27 @@ class CSFReborn(_PluginBase):
             }
         ], {
             "enabled": False,
-            "service_url": "http://subtitleforge:8600",
+            "service_url": "http://127.0.0.1:8600",
             "api_token": "",
+            "media_roots": "/plex,/media",
             "languages": ["zh-Hans", "zh-Hant"],
             "overwrite": False,
             "notify": True,
             "timeout": 180,
             "dry_run": False,
-            "manage_service": False,
+            "manage_service": True,
             "service_dir": "/config/subtitleforge",
-            "provider_order": "subtitle_best,opensubtitles,assrt,custom",
+            "provider_order": (
+                "xunlei,assrt,subtitle_best,opensubtitles,custom,shooter"
+            ),
             "subtitle_best_api_key": "",
-            "subtitle_best_header_token": "",
+            "subtitle_best_header_token": "5akwmGAbuFWqgaZf9QwT",
             "opensubtitles_api_key": "",
             "opensubtitles_username": "",
             "opensubtitles_password": "",
             "assrt_token": "",
+            "xunlei_enabled": True,
+            "shooter_enabled": False,
             "custom_provider_url": "",
             "custom_provider_token": "",
             "scan_enabled": False,

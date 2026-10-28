@@ -25,8 +25,10 @@ from .providers import (
     OpenSubtitlesProvider,
     ProviderError,
     ProviderQuotaError,
+    ShooterProvider,
     SubtitleBestProvider,
     SubtitleProvider,
+    XunleiProvider,
 )
 from .subtitle_files import (
     ensure_path_allowed,
@@ -49,9 +51,13 @@ class SubtitleService:
         self._client = client or httpx.AsyncClient(
             timeout=settings.request_timeout_seconds,
             follow_redirects=True,
-            headers={"User-Agent": "SubtitleForge/0.2.5"},
+            headers={"User-Agent": "SubtitleForge/0.3.0"},
         )
         self.providers: dict[str, SubtitleProvider] = {
+            "xunlei": XunleiProvider(
+                self._client,
+                settings.xunlei_enabled,
+            ),
             "subtitle_best": SubtitleBestProvider(
                 self._client,
                 settings.subtitle_best_api_key,
@@ -64,6 +70,10 @@ class SubtitleService:
                 settings.opensubtitles_password,
             ),
             "assrt": AssrtProvider(self._client, settings.assrt_token),
+            "shooter": ShooterProvider(
+                self._client,
+                settings.shooter_enabled,
+            ),
             "custom": CustomHttpProvider(
                 self._client,
                 settings.custom_provider_url,

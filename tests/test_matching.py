@@ -56,3 +56,14 @@ def test_unknown_language_can_fill_a_missing_language() -> None:
         provider="custom", candidate_id="x", title="Movie.2024"
     )
     assert candidate_allowed(candidate, request)
+
+
+def test_exact_file_fingerprint_skips_title_similarity_filter() -> None:
+    request = SearchRequest(title="本地化标题", year=2025)
+    candidate = SubtitleCandidate(
+        provider="xunlei",
+        candidate_id="hash-match",
+        title="Unrelated.Release.Name",
+        download_ref={"exact_file_match": True},
+    )
+    assert candidate_allowed(candidate, request)

@@ -15,6 +15,8 @@ installation logic, or MoviePilot integration.
 - SubtitleBest share-sub adapter (account key plus API client token).
 - Official OpenSubtitles API adapter (API key plus username/password for downloads).
 - ASSRT adapter (token).
+- Xunlei adapter using the exact video file CID fingerprint.
+- Optional Shooter adapter using the exact video file hash fingerprint.
 - Custom HTTP manifest adapter for your own source.
 - Media-id/title matching, season/episode filtering, machine-translation filtering.
 - External and embedded subtitle detection using `ffprobe`.
@@ -39,9 +41,11 @@ Movie.2024.1080p.zh-tw.ass
 
 ## Source policy
 
-SubtitleBest, OpenSubtitles, and ASSRT are opt-in. They require accounts and
-credentials, and their quotas and terms can change. The service never scrapes
-a site by default.
+SubtitleBest, OpenSubtitles, and ASSRT require accounts and credentials. Xunlei
+is credential-free and enabled by default because it matches the exact video
+fingerprint. Shooter follows the protocol retained by the upstream
+ChineseSubFinder project, but is disabled by default because its endpoint often
+times out from NAS networks. Provider quotas and terms can change.
 For another source, implement the JSON manifest contract below or add a provider
 adapter under `src/subtitleforge/providers/`.
 
@@ -78,13 +82,15 @@ Copy `.env.example` to `.env`. The most important values are:
 | `SF_OPENSUBTITLES_USERNAME` | OpenSubtitles account username |
 | `SF_OPENSUBTITLES_PASSWORD` | OpenSubtitles account password |
 | `SF_ASSRT_TOKEN` | ASSRT API token |
+| `SF_XUNLEI_ENABLED` | Enable the Xunlei file-fingerprint source |
+| `SF_SHOOTER_ENABLED` | Enable the optional Shooter source |
 | `SF_CUSTOM_PROVIDER_URL` | Optional custom manifest URL |
 | `SF_ALLOW_MACHINE_TRANSLATED` | Allow machine-translated candidates |
 
 Provider order is configured with `SF_PROVIDER_ORDER`, for example:
 
 ```text
-SF_PROVIDER_ORDER=subtitle_best,assrt,opensubtitles,custom
+SF_PROVIDER_ORDER=xunlei,assrt,subtitle_best,opensubtitles,custom,shooter
 ```
 
 ## API
@@ -213,6 +219,7 @@ See [NAS deployment](docs/NAS_DEPLOY.md) and
 ## Licensing and attribution
 
 SubtitleForge is MIT licensed. ChineseSubFinder is also MIT licensed; its
-license and attribution are retained in this repository's history notes. This
-project intentionally reimplements the service boundary and provider adapters
-rather than maintaining a fork of the stopped Go application.
+license and attribution are retained in this repository. The Xunlei and Shooter
+fingerprint protocols were reimplemented in Python from the upstream project,
+which stopped receiving source updates in 2023. SubtitleForge does not bundle
+the Go application.

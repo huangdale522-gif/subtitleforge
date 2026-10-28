@@ -82,6 +82,10 @@ def candidate_allowed(candidate: SubtitleCandidate, request: SearchRequest) -> b
             return False
     if request.year and candidate.year and abs(candidate.year - request.year) > 1:
         return False
+    if candidate.download_ref.get("exact_file_match"):
+        # Hash providers bind the subtitle to this exact video, so a release
+        # name that differs from the scraper title must not reject it.
+        return True
     return candidate_title_score(candidate, request) >= 0.45
 
 

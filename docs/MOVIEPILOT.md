@@ -31,15 +31,18 @@ installation method.
 In the MoviePilot plugin page:
 
 1. Enable the plugin.
-2. Set `service_url`.
-3. Paste the same token used by `SF_API_TOKEN`.
-4. Choose `zh-Hans` and/or `zh-Hant`.
-5. Keep overwrite off unless you explicitly want replacement.
-6. Configure `scan_paths` for foreign movies, foreign TV, documentaries, and
+2. Leave `service_url` as `http://127.0.0.1:8600` when the plugin manages the
+   bundled service.
+3. Set `media_roots` to the media paths visible inside the MoviePilot
+   container, commonly `/plex,/media`.
+4. Paste the same token used by `SF_API_TOKEN` if the external service uses one.
+5. Choose `zh-Hans` and/or `zh-Hant`.
+6. Keep overwrite off unless you explicitly want replacement.
+7. Configure `scan_paths` for foreign movies, foreign TV, documentaries, and
    anime, and keep Chinese-language libraries in `scan_exclude_paths`.
-7. Set `scan_max_files` for one batch and `scan_daily_download_limit` for the
+8. Set `scan_max_files` for one batch and `scan_daily_download_limit` for the
    total successful downloads allowed per local day.
-8. Leave `scan_dry_run` enabled for the first full-library inventory. The
+9. Leave `scan_dry_run` enabled for the first full-library inventory. The
    preview checks external and embedded subtitles without calling providers.
 
 Use the plugin's `/health` endpoint to check the service.
