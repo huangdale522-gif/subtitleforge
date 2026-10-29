@@ -127,6 +127,9 @@ class ScanMediaMetadata(BaseModel):
 
     tmdb_id: int | None = Field(default=None, ge=1)
     media_type: MediaType | None = None
+    title: str | None = Field(default=None, max_length=512)
+    original_title: str | None = Field(default=None, max_length=512)
+    year: int | None = Field(default=None, ge=1800, le=2200)
     genres: list[str] = Field(default_factory=list)
     origin_countries: list[str] = Field(default_factory=list)
     original_language: str | None = Field(default=None, max_length=32)
@@ -259,6 +262,8 @@ class ScanResult(BaseModel):
     status: str
     discovered: int = 0
     checked: int = 0
+    metadata_applied: int = 0
+    metadata_animation: int = 0
     excluded_domestic_anime: int = 0
     existing: int = 0
     queued: int = 0

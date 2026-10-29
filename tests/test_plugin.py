@@ -258,7 +258,7 @@ def test_media_poster_url_builds_tmdb_poster_url() -> None:
     )
 
     assert plugin._media_poster_url(media) == (
-        "/api/v1/system/img/0?"
+        "/api/v1/system/img/1?"
         "imgurl=https%3A%2F%2Fimage.tmdb.org%2Ft%2Fp%2Fw500%2Fposter.jpg"
     )
 
@@ -296,7 +296,7 @@ def test_tmdb_image_url_proxies_default_domain_through_moviepilot(
     monkeypatch.setitem(sys.modules, "app.runtime.config", settings_module)
 
     assert plugin_module.CSFReborn._tmdb_image_url("/poster.jpg") == (
-        "/api/v1/system/img/0?"
+        "/api/v1/system/img/1?"
         "imgurl=https%3A%2F%2Fimage.tmdb.org%2Ft%2Fp%2Fw500%2Fposter.jpg"
     )
 
@@ -340,6 +340,30 @@ def test_domestic_anime_filter_uses_moviepilot_metadata() -> None:
     )
     assert not plugin._is_domestic_anime(
         unknown, ["/plex/电影/普通电影/普通电影.mkv"]
+    )
+
+
+def test_domestic_anime_filter_reads_object_tmdb_info() -> None:
+    plugin_module = load_moviepilot_plugin()
+    plugin = plugin_module.CSFReborn()
+    plugin._domestic_anime_regions = "CN,TW,HK"
+    plugin._domestic_anime_path_keywords = "国漫,国产动漫"
+    media = types.SimpleNamespace(
+        genre_ids=[],
+        origin_country=[],
+        production_countries=[],
+        original_language=None,
+        tmdb_info=types.SimpleNamespace(
+            genre_ids=[16],
+            origin_country=["CN"],
+            production_countries=[],
+            original_language="zh",
+        ),
+    )
+
+    assert plugin._is_domestic_anime(
+        media,
+        ["/plex/动漫/某部动画/Season 1/01.mkv"],
     )
 
 
@@ -387,6 +411,7 @@ def test_scan_library_sends_moviepilot_tmdb_metadata(tmp_path: Path) -> None:
     plugin.chain = types.SimpleNamespace(
         tmdb_info=lambda **_kwargs: {
             "name": "牧神记",
+            "original_name": "牧神记",
             "first_air_date": "2024-10-27",
             "genre_ids": [16],
             "origin_country": ["CN"],
@@ -409,6 +434,9 @@ def test_scan_library_sends_moviepilot_tmdb_metadata(tmp_path: Path) -> None:
     metadata = captured["media_metadata"][0]
     assert metadata["tmdb_id"] == 236534
     assert metadata["media_type"] == "tv"
+    assert metadata["title"] == "牧神记"
+    assert metadata["original_title"] == "牧神记"
+    assert metadata["year"] == 2024
     assert metadata["origin_countries"] == ["CN"]
     assert metadata["genres"] == ["16"]
     assert "mushenji.jpg" in metadata["poster_url"]

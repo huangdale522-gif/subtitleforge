@@ -888,6 +888,14 @@ def _path_prefix_matches(path: Path, prefix: str) -> bool:
     )
 
 
+def _normalized_title(value: Any) -> str:
+    """Normalize titles for a conservative same-title metadata fallback."""
+
+    text = TMDB_PATTERN.sub("", str(value or ""))
+    text = YEAR_PATTERN.sub("", text)
+    return "".join(character for character in text.casefold() if character.isalnum())
+
+
 def _metadata_match_score(
     media: DiscoveredVideo,
     metadata: ScanMediaMetadata,
@@ -903,13 +911,34 @@ def _metadata_match_score(
             score = max(score, 5_000)
         else:
             score = max(score, 4_000)
+    media_titles = {
+        title
+        for title in (
+            _normalized_title(media.title),
+            _normalized_title(media.original_title),
+        )
+        if title
+    }
+    metadata_titles = {
+        title
+        for title in (
+            _normalized_title(metadata.title),
+            _normalized_title(metadata.original_title),
+        )
+        if title
+    }
+    if media_titles.intersection(metadata_titles):
+        if metadata.year and metadata.year == media.year:
+            score = max(score, 2_000)
+        elif metadata.media_type in (None, media.media_type):
+            score = max(score, 1_000)
     return score
 
 
 def _apply_scan_metadata(
     media: DiscoveredVideo,
     values: list[ScanMediaMetadata],
-) -> None:
+) -> bool:
     """Overlay MoviePilot metadata without weakening existing NFO evidence."""
 
     matches = [
@@ -918,7 +947,7 @@ def _apply_scan_metadata(
         if (score := _metadata_match_score(media, metadata)) > 0
     ]
     if not matches:
-        return
+        return False
     _, metadata = max(matches, key=lambda item: item[0])
     if metadata.genres:
         media.genres = list(dict.fromkeys([*metadata.genres, *media.genres]))
@@ -929,6 +958,7 @@ def _apply_scan_metadata(
     if metadata.poster_url:
         media.poster_url = metadata.poster_url
         media.poster_source = "moviepilot"
+    return True
 
 
 def _region_key(value: Any) -> str:
@@ -1439,7 +1469,10 @@ class LibraryScanner:
         # Phase 1: inspect every file locally. This never queries a provider.
         for path, root in ordered:
             discovered_media = parse_media_path(path, root)
-            _apply_scan_metadata(discovered_media, request.media_metadata)
+            if _apply_scan_metadata(discovered_media, request.media_metadata):
+                result.metadata_applied += 1
+            if _is_animation_media(discovered_media, path):
+                result.metadata_animation += 1
             if (
                 request.exclude_domestic_anime
                 and is_domestic_anime(

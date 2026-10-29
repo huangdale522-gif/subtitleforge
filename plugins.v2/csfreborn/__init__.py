@@ -62,7 +62,7 @@ class CSFReborn(_PluginBase):
         "队列按季度展示封面，并支持手动挑选字幕。"
     )
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.10.3"
+    plugin_version = "0.10.4"
     plugin_author = "SubtitleForge contributors"
     author_url = "https://github.com/"
     plugin_config_prefix = "csfreborn_"
@@ -479,7 +479,9 @@ class CSFReborn(_PluginBase):
                 "SubtitleForge 媒体库扫描完成："
                 f"发现 {result.get('discovered', 0)}，"
                 f"检查 {result.get('checked', 0)}，"
-                f"下载 {result.get('downloaded', 0)}"
+                f"下载 {result.get('downloaded', 0)}，"
+                f"元数据命中 {result.get('metadata_applied', 0)}，"
+                f"排除国产动漫 {result.get('excluded_domestic_anime', 0)}"
             )
             if (
                 notify_completion
@@ -516,11 +518,40 @@ class CSFReborn(_PluginBase):
             item = dict(metadata)
             item["path_prefixes"] = sorted(target["path_prefixes"])
             metadata_items.append(item)
+        country_count = sum(
+            1 for item in metadata_items if item.get("origin_countries")
+        )
+        genre_count = sum(1 for item in metadata_items if item.get("genres"))
+        language_count = sum(
+            1 for item in metadata_items if item.get("original_language")
+        )
         if targets:
             logger.info(
                 "SubtitleForge: 已为 "
                 f"{len(metadata_items)}/{min(len(targets), MAX_TMDB_METADATA_ITEMS)} "
-                "个媒体读取 MoviePilot/TMDB 元数据"
+                "个媒体读取 MoviePilot/TMDB 元数据；"
+                f"国家字段 {country_count} 条、题材字段 {genre_count} 条、"
+                f"语言字段 {language_count} 条"
+            )
+        incomplete = [
+            item
+            for item in metadata_items
+            if not item.get("origin_countries") or not item.get("genres")
+        ]
+        if incomplete:
+            samples = "; ".join(
+                (
+                    f"tmdb={item.get('tmdb_id')} "
+                    f"title={item.get('title') or '-'} "
+                    f"countries={item.get('origin_countries') or []} "
+                    f"genres={item.get('genres') or []} "
+                    f"language={item.get('original_language') or '-'}"
+                )
+                for item in incomplete[:5]
+            )
+            logger.warning(
+                "SubtitleForge: TMDB 元数据字段不完整 "
+                f"{len(incomplete)}/{len(metadata_items)} 条；示例：{samples}"
             )
         if missing:
             logger.warning(
@@ -775,17 +806,39 @@ class CSFReborn(_PluginBase):
                 break
         language_values = cls._metadata_values(
             info,
-            ("original_language", "original_languages"),
+            (
+                "original_language",
+                "original_languages",
+                "language",
+                "languages",
+            ),
+        )
+        original_title_values = cls._metadata_values(
+            info,
+            ("original_title", "original_name"),
         )
         return {
             "tmdb_id": tmdb_id,
             "media_type": media_type,
             "title": title_values[0] if title_values else None,
+            "original_title": (
+                original_title_values[0] if original_title_values else None
+            ),
             "year": year,
-            "genres": cls._metadata_values(info, ("genre_ids", "genres")),
+            "genres": cls._metadata_values(
+                info,
+                ("genre_ids", "genres", "genre"),
+            ),
             "origin_countries": cls._metadata_values(
                 info,
-                ("origin_country", "production_countries", "country"),
+                (
+                    "origin_country",
+                    "production_countries",
+                    "country",
+                    "countries",
+                    "country_codes",
+                    "countryOfOrigin",
+                ),
             ),
             "original_language": (
                 language_values[0] if language_values else None
@@ -846,7 +899,7 @@ class CSFReborn(_PluginBase):
             getattr(settings, "API_V1_STR", "/api/v1") or "/api/v1"
         ).rstrip("/")
         return (
-            f"{api_prefix}/system/img/0?"
+            f"{api_prefix}/system/img/1?"
             f"imgurl={quote(source_url, safe='')}"
         )
 
@@ -3299,9 +3352,9 @@ class CSFReborn(_PluginBase):
         for name in names:
             values.extend(cls._as_values(cls._field(mediainfo, name)))
         tmdb_info = cls._field(mediainfo, "tmdb_info")
-        if isinstance(tmdb_info, Mapping):
+        if tmdb_info is not None:
             for name in names:
-                values.extend(cls._as_values(tmdb_info.get(name)))
+                values.extend(cls._as_values(cls._field(tmdb_info, name)))
         return list(dict.fromkeys(values))
 
     @staticmethod

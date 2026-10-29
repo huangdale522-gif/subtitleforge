@@ -313,14 +313,18 @@ async def test_scan_uses_moviepilot_metadata_for_domestic_anime_and_posters(
                     ScanMediaMetadata(
                         tmdb_id=236534,
                         media_type=MediaType.TV,
+                        title="牧神记",
+                        year=2024,
                         genres=["16"],
                         origin_countries=["CN"],
                         original_language="zh",
                         poster_url="https://image.tmdb.org/t/p/w500/mushenji.jpg",
                     ),
                     ScanMediaMetadata(
-                        tmdb_id=209867,
                         media_type=MediaType.TV,
+                        title="葬送的芙莉莲",
+                        original_title="Sousou no Frieren",
+                        year=2023,
                         genres=["16"],
                         origin_countries=["JP"],
                         original_language="ja",
@@ -334,6 +338,8 @@ async def test_scan_uses_moviepilot_metadata_for_domestic_anime_and_posters(
         await service.close()
 
     assert result.discovered == 2
+    assert result.metadata_applied == 2
+    assert result.metadata_animation == 2
     assert result.excluded_domestic_anime == 1
     assert result.checked == 1
     assert provider.search_calls >= 1
