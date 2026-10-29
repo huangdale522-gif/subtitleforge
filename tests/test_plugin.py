@@ -1,3 +1,4 @@
+import asyncio
 import importlib.util
 import json
 import sys
@@ -87,6 +88,7 @@ def test_scan_notification_lists_actual_downloaded_files() -> None:
             "discovered": 651,
             "checked": 651,
             "existing": 649,
+            "excluded_domestic_anime": 4,
             "queue_remaining": 2,
             "downloaded": 1,
             "downloads_today": 3,
@@ -109,6 +111,7 @@ def test_scan_notification_lists_actual_downloaded_files() -> None:
     )
 
     assert "全库发现 651 个视频" in text
+    assert "排除国产动漫 4 个" in text
     assert "今日额度 3/10" in text
     assert "Some Show S02E03" in text
     assert "Some.Show.S02E03.chi.zh-cn.ass" in text
@@ -156,3 +159,72 @@ def test_status_page_explains_quota_queue_and_provider_health() -> None:
     assert "短暂冷却 15 分钟" in rendered
     assert "冷却中" in rendered
     assert "ASSRT" in rendered
+
+
+def test_domestic_anime_filter_uses_moviepilot_metadata() -> None:
+    plugin_module = load_moviepilot_plugin()
+    plugin = plugin_module.CSFReborn()
+    plugin._domestic_anime_regions = "CN,TW,HK"
+    plugin._domestic_anime_path_keywords = "国漫,国产动漫"
+
+    domestic = types.SimpleNamespace(
+        genre_ids=[16],
+        origin_country=["CN"],
+        production_countries=[],
+        original_language="zh",
+        tmdb_info={},
+    )
+    foreign = types.SimpleNamespace(
+        genre_ids=[16],
+        origin_country=["JP"],
+        production_countries=[],
+        original_language="ja",
+        tmdb_info={},
+    )
+    unknown = types.SimpleNamespace(
+        genre_ids=[16],
+        origin_country=[],
+        production_countries=[],
+        original_language=None,
+        tmdb_info={},
+    )
+
+    assert plugin._is_domestic_anime(
+        domestic, ["/plex/动漫/某部动画/Season 1/01.mkv"]
+    )
+    assert not plugin._is_domestic_anime(
+        foreign, ["/plex/动漫/Foreign/Season 1/01.mkv"]
+    )
+    assert plugin._is_domestic_anime(
+        unknown, ["/plex/动漫/国漫/某部动画/01.mkv"]
+    )
+    assert not plugin._is_domestic_anime(
+        unknown, ["/plex/电影/普通电影/普通电影.mkv"]
+    )
+
+
+def test_scan_library_sends_domestic_anime_filter_settings() -> None:
+    plugin_module = load_moviepilot_plugin()
+    plugin = plugin_module.CSFReborn()
+    plugin._enabled = True
+    plugin._scan_paths = "/plex/动漫"
+    plugin._scan_exclude_paths = ""
+    plugin._exclude_domestic_anime = True
+    plugin._domestic_anime_regions = "CN,TW,HK"
+    plugin._domestic_anime_path_keywords = "国漫,国产动画"
+    plugin._notify = False
+    captured: dict = {}
+
+    def request_json(method, path, payload, timeout=None):
+        captured.update(payload)
+        return {"status": "ok", "items": []}
+
+    plugin._request_json = request_json
+    plugin.save_data = lambda *_args, **_kwargs: None
+
+    result = asyncio.run(plugin.scan_library())
+
+    assert result["status"] == "ok"
+    assert captured["exclude_domestic_anime"] is True
+    assert captured["domestic_anime_regions"] == ["CN", "TW", "HK"]
+    assert captured["domestic_anime_path_keywords"] == ["国漫", "国产动画"]

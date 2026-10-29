@@ -18,6 +18,13 @@ Configuration:
   foreign TV, documentaries, and anime on the NAS layout.
 - `scan_exclude_paths`: paths excluded from scanning, for example Chinese films
   and domestic TV.
+- `exclude_domestic_anime`: skip animation identified as domestic by NFO or
+  MoviePilot metadata. This applies to both scheduled scans and
+  `TransferComplete` events.
+- `domestic_anime_regions`: country/region codes used by the domestic-anime
+  filter. The default is `CN,TW,HK`.
+- `domestic_anime_path_keywords`: fallback path keywords such as `国漫`,
+  `国产`, or `国创` when NFO metadata has no country information.
 - `scan_dry_run`: only inspect and never write subtitles. This is enabled
   by default until library identification has been reviewed. Preview mode does
   not query subtitle providers, so it consumes no provider quota.
@@ -44,6 +51,11 @@ subtitles through `ffprobe`. Every configured video is inspected before any
 subtitle source is queried. Blu-ray `BDMV/STREAM` fragments are ignored because
 they are not standalone media files. Existing Chinese subtitles are skipped
 unless `overwrite` is enabled; missing items are saved in a persistent queue.
+Domestic animation is excluded before queueing when NFO metadata identifies
+animation plus a configured region, or when its path contains a configured
+keyword. A Chinese title by itself is not treated as evidence of domestic
+animation, so Japanese anime is not excluded merely because its title is in
+Chinese.
 Providers are queried only while consuming that queue, in configured order, and
 later providers are skipped when the first one returns usable candidates.
 Rate-limit or quota responses put that provider into a 24-hour cooldown; HTTP

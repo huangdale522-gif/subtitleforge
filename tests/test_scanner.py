@@ -112,6 +112,92 @@ def test_parse_path_reads_imdb_from_kodi_nfo(tmp_path: Path) -> None:
     assert media.tmdb_id == 7654321
 
 
+def test_parse_path_reads_anime_metadata_from_nfo(tmp_path: Path) -> None:
+    root = tmp_path / "动漫"
+    video = (
+        root
+        / "某部动画 (2024) {tmdbid=123}"
+        / "Season 1"
+        / "某部动画 S01E01.mkv"
+    )
+    video.parent.mkdir(parents=True)
+    video.write_bytes(b"video")
+    (video.parent.parent / "tvshow.nfo").write_text(
+        (
+            "<tvshow>"
+            "<genre>Animation</genre>"
+            "<origin_country>CN</origin_country>"
+            "<original_language>zh</original_language>"
+            "</tvshow>"
+        ),
+        encoding="utf-8",
+    )
+
+    media = parse_media_path(video, root)
+
+    assert media.genres == ["Animation"]
+    assert media.origin_countries == ["CN"]
+    assert media.original_language == "zh"
+
+
+@pytest.mark.asyncio
+async def test_scan_excludes_domestic_anime_but_keeps_foreign_anime(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "动漫"
+    domestic = (
+        root
+        / "国产动画 (2024) {tmdbid=1}"
+        / "Season 1"
+        / "国产动画 S01E01.mkv"
+    )
+    foreign = (
+        root
+        / "Foreign Anime (2024) {tmdbid=2}"
+        / "Season 1"
+        / "Foreign.Anime.S01E01.mkv"
+    )
+    path_only = root / "国漫" / "无元数据 (2024)" / "无元数据.mkv"
+    for video in (domestic, foreign, path_only):
+        video.parent.mkdir(parents=True)
+        video.write_bytes(b"video")
+    (domestic.parent.parent / "tvshow.nfo").write_text(
+        "<tvshow><genre>动画</genre><origin_country>CN</origin_country></tvshow>",
+        encoding="utf-8",
+    )
+    (foreign.parent.parent / "tvshow.nfo").write_text(
+        (
+            "<tvshow><genre>Animation</genre>"
+            "<origin_country>JP</origin_country>"
+            "<original_language>ja</original_language></tvshow>"
+        ),
+        encoding="utf-8",
+    )
+
+    service = make_service(tmp_path)
+    provider = ScanProvider()
+    service.providers["custom"] = provider
+    scanner = LibraryScanner(service, service.settings.data_dir)
+    try:
+        result = await scanner.scan(
+            ScanRequest(
+                paths=[str(root)],
+                exclude_domestic_anime=True,
+                domestic_anime_regions=["CN", "TW", "HK"],
+                languages=[SubtitleLanguage.SIMPLIFIED],
+                dry_run=True,
+            )
+        )
+    finally:
+        await service.close()
+
+    assert result.discovered == 3
+    assert result.checked == 1
+    assert result.excluded_domestic_anime == 2
+    assert result.items[0].title == "Foreign Anime"
+    assert provider.search_calls == 0
+
+
 @pytest.mark.asyncio
 async def test_scanner_status_reports_live_quota_and_queue(tmp_path: Path) -> None:
     video = tmp_path / "Movie (2024)" / "Movie.2024.mkv"

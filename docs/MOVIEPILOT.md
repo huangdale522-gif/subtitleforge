@@ -40,9 +40,12 @@ In the MoviePilot plugin page:
 6. Keep overwrite off unless you explicitly want replacement.
 7. Configure `scan_paths` for foreign movies, foreign TV, documentaries, and
    anime, and keep Chinese-language libraries in `scan_exclude_paths`.
-8. Set `scan_max_files` for one batch and `scan_daily_download_limit` for the
+8. Keep `exclude_domestic_anime` enabled if domestic animation should not
+   consume subtitle quota. The default regions are `CN,TW,HK`; path keywords
+   such as `国漫` and `国创` are used only as a fallback.
+9. Set `scan_max_files` for one batch and `scan_daily_download_limit` for the
    total successful downloads allowed per local day.
-9. Leave `scan_dry_run` enabled for the first full-library inventory. The
+10. Leave `scan_dry_run` enabled for the first full-library inventory. The
    preview checks external and embedded subtitles without calling providers.
 
 Use the plugin's `/health` endpoint to check the service.
@@ -54,6 +57,12 @@ provider. Files without the requested Chinese subtitle are stored in a
 persistent queue; only queued items then consume provider downloads. Scheduled
 and manual scans share the same daily ledger, and simultaneous triggers are
 serialized.
+
+Domestic-animation exclusion uses NFO `genre`, `origin_country`/`country`, and
+`original_language` fields during scans, and MoviePilot `genre_ids`,
+`origin_country`, and `production_countries` during `TransferComplete` events.
+A Chinese title alone is not used as a classification signal, so Japanese
+animation with a Chinese title remains eligible.
 
 The plugin status page uses `GET /v1/status` to show the live local daily
 ledger, queue due/deferred counts, and provider cooldown state. The configured

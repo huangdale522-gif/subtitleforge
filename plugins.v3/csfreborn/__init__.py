@@ -8,6 +8,7 @@ import os
 import signal
 import subprocess
 import sys
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -36,7 +37,7 @@ class CSFReborn(_PluginBase):
         "接入 SubtitleBest、ASSRT、迅雷等中文字幕源，为电影、剧集和动漫自动补全字幕。"
     )
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.8.1"
+    plugin_version = "0.9.0"
     plugin_author = "SubtitleForge contributors"
     author_url = "https://github.com/"
     plugin_config_prefix = "csfreborn_"
@@ -78,6 +79,11 @@ class CSFReborn(_PluginBase):
             "/plex/电视剧/纪录片,/plex/动漫"
         )
         self._scan_exclude_paths = "/plex/电影/华语电影,/plex/电视剧/国产剧"
+        self._exclude_domestic_anime = True
+        self._domestic_anime_regions = "CN,TW,HK"
+        self._domestic_anime_path_keywords = (
+            "国漫,国产,国产动漫,国产动画,国产番剧,国创"
+        )
         self._scan_video_extensions = (
             ".mkv,.mp4,.avi,.mov,.wmv,.m4v,.ts,.m2ts,.webm"
         )
@@ -139,6 +145,17 @@ class CSFReborn(_PluginBase):
         self._scan_paths = str(config.get("scan_paths") or self._scan_paths)
         self._scan_exclude_paths = str(
             config.get("scan_exclude_paths") or self._scan_exclude_paths
+        )
+        self._exclude_domestic_anime = bool(
+            config.get("exclude_domestic_anime", True)
+        )
+        self._domestic_anime_regions = str(
+            config.get("domestic_anime_regions")
+            or self._domestic_anime_regions
+        )
+        self._domestic_anime_path_keywords = str(
+            config.get("domestic_anime_path_keywords")
+            or self._domestic_anime_path_keywords
         )
         self._scan_video_extensions = str(
             config.get("scan_video_extensions") or self._scan_video_extensions
@@ -279,6 +296,13 @@ class CSFReborn(_PluginBase):
         payload = {
             "paths": self._split_list(self._scan_paths),
             "exclude_paths": self._split_list(self._scan_exclude_paths),
+            "exclude_domestic_anime": self._exclude_domestic_anime,
+            "domestic_anime_regions": self._split_list(
+                self._domestic_anime_regions
+            ),
+            "domestic_anime_path_keywords": self._split_list(
+                self._domestic_anime_path_keywords
+            ),
             "video_extensions": self._split_list(self._scan_video_extensions),
             "languages": self._scan_languages or self._languages,
             "max_files": self._scan_max_files,
@@ -347,6 +371,9 @@ class CSFReborn(_PluginBase):
                 f"{result.get('daily_download_limit', 0)}。"
             ),
         ]
+        excluded = int(result.get("excluded_domestic_anime") or 0)
+        if excluded:
+            lines.append(f"已按规则排除国产动漫 {excluded} 个。")
         downloaded: list[str] = []
         for item in result.get("items") or []:
             if not isinstance(item, dict):
@@ -603,6 +630,15 @@ class CSFReborn(_PluginBase):
             logger.debug("SubtitleForge: TransferComplete has no mediainfo")
             return
         media_type = self._media_type(getattr(mediainfo, "type", None))
+        if (
+            self._exclude_domestic_anime
+            and self._is_domestic_anime(mediainfo, paths)
+        ):
+            logger.info(
+                "SubtitleForge: 已跳过国产动漫 "
+                f"{getattr(mediainfo, 'title', '') or '未知标题'}"
+            )
+            return
         common_payload = {
             "title": str(getattr(mediainfo, "title", "") or ""),
             "original_title": getattr(mediainfo, "original_title", None),
@@ -831,6 +867,35 @@ class CSFReborn(_PluginBase):
                             "label": "排除目录",
                             "rows": 2,
                             "placeholder": "/plex/电影/华语电影\n/plex/电视剧/国产剧",
+                        },
+                    },
+                    {
+                        "component": "VSwitch",
+                        "props": {
+                            "model": "exclude_domestic_anime",
+                            "label": "排除国产动漫（动画 + 中国地区）",
+                            "hint": "同时作用于定时扫描和整理完成后的实时补全",
+                            "persistent-hint": True,
+                        },
+                    },
+                    {
+                        "component": "VTextField",
+                        "props": {
+                            "model": "domestic_anime_regions",
+                            "label": "国产动漫地区",
+                            "placeholder": "CN,TW,HK",
+                            "hint": "留空则不按地区排除；默认包含中国大陆、台湾和香港",
+                            "persistent-hint": True,
+                        },
+                    },
+                    {
+                        "component": "VTextField",
+                        "props": {
+                            "model": "domestic_anime_path_keywords",
+                            "label": "国产动漫路径关键词（兜底）",
+                            "placeholder": "国漫,国产,国产动漫,国产动画,国产番剧,国创",
+                            "hint": "当 NFO 缺少国家信息时，可用目录名如 /动漫/国漫 排除",
+                            "persistent-hint": True,
                         },
                     },
                     {
@@ -1146,6 +1211,11 @@ class CSFReborn(_PluginBase):
                 "/plex/电视剧/纪录片,/plex/动漫"
             ),
             "scan_exclude_paths": "/plex/电影/华语电影,/plex/电视剧/国产剧",
+            "exclude_domestic_anime": True,
+            "domestic_anime_regions": "CN,TW,HK",
+            "domestic_anime_path_keywords": (
+                "国漫,国产,国产动漫,国产动画,国产番剧,国创"
+            ),
             "scan_video_extensions": (
                 ".mkv,.mp4,.avi,.mov,.wmv,.m4v,.ts,.m2ts,.webm"
             ),
@@ -1328,6 +1398,14 @@ class CSFReborn(_PluginBase):
                         f"Shooter {'开启' if self._shooter_enabled else '关闭'}",
                         "success" if self._shooter_enabled else "default",
                     ),
+                    self._chip(
+                        (
+                            "国产动漫排除"
+                            if self._exclude_domestic_anime
+                            else "国产动漫保留"
+                        ),
+                        "success" if self._exclude_domestic_anime else "default",
+                    ),
                 ],
             },
         ]
@@ -1390,7 +1468,9 @@ class CSFReborn(_PluginBase):
                                     (
                                         f"发现 {latest_scan.get('discovered', 0)} · "
                                         f"已有 {latest_scan.get('existing', 0)} · "
-                                        f"缺失 {latest_scan.get('queued', 0)}"
+                                        f"缺失 {latest_scan.get('queued', 0)} · "
+                                        f"排除国产动漫 "
+                                        f"{latest_scan.get('excluded_domestic_anime', 0)}"
                                     ),
                                     "mdi-library-shelves",
                                     "secondary",
@@ -1433,7 +1513,9 @@ class CSFReborn(_PluginBase):
                                     "1. 先全库检查",
                                     (
                                         "逐个检查外挂和内嵌中文字幕。只读本地文件，"
-                                        "这一步不访问任何字幕源。"
+                                        "这一步不访问任何字幕源。开启国产动漫排除时，"
+                                        "先按动画类型和国家/地区过滤，日漫不会仅因"
+                                        "中文标题被排除；缺少元数据时再用路径关键词兜底。"
                                     ),
                                 ),
                                 self._logic_line(
@@ -1564,6 +1646,8 @@ class CSFReborn(_PluginBase):
                                         f"发现 {latest_scan.get('discovered', 0)} · "
                                         f"检查 {latest_scan.get('checked', 0)} · "
                                         f"已有 {latest_scan.get('existing', 0)} · "
+                                        f"排除国产动漫 "
+                                        f"{latest_scan.get('excluded_domestic_anime', 0)} · "
                                         f"缺失入队 {latest_scan.get('queued', 0)} · "
                                         f"本轮下载 {latest_scan.get('downloaded', 0)} · "
                                         f"队列剩余 "
@@ -2160,6 +2244,149 @@ class CSFReborn(_PluginBase):
         self.save_data(
             self._history_key,
             json.dumps(history[: self._history_max], ensure_ascii=False),
+        )
+
+    @staticmethod
+    def _field(value: Any, name: str) -> Any:
+        """Read a field from either a MoviePilot model or a mapping."""
+
+        if isinstance(value, Mapping):
+            return value.get(name)
+        return getattr(value, name, None)
+
+    @classmethod
+    def _as_values(cls, value: Any) -> list[str]:
+        """Flatten scalar, list, or metadata-dict values into text."""
+
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [value.strip()] if value.strip() else []
+        if isinstance(value, Mapping):
+            values: list[str] = []
+            for key in ("value", "iso_3166_1", "code", "name", "title", "id"):
+                item = value.get(key)
+                if item not in (None, ""):
+                    values.extend(cls._as_values(item))
+            return list(dict.fromkeys(values))
+        if isinstance(value, (list, tuple, set)):
+            values = []
+            for item in value:
+                values.extend(cls._as_values(item))
+            return list(dict.fromkeys(values))
+        values = []
+        for key in ("value", "iso_3166_1", "code", "name", "title", "id"):
+            item = getattr(value, key, None)
+            if item not in (None, ""):
+                values.extend(cls._as_values(item))
+        if values:
+            return list(dict.fromkeys(values))
+        return [str(value).strip()] if str(value).strip() else []
+
+    @classmethod
+    def _metadata_values(
+        cls,
+        mediainfo: Any,
+        names: tuple[str, ...],
+    ) -> list[str]:
+        """Read top-level and TMDB metadata fields without assuming a model type."""
+
+        values: list[str] = []
+        for name in names:
+            values.extend(cls._as_values(cls._field(mediainfo, name)))
+        tmdb_info = cls._field(mediainfo, "tmdb_info")
+        if isinstance(tmdb_info, Mapping):
+            for name in names:
+                values.extend(cls._as_values(tmdb_info.get(name)))
+        return list(dict.fromkeys(values))
+
+    @staticmethod
+    def _region_key(value: Any) -> str:
+        """Normalize common country codes and localized names."""
+
+        aliases = {
+            "cn": {
+                "cn",
+                "chn",
+                "china",
+                "中国",
+                "中国大陆",
+                "中国内地",
+                "中华人民共和国",
+            },
+            "tw": {"tw", "twn", "taiwan", "台湾", "中国台湾", "台灣"},
+            "hk": {
+                "hk",
+                "hkg",
+                "hongkong",
+                "hong kong",
+                "香港",
+                "中国香港",
+            },
+            "mo": {"mo", "macau", "macao", "澳门", "澳門", "中国澳门"},
+        }
+        token = str(value or "").strip().casefold()
+        for key, names in aliases.items():
+            if token == key or token in names:
+                return key
+        return token
+
+    def _is_domestic_anime(self, mediainfo: Any, paths: list[str]) -> bool:
+        """Return whether MoviePilot metadata identifies domestic animation."""
+
+        path_text = " ".join(str(path) for path in paths).casefold()
+        keywords = self._split_list(self._domestic_anime_path_keywords)
+        if any(keyword.casefold() in path_text for keyword in keywords):
+            return True
+
+        genres = self._metadata_values(mediainfo, ("genre_ids", "genres"))
+        genre_tokens = {
+            token.strip().casefold()
+            for value in genres
+            for token in value.split(",")
+            if token.strip()
+        }
+        anime_genre_names = {"animation", "anime", "动画", "动漫", "番剧"}
+        is_animation = "16" in genre_tokens or any(
+            marker in token
+            for token in genre_tokens
+            for marker in anime_genre_names
+        )
+        if not is_animation:
+            is_animation = any(
+                marker in path_text
+                for marker in ("动漫", "动画", "番剧", "anime", "animation")
+            )
+        if not is_animation:
+            return False
+
+        regions = {
+            self._region_key(token)
+            for value in self._split_list(self._domestic_anime_regions)
+            for token in value.split(",")
+        }
+        countries = {
+            self._region_key(token)
+            for value in self._metadata_values(
+                mediainfo,
+                ("origin_country", "production_countries", "country"),
+            )
+            for token in value.split(",")
+        }
+        if countries:
+            return bool(regions.intersection(countries))
+
+        languages = self._metadata_values(
+            mediainfo,
+            ("original_language", "original_languages"),
+        )
+        return (
+            "cn" in regions
+            and any(
+                token.strip().casefold() in {"zh", "cn", "bo", "za"}
+                for value in languages
+                for token in value.split(",")
+            )
         )
 
     @staticmethod

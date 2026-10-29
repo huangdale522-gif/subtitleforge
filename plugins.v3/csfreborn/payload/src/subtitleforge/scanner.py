@@ -7,8 +7,9 @@ import json
 import os
 import re
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from html import unescape
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -44,6 +45,57 @@ TRAILING_RELEASE_TOKENS = re.compile(
     r"hdtv|remux|x264|x265|h264|h265|hevc|avc|aac|dts|proper|repack).*)$"
 )
 MAX_SCAN_ITEMS = 500
+ANIME_GENRE_IDS = {"16"}
+ANIME_GENRE_NAMES = {
+    "animation",
+    "anime",
+    "动画",
+    "动漫",
+    "番剧",
+}
+ANIME_PATH_MARKERS = {
+    "动漫",
+    "动画",
+    "番剧",
+    "anime",
+    "animation",
+}
+CHINESE_LANGUAGE_CODES = {"zh", "cn", "bo", "za"}
+REGION_ALIASES = {
+    "cn": {
+        "cn",
+        "chn",
+        "china",
+        "中国",
+        "中国大陆",
+        "中国内地",
+        "中华人民共和国",
+    },
+    "tw": {
+        "tw",
+        "twn",
+        "taiwan",
+        "台湾",
+        "中国台湾",
+        "台灣",
+    },
+    "hk": {
+        "hk",
+        "hkg",
+        "hongkong",
+        "hong kong",
+        "香港",
+        "中国香港",
+    },
+    "mo": {
+        "mo",
+        "macau",
+        "macao",
+        "澳门",
+        "澳門",
+        "中国澳门",
+    },
+}
 
 
 def _now() -> str:
@@ -65,6 +117,9 @@ class DiscoveredVideo:
     media_type: MediaType
     season: int | None
     episode: int | None
+    genres: list[str] = field(default_factory=list)
+    origin_countries: list[str] = field(default_factory=list)
+    original_language: str | None = None
 
 
 @dataclass(slots=True)
@@ -74,6 +129,17 @@ class QueueEntry:
     video_path: str
     payload: dict[str, Any]
     attempts: int
+
+
+@dataclass(slots=True)
+class NfoMetadata:
+    """Useful media metadata read from a Kodi-style NFO file."""
+
+    tmdb_id: int | None = None
+    imdb_id: str | None = None
+    genres: list[str] = field(default_factory=list)
+    origin_countries: list[str] = field(default_factory=list)
+    original_language: str | None = None
 
 
 class ScanStore:
@@ -388,8 +454,26 @@ def _season_directory(path: Path, root: Path) -> Path:
     return parent
 
 
-def _nfo_ids(path: Path) -> tuple[int | None, str | None]:
-    """Read common Kodi-style NFO identifiers when they are available."""
+def _nfo_values(content: str, *tags: str) -> list[str]:
+    """Read simple text values from common Kodi-style NFO tags."""
+
+    values: list[str] = []
+    for tag in tags:
+        pattern = re.compile(
+            rf"(?is)<(?:[a-z0-9_]+:)?{re.escape(tag)}"
+            rf"(?:\s[^>]*)?>\s*([^<]+?)\s*"
+            rf"</(?:[a-z0-9_]+:)?{re.escape(tag)}>"
+        )
+        values.extend(
+            unescape(match.group(1)).strip()
+            for match in pattern.finditer(content)
+            if match.group(1).strip()
+        )
+    return list(dict.fromkeys(values))
+
+
+def _read_nfo_metadata(path: Path) -> NfoMetadata:
+    """Read IDs, genres and country metadata from nearby NFO files."""
 
     show_dir = (
         path.parent.parent
@@ -404,26 +488,50 @@ def _nfo_ids(path: Path) -> tuple[int | None, str | None]:
         show_dir / "tvshow.nfo",
         show_dir / "movie.nfo",
     ]
-    tmdb_id: int | None = None
-    imdb_id: str | None = None
+    metadata = NfoMetadata()
     for candidate in dict.fromkeys(candidates):
         try:
             content = candidate.read_text(encoding="utf-8", errors="ignore")[:262_144]
         except OSError:
             continue
-        if tmdb_id is None:
+        if metadata.tmdb_id is None:
             match = re.search(r"(?is)<tmdbid>\s*(\d+)\s*</tmdbid>", content)
             if match:
-                tmdb_id = int(match.group(1))
-        if imdb_id is None:
+                metadata.tmdb_id = int(match.group(1))
+        if metadata.imdb_id is None:
             match = re.search(
                 r"(?is)<imdbid>\s*(tt\d{5,12})\s*</imdbid>", content
             )
             if match:
-                imdb_id = match.group(1)
-        if tmdb_id is not None and imdb_id is not None:
+                metadata.imdb_id = match.group(1)
+        if not metadata.genres:
+            metadata.genres = _nfo_values(content, "genre")
+        if not metadata.origin_countries:
+            metadata.origin_countries = _nfo_values(
+                content,
+                "origin_country",
+                "country",
+                "production_country",
+            )
+        if not metadata.original_language:
+            languages = _nfo_values(content, "original_language")
+            metadata.original_language = languages[0] if languages else None
+        if (
+            metadata.tmdb_id is not None
+            and metadata.imdb_id is not None
+            and metadata.genres
+            and metadata.origin_countries
+            and metadata.original_language
+        ):
             break
-    return tmdb_id, imdb_id
+    return metadata
+
+
+def _nfo_ids(path: Path) -> tuple[int | None, str | None]:
+    """Read common Kodi-style NFO identifiers when they are available."""
+
+    metadata = _read_nfo_metadata(path)
+    return metadata.tmdb_id, metadata.imdb_id
 
 
 def parse_media_path(path: Path, root: Path) -> DiscoveredVideo:
@@ -467,17 +575,116 @@ def parse_media_path(path: Path, root: Path) -> DiscoveredVideo:
             if part
         )
     )
-    nfo_tmdb_id, nfo_imdb_id = _nfo_ids(path)
+    nfo = _read_nfo_metadata(path)
     return DiscoveredVideo(
         path=path,
         title=title,
         original_title=original_title,
         year=year,
-        tmdb_id=int(tmdb_match.group(1)) if tmdb_match else nfo_tmdb_id,
-        imdb_id=nfo_imdb_id,
+        tmdb_id=int(tmdb_match.group(1)) if tmdb_match else nfo.tmdb_id,
+        imdb_id=nfo.imdb_id,
         media_type=media_type,
         season=season,
         episode=episode,
+        genres=nfo.genres,
+        origin_countries=nfo.origin_countries,
+        original_language=nfo.original_language,
+    )
+
+
+def _region_key(value: Any) -> str:
+    """Normalize a country code or localized country name."""
+
+    token = str(value or "").strip().casefold()
+    if not token:
+        return ""
+    for key, aliases in REGION_ALIASES.items():
+        if token == key or token in aliases:
+            return key
+    return token
+
+
+def _is_animation_media(
+    media: DiscoveredVideo,
+    path: Path,
+) -> bool:
+    """Return whether NFO metadata or the library path marks this as animation."""
+
+    genre_tokens: set[str] = set()
+    for value in media.genres:
+        genre_tokens.update(
+            token.strip().casefold()
+            for token in re.split(r"[,/|]", str(value))
+            if token.strip()
+        )
+    if genre_tokens.intersection(ANIME_GENRE_IDS):
+        return True
+    if any(
+        marker in token
+        for token in genre_tokens
+        for marker in ANIME_GENRE_NAMES
+    ):
+        return True
+    return any(
+        marker in part.casefold()
+        for part in path.parts
+        for marker in ANIME_PATH_MARKERS
+    )
+
+
+def _path_matches_keywords(
+    path: Path,
+    keywords: Iterable[str],
+) -> bool:
+    """Return whether a path contains an explicitly configured keyword."""
+
+    parts = [part.casefold() for part in path.parts]
+    for raw_keyword in keywords:
+        keyword = str(raw_keyword).strip().casefold()
+        if not keyword:
+            continue
+        if "/" in keyword:
+            if keyword in str(path).casefold():
+                return True
+        elif any(keyword in part for part in parts):
+            return True
+    return False
+
+
+def is_domestic_anime(
+    path: Path,
+    media: DiscoveredVideo,
+    regions: Iterable[str],
+    path_keywords: Iterable[str],
+) -> bool:
+    """Identify domestic animation without guessing from a Chinese title alone."""
+
+    if _path_matches_keywords(path, path_keywords):
+        return True
+    if not _is_animation_media(media, path):
+        return False
+
+    region_keys = {
+        _region_key(token)
+        for value in regions
+        if str(value).strip()
+        for token in re.split(r"[,/|]", str(value))
+        if token.strip()
+    }
+    country_keys = {
+        _region_key(token)
+        for value in media.origin_countries
+        if str(value).strip()
+        for token in re.split(r"[,/|]", str(value))
+        if token.strip()
+    }
+    if country_keys:
+        return bool(region_keys.intersection(country_keys))
+
+    language = str(media.original_language or "").strip().casefold()
+    return (
+        "cn" in region_keys
+        and language in CHINESE_LANGUAGE_CODES
     )
 
 
@@ -649,6 +856,19 @@ class LibraryScanner:
         # Phase 1: inspect every file locally. This never queries a provider.
         for path, root in ordered:
             discovered_media = parse_media_path(path, root)
+            if (
+                request.exclude_domestic_anime
+                and is_domestic_anime(
+                    path,
+                    discovered_media,
+                    request.domestic_anime_regions,
+                    request.domestic_anime_path_keywords,
+                )
+            ):
+                result.excluded_domestic_anime += 1
+                if not request.dry_run:
+                    self._store.remove_queue_item(path)
+                continue
             inspect_request = ProcessRequest(
                 video_path=str(path),
                 title=discovered_media.title,

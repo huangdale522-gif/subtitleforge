@@ -140,6 +140,11 @@ bounded number of queued items:
 {
   "paths": ["/media/movies/foreign", "/media/tv/foreign"],
   "exclude_paths": ["/media/movies/chinese"],
+  "exclude_domestic_anime": true,
+  "domestic_anime_regions": ["CN", "TW", "HK"],
+  "domestic_anime_path_keywords": [
+    "国漫", "国产", "国产动漫", "国产动画", "国产番剧", "国创"
+  ],
   "languages": ["zh-Hans", "zh-Hant"],
   "max_files": 10,
   "daily_download_limit": 20,
@@ -157,6 +162,14 @@ use a shorter 15-minute circuit break so a temporary outage does not prevent
 failover for the rest of the queue. Each video is limited to three subtitle
 download attempts, and cooldown state is persisted locally across service
 restarts.
+
+`exclude_domestic_anime` filters animation whose NFO metadata identifies a
+configured region, or whose path contains one of
+`domestic_anime_path_keywords`. The default regions are mainland China, Taiwan,
+and Hong Kong (`CN,TW,HK`). A Chinese title alone is never used as a
+classification signal; Japanese animation remains eligible. If NFO metadata is
+missing, place domestic animation under a path such as `/动漫/国漫` or add a
+stable directory keyword in the plugin settings.
 
 `max_files` limits one scan batch. `daily_download_limit` limits successful
 subtitle downloads for the local calendar day across every scanner instance

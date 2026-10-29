@@ -125,6 +125,20 @@ class ScanRequest(BaseModel):
 
     paths: list[str] = Field(default_factory=lambda: ["/media"])
     exclude_paths: list[str] = Field(default_factory=list)
+    exclude_domestic_anime: bool = False
+    domestic_anime_regions: list[str] = Field(
+        default_factory=lambda: ["CN", "TW", "HK"]
+    )
+    domestic_anime_path_keywords: list[str] = Field(
+        default_factory=lambda: [
+            "国漫",
+            "国产",
+            "国产动漫",
+            "国产动画",
+            "国产番剧",
+            "国创",
+        ]
+    )
     video_extensions: list[str] = Field(
         default_factory=lambda: [
             ".mkv",
@@ -157,6 +171,20 @@ class ScanRequest(BaseModel):
         """Normalize extensions and languages while preserving their order."""
 
         self.languages = list(dict.fromkeys(self.languages))
+        self.domestic_anime_regions = list(
+            dict.fromkeys(
+                value.strip()
+                for value in self.domestic_anime_regions
+                if value.strip()
+            )
+        )
+        self.domestic_anime_path_keywords = list(
+            dict.fromkeys(
+                value.strip()
+                for value in self.domestic_anime_path_keywords
+                if value.strip()
+            )
+        )
         self.video_extensions = list(
             dict.fromkeys(
                 extension.strip().casefold()
@@ -191,6 +219,7 @@ class ScanResult(BaseModel):
     status: str
     discovered: int = 0
     checked: int = 0
+    excluded_domestic_anime: int = 0
     existing: int = 0
     queued: int = 0
     queue_remaining: int = 0
