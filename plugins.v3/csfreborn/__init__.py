@@ -57,6 +57,22 @@ TMDB_IMAGE_HOSTS = {
     "themoviedb.org",
     "www.themoviedb.org",
 }
+SUPPORTED_PROVIDER_ORDER = (
+    "xunlei",
+    "assrt",
+    "subtitle_best",
+    "opensubtitles",
+    "custom",
+    "shooter",
+)
+PROVIDER_LABELS = {
+    "xunlei": "迅雷",
+    "assrt": "ASSRT",
+    "subtitle_best": "SubtitleBest",
+    "opensubtitles": "OpenSubtitles",
+    "custom": "自定义源",
+    "shooter": "Shooter",
+}
 TMDB_INFO_FIELDS = (
     "title",
     "name",
@@ -94,7 +110,7 @@ class CSFReborn(_PluginBase):
         "队列按季度展示封面，并支持手动挑选字幕。"
     )
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.10.8"
+    plugin_version = "0.10.9"
     plugin_author = "SubtitleForge contributors"
     author_url = "https://github.com/"
     plugin_config_prefix = "csfreborn_"
@@ -117,9 +133,7 @@ class CSFReborn(_PluginBase):
         self._timeout = 180
         self._manage_service = True
         self._service_dir = Path("/config/subtitleforge")
-        self._provider_order = (
-            "xunlei,assrt,subtitle_best,opensubtitles,custom,shooter"
-        )
+        self._provider_order = ",".join(SUPPORTED_PROVIDER_ORDER)
         self._subtitle_best_api_key = ""
         self._subtitle_best_header_token = "5akwmGAbuFWqgaZf9QwT"
         self._opensubtitles_api_key = ""
@@ -148,7 +162,7 @@ class CSFReborn(_PluginBase):
         self._scan_max_files = 10
         self._scan_daily_download_limit = 10
         self._scan_dry_run = True
-        self._scan_provider_order = ""
+        self._scan_provider_order: list[str] = []
         self._scan_languages = ["zh-Hans"]
         self._managed_process: subprocess.Popen | None = None
         self._scan_running = False
@@ -179,7 +193,7 @@ class CSFReborn(_PluginBase):
         ).expanduser()
         self._provider_order = str(
             config.get("provider_order")
-            or "xunlei,assrt,subtitle_best,opensubtitles,custom,shooter"
+            or ",".join(SUPPORTED_PROVIDER_ORDER)
         )
         self._subtitle_best_api_key = str(config.get("subtitle_best_api_key") or "")
         self._subtitle_best_header_token = str(
@@ -224,8 +238,8 @@ class CSFReborn(_PluginBase):
         self._scan_languages = list(
             config.get("scan_languages") or ["zh-Hans"]
         )
-        self._scan_provider_order = str(
-            config.get("scan_provider_order") or ""
+        self._scan_provider_order = self._normalize_provider_order(
+            config.get("scan_provider_order")
         )
         try:
             self._scan_interval_hours = max(
@@ -376,6 +390,20 @@ class CSFReborn(_PluginBase):
         video_path = str(data.get("video_path") or "").strip()
         if not video_path:
             return {"status": "error", "message": "缺少视频路径"}
+        raw_provider_order = data.get("provider_order")
+        selected_provider_order = self._normalize_provider_order(
+            raw_provider_order
+        )
+        if (
+            raw_provider_order not in (None, "", [])
+            and not selected_provider_order
+        ):
+            return {"status": "error", "message": "字幕源选择无效"}
+        provider_order = (
+            selected_provider_order
+            or self._normalize_provider_order(self._provider_order)
+            or list(SUPPORTED_PROVIDER_ORDER)
+        )
         try:
             result = await asyncio.to_thread(
                 self._request_json,
@@ -383,11 +411,7 @@ class CSFReborn(_PluginBase):
                 "/v1/manual/search",
                 {
                     "video_path": video_path,
-                    "provider_order": (
-                        self._split_list(self._scan_provider_order)
-                        if self._scan_provider_order
-                        else None
-                    ),
+                    "provider_order": provider_order,
                 },
                 600,
             )
@@ -486,11 +510,7 @@ class CSFReborn(_PluginBase):
             "overwrite": self._overwrite,
             "dry_run": self._scan_dry_run,
             "provider_failover": True,
-            "provider_order": (
-                self._split_list(self._scan_provider_order)
-                if self._scan_provider_order
-                else None
-            ),
+            "provider_order": self._scan_provider_order or None,
         }
         try:
             result = await asyncio.to_thread(
@@ -1718,11 +1738,20 @@ class CSFReborn(_PluginBase):
                         ],
                     },
                     {
-                        "component": "VTextField",
+                        "component": "VSelect",
                         "props": {
                             "model": "scan_provider_order",
-                            "label": "扫描专用字幕源顺序（可选）",
-                            "placeholder": "留空则使用上方字幕源顺序，按顺序故障切换",
+                            "label": "自动扫描字幕源（可选）",
+                            "multiple": True,
+                            "chips": True,
+                            "closable-chips": True,
+                            "clearable": True,
+                            "items": self._provider_select_items(),
+                            "hint": (
+                                "可多选；留空则使用下方全局字幕源顺序。"
+                                "选择顺序就是故障切换顺序。"
+                            ),
+                            "persistent-hint": True,
                         },
                     },
                     {
@@ -1994,7 +2023,7 @@ class CSFReborn(_PluginBase):
             "scan_max_files": 10,
             "scan_daily_download_limit": 10,
             "scan_dry_run": True,
-            "scan_provider_order": "",
+            "scan_provider_order": [],
             "scan_languages": ["zh-Hans"],
         }
 
@@ -3354,11 +3383,36 @@ class CSFReborn(_PluginBase):
             f"plugin/{self.__class__.__name__}/manual/download"
         )
         video_literal = json.dumps(video_path, ensure_ascii=True)
+        provider_options = json.dumps(
+            [
+                {"value": name, "label": PROVIDER_LABELS[name]}
+                for name in SUPPORTED_PROVIDER_ORDER
+            ],
+            ensure_ascii=True,
+        )
         return (
             "(function(){"
             f"var videoPath={video_literal};"
-            "if(!confirm('搜索这个视频的全部字幕候选？')){return;}"
-            f"window.MoviePilotAPI.post({search_api},{{video_path:videoPath}})"
+            f"var providerOptions={provider_options};"
+            "var providerLines='0. 自动顺序（使用全局字幕源顺序）\\n'"
+            "+providerOptions.map(function(p,i){"
+            "return (i+1)+'. '+p.label;"
+            "}).join('\\n');"
+            "var sourceAnswer=prompt('选择本次手动搜索使用的字幕源："
+            "\\n\\n'+providerLines,'0');"
+            "if(sourceAnswer===null){return;}"
+            "sourceAnswer=String(sourceAnswer).trim();"
+            "var providerOrder=null;"
+            "if(sourceAnswer!==''&&sourceAnswer!=='0'){"
+            "var sourceIndex=parseInt(sourceAnswer,10)-1;"
+            "if(isNaN(sourceIndex)||sourceIndex<0||"
+            "sourceIndex>=providerOptions.length){"
+            "alert('字幕源编号无效');return;}"
+            "providerOrder=[providerOptions[sourceIndex].value];"
+            "}"
+            "var searchPayload={video_path:videoPath};"
+            "if(providerOrder){searchPayload.provider_order=providerOrder;}"
+            f"window.MoviePilotAPI.post({search_api},searchPayload)"
             ".then(function(r){"
             "if(!r||r.status==='error'||r.status==='disabled'){"
             "alert((r&&(r.message||r.errors&&r.errors[0]))||'搜索失败');return null;}"
@@ -3668,6 +3722,37 @@ class CSFReborn(_PluginBase):
             item.strip()
             for item in str(value or "").replace("\n", ",").split(",")
             if item.strip()
+        ]
+
+    @classmethod
+    def _normalize_provider_order(cls, value: Any) -> list[str]:
+        """Normalize legacy text or multi-select values to supported IDs."""
+
+        if isinstance(value, str):
+            raw_values = cls._split_list(value)
+        elif isinstance(value, (list, tuple)):
+            raw_values = []
+            for item in value:
+                if isinstance(item, str):
+                    raw_values.extend(cls._split_list(item))
+                elif item is not None:
+                    raw_values.append(str(item))
+        else:
+            raw_values = []
+        normalized: list[str] = []
+        for item in raw_values:
+            name = item.strip().lower()
+            if name in PROVIDER_LABELS and name not in normalized:
+                normalized.append(name)
+        return normalized
+
+    @staticmethod
+    def _provider_select_items() -> list[dict[str, str]]:
+        """Return MoviePilot form options for supported subtitle sources."""
+
+        return [
+            {"title": PROVIDER_LABELS[name], "value": name}
+            for name in SUPPORTED_PROVIDER_ORDER
         ]
 
 

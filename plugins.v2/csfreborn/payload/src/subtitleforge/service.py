@@ -54,7 +54,7 @@ class SubtitleService:
         self._client = client or httpx.AsyncClient(
             timeout=settings.request_timeout_seconds,
             follow_redirects=True,
-            headers={"User-Agent": "SubtitleForge/0.4.6"},
+            headers={"User-Agent": "SubtitleForge/0.4.7"},
         )
         self.providers: dict[str, SubtitleProvider] = {
             "xunlei": XunleiProvider(

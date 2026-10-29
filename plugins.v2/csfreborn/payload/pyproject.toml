@@ -1,6 +1,6 @@
 [project]
 name = "subtitleforge"
-version = "0.4.6"
+version = "0.4.7"
 description = "A provider-driven subtitle downloader for NAS and MoviePilot"
 readme = "README.md"
 requires-python = ">=3.11"

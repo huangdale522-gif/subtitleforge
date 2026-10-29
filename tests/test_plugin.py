@@ -222,6 +222,8 @@ def test_queue_page_shows_posters_seasons_and_manual_actions() -> None:
     assert "Some Show" in rendered
     assert "manual/search" in rendered
     assert "manual/download" in rendered
+    assert "自动顺序（使用全局字幕源顺序）" in rendered
+    assert "provider_order" in rendered
 
 
 def test_plugin_registers_queue_and_manual_api_routes() -> None:
@@ -476,6 +478,128 @@ def test_scan_library_sends_domestic_anime_filter_settings() -> None:
     assert captured["exclude_domestic_anime"] is True
     assert captured["domestic_anime_regions"] == ["CN", "TW", "HK"]
     assert captured["domestic_anime_path_keywords"] == ["国漫", "国产动画"]
+
+
+def test_scan_library_forwards_selected_provider_sources() -> None:
+    plugin_module = load_moviepilot_plugin()
+    plugin = plugin_module.CSFReborn()
+    plugin._enabled = True
+    plugin._scan_paths = ""
+    plugin._scan_exclude_paths = ""
+    plugin._scan_provider_order = ["assrt", "xunlei"]
+    plugin._notify = False
+    captured: dict = {}
+
+    def request_json(method, path, payload, timeout=None):
+        captured.update(payload)
+        return {"status": "ok", "items": []}
+
+    plugin._request_json = request_json
+    plugin.save_data = lambda *_args, **_kwargs: None
+
+    result = asyncio.run(plugin.scan_library())
+
+    assert result["status"] == "ok"
+    assert captured["provider_order"] == ["assrt", "xunlei"]
+
+
+def test_scan_provider_order_accepts_legacy_comma_text() -> None:
+    plugin_module = load_moviepilot_plugin()
+    plugin = plugin_module.CSFReborn()
+
+    assert plugin._normalize_provider_order(
+        "ASSRT, xunlei,assrt,unsupported"
+    ) == ["assrt", "xunlei"]
+    assert plugin._normalize_provider_order(
+        ["subtitle_best", "custom"]
+    ) == ["subtitle_best", "custom"]
+
+
+def test_form_uses_multi_select_for_automatic_scan_sources() -> None:
+    plugin_module = load_moviepilot_plugin()
+    plugin = plugin_module.CSFReborn()
+
+    form, defaults = plugin.get_form()
+    rendered = json.dumps(form, ensure_ascii=False)
+
+    assert '"model": "scan_provider_order"' in rendered
+    assert '"multiple": true' in rendered
+    assert "自动扫描字幕源（可选）" in rendered
+    assert "SubtitleBest" in rendered
+    assert defaults["scan_provider_order"] == []
+
+
+def test_manual_search_forwards_selected_provider_source() -> None:
+    plugin_module = load_moviepilot_plugin()
+    plugin = plugin_module.CSFReborn()
+    plugin._enabled = True
+    plugin._provider_order = "xunlei,assrt"
+    plugin._scan_provider_order = ["subtitle_best"]
+    captured: dict = {}
+
+    def request_json(method, path, payload, timeout=None):
+        captured.update(method=method, path=path, payload=payload)
+        return {"status": "ok", "candidates": []}
+
+    plugin._request_json = request_json
+    result = asyncio.run(
+        plugin.manual_search(
+            {
+                "video_path": "/plex/movie.mkv",
+                "provider_order": ["assrt"],
+            }
+        )
+    )
+
+    assert result["status"] == "ok"
+    assert captured["path"] == "/v1/manual/search"
+    assert captured["payload"]["provider_order"] == ["assrt"]
+
+
+def test_manual_search_auto_uses_global_order_not_scan_order() -> None:
+    plugin_module = load_moviepilot_plugin()
+    plugin = plugin_module.CSFReborn()
+    plugin._enabled = True
+    plugin._provider_order = "xunlei,assrt"
+    plugin._scan_provider_order = ["subtitle_best"]
+    captured: dict = {}
+
+    def request_json(method, path, payload, timeout=None):
+        captured.update(payload)
+        return {"status": "ok", "candidates": []}
+
+    plugin._request_json = request_json
+    result = asyncio.run(
+        plugin.manual_search({"video_path": "/plex/movie.mkv"})
+    )
+
+    assert result["status"] == "ok"
+    assert captured["provider_order"] == ["xunlei", "assrt"]
+
+
+def test_manual_search_rejects_unknown_provider_source() -> None:
+    plugin_module = load_moviepilot_plugin()
+    plugin = plugin_module.CSFReborn()
+    plugin._enabled = True
+    called = False
+
+    def request_json(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        return {"status": "ok"}
+
+    plugin._request_json = request_json
+    result = asyncio.run(
+        plugin.manual_search(
+            {
+                "video_path": "/plex/movie.mkv",
+                "provider_order": ["unsupported"],
+            }
+        )
+    )
+
+    assert result == {"status": "error", "message": "字幕源选择无效"}
+    assert called is False
 
 
 def test_scan_library_sends_moviepilot_tmdb_metadata(tmp_path: Path) -> None:

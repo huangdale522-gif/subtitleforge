@@ -96,6 +96,11 @@ Provider order is configured with `SF_PROVIDER_ORDER`, for example:
 SF_PROVIDER_ORDER=xunlei,assrt,subtitle_best,opensubtitles,custom,shooter
 ```
 
+In the MoviePilot plugin form, automatic library scans can select one or more
+sources independently. Leaving that field empty uses the global source order.
+Each manual subtitle search also asks whether to use the global automatic order
+or one specific source for that search only.
+
 ## API
 
 ### Process a file synchronously
