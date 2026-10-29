@@ -90,6 +90,7 @@ def test_scan_notification_lists_actual_downloaded_files() -> None:
             "checked": 651,
             "existing": 649,
             "excluded_domestic_anime": 4,
+            "excluded_configured_paths": 3,
             "queue_remaining": 2,
             "downloaded": 1,
             "downloads_today": 3,
@@ -113,6 +114,7 @@ def test_scan_notification_lists_actual_downloaded_files() -> None:
 
     assert "全库发现 651 个视频" in text
     assert "排除国产动漫 4 个" in text
+    assert "配置排除目录中的视频 3 个" in text
     assert "今日额度 3/10" in text
     assert "Some Show S02E03" in text
     assert "Some.Show.S02E03.chi.zh-cn.ass" in text

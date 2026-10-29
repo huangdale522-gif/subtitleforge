@@ -338,6 +338,40 @@ class ScanStore:
             )
             connection.commit()
 
+    def remove_excluded_paths(self, prefixes: list[str]) -> int:
+        """Drop queued tasks under configured directory exclusions."""
+
+        normalized = [
+            str(prefix).replace("\\", "/").rstrip("/").casefold()
+            for prefix in prefixes
+            if str(prefix).strip()
+        ]
+        if not normalized:
+            return 0
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT video_path FROM download_queue"
+            ).fetchall()
+            matches = [
+                str(row[0])
+                for row in rows
+                if any(
+                    _path_prefix_matches(Path(str(row[0])), prefix)
+                    for prefix in normalized
+                )
+            ]
+            if matches:
+                connection.executemany(
+                    "DELETE FROM download_queue WHERE video_path = ?",
+                    ((video_path,) for video_path in matches),
+                )
+                connection.executemany(
+                    "DELETE FROM scan_checks WHERE video_path = ?",
+                    ((video_path,) for video_path in matches),
+                )
+            connection.commit()
+        return len(matches)
+
     @staticmethod
     def _queue_entry(row: tuple[Any, ...]) -> QueueEntry | None:
         """Convert a queue row into a typed entry."""
@@ -1417,8 +1451,12 @@ class LibraryScanner:
     async def _scan_locked(self, request: ScanRequest) -> ScanResult:
         """Inventory every video before downloading a quota-bounded queue batch."""
 
+        removed_excluded_paths = 0
         if not request.dry_run:
             self._store.remove_unsupported_media()
+            removed_excluded_paths = self._store.remove_excluded_paths(
+                request.exclude_paths
+            )
 
         roots: list[Path] = []
         errors: list[str] = []
@@ -1445,6 +1483,7 @@ class LibraryScanner:
             return ScanResult(
                 status="not_found",
                 discovered=0,
+                excluded_configured_paths=removed_excluded_paths,
                 queue_remaining=queue["total"],
                 remaining=queue["total"],
                 downloads_today=self._store.downloads_today(),
@@ -1459,6 +1498,7 @@ class LibraryScanner:
         result = ScanResult(
             status="processing",
             discovered=len(ordered),
+            excluded_configured_paths=removed_excluded_paths,
             downloads_today=self._store.downloads_today(),
             daily_download_limit=request.daily_download_limit,
             dry_run=request.dry_run,

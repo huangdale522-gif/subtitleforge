@@ -264,6 +264,7 @@ class ScanResult(BaseModel):
     checked: int = 0
     metadata_applied: int = 0
     metadata_animation: int = 0
+    excluded_configured_paths: int = 0
     excluded_domestic_anime: int = 0
     existing: int = 0
     queued: int = 0

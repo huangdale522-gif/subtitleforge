@@ -62,7 +62,7 @@ class CSFReborn(_PluginBase):
         "队列按季度展示封面，并支持手动挑选字幕。"
     )
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.10.4"
+    plugin_version = "0.10.5"
     plugin_author = "SubtitleForge contributors"
     author_url = "https://github.com/"
     plugin_config_prefix = "csfreborn_"
@@ -481,6 +481,7 @@ class CSFReborn(_PluginBase):
                 f"检查 {result.get('checked', 0)}，"
                 f"下载 {result.get('downloaded', 0)}，"
                 f"元数据命中 {result.get('metadata_applied', 0)}，"
+                f"配置目录清理 {result.get('excluded_configured_paths', 0)}，"
                 f"排除国产动漫 {result.get('excluded_domestic_anime', 0)}"
             )
             if (
@@ -1003,6 +1004,13 @@ class CSFReborn(_PluginBase):
         excluded = int(result.get("excluded_domestic_anime") or 0)
         if excluded:
             lines.append(f"已按规则排除国产动漫 {excluded} 个。")
+        configured_excluded = int(
+            result.get("excluded_configured_paths") or 0
+        )
+        if configured_excluded:
+            lines.append(
+                f"已从队列清理配置排除目录中的视频 {configured_excluded} 个。"
+            )
         downloaded: list[str] = []
         for item in result.get("items") or []:
             if not isinstance(item, dict):
@@ -2106,7 +2114,9 @@ class CSFReborn(_PluginBase):
                                         f"已有 {latest_scan.get('existing', 0)} · "
                                         f"缺失 {latest_scan.get('queued', 0)} · "
                                         f"排除国产动漫 "
-                                        f"{latest_scan.get('excluded_domestic_anime', 0)}"
+                                        f"{latest_scan.get('excluded_domestic_anime', 0)} · "
+                                        f"配置目录清理 "
+                                        f"{latest_scan.get('excluded_configured_paths', 0)}"
                                     ),
                                     "mdi-library-shelves",
                                     "secondary",
@@ -2296,6 +2306,8 @@ class CSFReborn(_PluginBase):
                                         f"发现 {latest_scan.get('discovered', 0)} · "
                                         f"检查 {latest_scan.get('checked', 0)} · "
                                         f"已有 {latest_scan.get('existing', 0)} · "
+                                        f"配置目录清理 "
+                                        f"{latest_scan.get('excluded_configured_paths', 0)} · "
                                         f"排除国产动漫 "
                                         f"{latest_scan.get('excluded_domestic_anime', 0)} · "
                                         f"缺失入队 {latest_scan.get('queued', 0)} · "

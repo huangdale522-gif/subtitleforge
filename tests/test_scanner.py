@@ -351,6 +351,51 @@ async def test_scan_uses_moviepilot_metadata_for_domestic_anime_and_posters(
 
 
 @pytest.mark.asyncio
+async def test_scan_prunes_queue_items_under_configured_exclusions(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "动漫"
+    excluded_dir = root / "牧神记 (2024) {tmdbid=236534}"
+    excluded = excluded_dir / "Season 1" / "牧神记 S01E08.mkv"
+    keep = root / "Keep Show" / "Season 1" / "Keep.Show.S01E01.mkv"
+    for video in (excluded, keep):
+        video.parent.mkdir(parents=True)
+        video.write_bytes(b"video")
+
+    service = make_service(tmp_path)
+    provider = NoResultProvider()
+    service.providers["custom"] = provider
+    scanner = LibraryScanner(service, service.settings.data_dir)
+    for video in (excluded, keep):
+        scanner._store.upsert_queue_item(
+            video,
+            {
+                "video_path": str(video),
+                "title": video.stem,
+                "media_type": "tv",
+                "season": 1,
+                "episode": 1,
+            },
+        )
+    try:
+        result = await scanner.scan(
+            ScanRequest(
+                paths=[str(root)],
+                exclude_paths=[str(excluded_dir)],
+                languages=[SubtitleLanguage.SIMPLIFIED],
+                dry_run=False,
+            )
+        )
+        queue = scanner.queue_view()
+    finally:
+        await service.close()
+
+    assert result.excluded_configured_paths == 1
+    assert result.discovered == 1
+    assert [group.title for group in queue.groups] == ["Keep Show"]
+
+
+@pytest.mark.asyncio
 async def test_scanner_status_reports_live_quota_and_queue(tmp_path: Path) -> None:
     video = tmp_path / "Movie (2024)" / "Movie.2024.mkv"
     video.parent.mkdir(parents=True)
