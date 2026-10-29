@@ -43,7 +43,7 @@ class WatchedCleaner(_PluginBase):
         "显示海报，支持按季清理、Telegram 图片提醒和人工确认后安全删除。"
     )
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.3.2"
+    plugin_version = "1.3.3"
     plugin_author = "huangdale522-gif"
     author_url = "https://github.com/huangdale522-gif"
     plugin_config_prefix = "watchedcleaner_"
@@ -67,6 +67,7 @@ class WatchedCleaner(_PluginBase):
     _max_delete_batch = 20
     _scan_ttl_hours = 24
     _history_limit = 500
+    _scan_notification_limit = 10000
     _notify_enabled = False
     _notify_user = ""
     _notify_scan_results = True
@@ -399,6 +400,8 @@ class WatchedCleaner(_PluginBase):
                 "notify_scan_results",
                 "推送扫描结果",
                 md=4,
+                **{"persistent-hint": True},
+                hint="只推送首次达到条件的新增候选；没有新增时不会重复发送。",
             ),
             self._field(
                 "VSwitch",
@@ -774,6 +777,7 @@ class WatchedCleaner(_PluginBase):
                 "errors": errors,
                 "truncated": truncated,
             }
+            previous_scan = self._load_scan()
             self._store_scan(state)
             message = (
                 f"扫描完成：{len(candidates)} 个候选，"
@@ -783,7 +787,11 @@ class WatchedCleaner(_PluginBase):
                 message += "；候选达到上限，结果已截断"
             if errors:
                 message += f"；{len(errors)} 个错误"
-            self._notify_scan_completed(state, message)
+            self._notify_scan_completed(
+                state,
+                message,
+                previous_scan=previous_scan,
+            )
             return schemas.Response(
                 success=True,
                 message=message,
@@ -915,6 +923,13 @@ class WatchedCleaner(_PluginBase):
                     if candidate.get("key") not in deleted_keys
                 ]
                 self._store_scan(scan)
+                try:
+                    self._remove_scan_notification_candidates(deleted_keys)
+                except Exception as cleanup_error:
+                    logger.warning(
+                        "[已观看媒体清理] 删除后清理扫描通知状态失败："
+                        f"{cleanup_error}"
+                    )
             self._append_history(audit)
 
             message = (
@@ -1165,6 +1180,73 @@ class WatchedCleaner(_PluginBase):
             self._last_scan = dict(scan)
             self._state_loaded = True
             self.save_data("last_scan", self._last_scan)
+
+    def _load_scan_notification_state(self) -> tuple[dict[str, Any], bool]:
+        with self._state_lock:
+            raw = self._safe_get_data("scan_notified_candidates")
+        exists = isinstance(raw, Mapping)
+        state = dict(raw) if exists else {}
+        state["version"] = 1
+        items = state.get("items")
+        state["items"] = (
+            {
+                str(key): dict(value)
+                for key, value in items.items()
+                if isinstance(value, Mapping)
+            }
+            if isinstance(items, Mapping)
+            else {}
+        )
+        return state, exists
+
+    def _store_scan_notification_state(
+        self, state: Mapping[str, Any]
+    ) -> None:
+        with self._state_lock:
+            normalized = dict(state)
+            normalized["version"] = 1
+            items = normalized.get("items")
+            normalized["items"] = (
+                dict(items) if isinstance(items, Mapping) else {}
+            )
+            if len(normalized["items"]) > self._scan_notification_limit:
+                def last_notified_at(entry: Any) -> str:
+                    value = entry[1]
+                    return (
+                        str(value.get("last_notified_at") or "")
+                        if isinstance(value, Mapping)
+                        else ""
+                    )
+
+                ordered = sorted(
+                    normalized["items"].items(),
+                    key=last_notified_at,
+                    reverse=True,
+                )
+                normalized["items"] = dict(
+                    ordered[: self._scan_notification_limit]
+                )
+            self.save_data("scan_notified_candidates", normalized)
+
+    def _remove_scan_notification_candidates(self, keys: Any) -> None:
+        key_set = {
+            str(key)
+            for key in keys
+            if key is not None and str(key).strip()
+        }
+        if not key_set:
+            return
+        state, exists = self._load_scan_notification_state()
+        if not exists:
+            return
+        items = state["items"]
+        removed = False
+        for key in key_set:
+            if key in items:
+                items.pop(key, None)
+                removed = True
+        if removed:
+            self._store_scan_notification_state(state)
 
     def _load_history(self) -> list[dict[str, Any]]:
         raw = self._safe_get_data("history")
@@ -1425,7 +1507,11 @@ class WatchedCleaner(_PluginBase):
             return False
 
     def _notify_scan_completed(
-        self, state: Mapping[str, Any], summary: str
+        self,
+        state: Mapping[str, Any],
+        summary: str,
+        *,
+        previous_scan: Optional[Mapping[str, Any]] = None,
     ) -> None:
         if not self._notify_enabled or not self._notify_scan_results:
             return
@@ -1435,12 +1521,64 @@ class WatchedCleaner(_PluginBase):
             for candidate in (state.get("candidates") or [])
             if isinstance(candidate, Mapping)
         ]
+        notification_state, notification_state_exists = (
+            self._load_scan_notification_state()
+        )
+        notified_items = notification_state["items"]
+
+        # Upgrade compatibility: the previous version pushed every candidate
+        # on every scan, so seed those keys instead of notifying them again.
+        if not notification_state_exists and previous_scan:
+            previous_candidates = [
+                candidate
+                for candidate in (previous_scan.get("candidates") or [])
+                if isinstance(candidate, Mapping)
+            ]
+            seeded_at = str(
+                previous_scan.get("created_at")
+                or datetime.now(timezone.utc).isoformat()
+            )
+            seeded_scan_id = str(previous_scan.get("scan_id") or "")
+            for candidate in previous_candidates:
+                key = str(candidate.get("key") or "")
+                if not self._valid_candidate_key(key):
+                    continue
+                notified_items[key] = self._scan_notification_entry(
+                    candidate,
+                    seeded_at,
+                    seeded_scan_id,
+                )
+            if notified_items:
+                try:
+                    self._store_scan_notification_state(notification_state)
+                except Exception as error:
+                    logger.warning(
+                        "[已观看媒体清理] 初始化扫描通知状态失败："
+                        f"{error}"
+                    )
+
+        new_candidates: List[Mapping[str, Any]] = []
+        seen_new_keys: set[str] = set()
+        for candidate in candidates:
+            key = str(candidate.get("key") or "")
+            if key and (key in notified_items or key in seen_new_keys):
+                continue
+            new_candidates.append(candidate)
+            if key:
+                seen_new_keys.add(key)
+
+        historical_count = len(candidates) - len(new_candidates)
+        if not new_candidates and not errors:
+            return
+
         text = "\n".join(
             [
                 summary,
                 f"扫描条目：{state.get('scanned', 0)}",
-                f"候选数量：{len(candidates)}",
-                f"逐条推送：{len(candidates)} 条（每条带海报）",
+                f"候选总数：{len(candidates)}",
+                f"本次新增：{len(new_candidates)}",
+                f"已推送过、暂不重复：{historical_count}",
+                f"逐条推送：{len(new_candidates)} 条（每条带海报）",
                 f"扫描时间：{state.get('created_at') or '-'}",
                 *(
                     [f"错误：{'；'.join(str(item) for item in errors[:3])}"]
@@ -1454,10 +1592,29 @@ class WatchedCleaner(_PluginBase):
             text=text,
         ):
             return
-        if candidates:
+
+        notified_at = datetime.now(timezone.utc).isoformat()
+        scan_id = str(state.get("scan_id") or "")
+        for candidate in new_candidates:
+            key = str(candidate.get("key") or "")
+            if not self._valid_candidate_key(key):
+                continue
+            notified_items[key] = self._scan_notification_entry(
+                candidate,
+                notified_at,
+                scan_id,
+            )
+        try:
+            self._store_scan_notification_state(notification_state)
+        except Exception as error:
+            logger.warning(
+                f"[已观看媒体清理] 保存扫描通知状态失败：{error}"
+            )
+
+        if new_candidates:
             items = [
                 self._scan_notification_item(candidate)
-                for candidate in candidates
+                for candidate in new_candidates
             ]
             try:
                 Thread(
@@ -1471,6 +1628,22 @@ class WatchedCleaner(_PluginBase):
                 logger.warning(
                     f"[已观看媒体清理] 启动逐条扫描推送失败：{error}"
                 )
+
+    @staticmethod
+    def _scan_notification_entry(
+        candidate: Mapping[str, Any],
+        notified_at: str,
+        scan_id: Any,
+    ) -> dict[str, Any]:
+        return {
+            "first_notified_at": notified_at,
+            "last_notified_at": notified_at,
+            "scan_id": str(scan_id or ""),
+            "title": str(candidate.get("title") or ""),
+            "category": str(candidate.get("category") or ""),
+            "kind": str(candidate.get("kind") or ""),
+            "server": str(candidate.get("server") or ""),
+        }
 
     def _notify_delete_completed(
         self,
@@ -1954,9 +2127,11 @@ class WatchedCleaner(_PluginBase):
             if str(candidate.get("key") or "") != key
         ]
         if len(remaining) == len(candidates):
+            self._remove_scan_notification_candidates([key])
             return
         scan["candidates"] = remaining
         self._store_scan(scan)
+        self._remove_scan_notification_candidates([key])
 
     @staticmethod
     def _valid_candidate_key(key: str) -> bool:

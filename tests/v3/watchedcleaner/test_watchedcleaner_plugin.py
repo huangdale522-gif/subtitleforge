@@ -688,6 +688,73 @@ def test_scan_only_stores_candidates_and_never_deletes(monkeypatch):
     assert plugin._load_scan()["scan_id"] == response.data["scan_id"]
 
 
+def test_api_scan_pushes_each_candidate_only_once(monkeypatch):
+    plugin, _ = _plugin(
+        monkeypatch,
+        dry_run=True,
+        notify_enabled=True,
+        notify_user="123456789",
+    )
+    plugin._discover_services = lambda: ({"Emby": object()}, "")
+    key = candidate_key("Emby", "movie", "movie-1")
+
+    class FakeAdapter:
+        service_type = "emby"
+
+        def scan(self, _options, scan_id):
+            return {
+                "server": "Emby",
+                "server_type": "emby",
+                "user": "admin",
+                "user_id": "user-1",
+                "scanned": 1,
+                "candidates": [
+                    {
+                        "key": key,
+                        "scan_id": scan_id,
+                        "server": "Emby",
+                        "server_type": "emby",
+                        "user": "admin",
+                        "user_id": "user-1",
+                        "category": "movie",
+                        "kind": "movie",
+                        "item_id": "movie-1",
+                        "title": "测试电影",
+                        "path": "/media/Movies/Test.mkv",
+                    }
+                ],
+                "skipped": {},
+                "truncated": False,
+                "errors": [],
+            }
+
+    scheduled = []
+
+    class FakeThread:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def start(self):
+            scheduled.append(self.kwargs)
+
+    monkeypatch.setattr(plugin_module, "build_adapter", lambda *_: FakeAdapter())
+    monkeypatch.setattr(plugin_module, "Thread", FakeThread)
+    sent = []
+    plugin.post_message = lambda **kwargs: sent.append(kwargs)
+
+    first = plugin.api_scan({})
+    assert first.success is True
+    assert len(sent) == 1
+    assert len(scheduled) == 1
+
+    sent.clear()
+    scheduled.clear()
+    second = plugin.api_scan({})
+    assert second.success is True
+    assert sent == []
+    assert scheduled == []
+
+
 def test_dry_run_revalidates_and_never_calls_adapter_delete(monkeypatch):
     plugin, _ = _plugin(
         monkeypatch,
@@ -1002,6 +1069,155 @@ def test_candidate_table_and_scan_push_send_one_poster_item_per_candidate(
     assert item_messages[1]["title"].startswith("扫描候选 2/2")
 
 
+def test_scan_push_only_sends_candidates_not_notified_before(monkeypatch):
+    plugin, data = _plugin(
+        monkeypatch,
+        notify_enabled=True,
+        notify_user="123456789",
+    )
+
+    def candidate(item_id, title):
+        return {
+            "key": candidate_key("Emby", "movie", item_id),
+            "item_id": item_id,
+            "server": "Emby",
+            "user": "admin",
+            "category": "movie",
+            "kind": "movie",
+            "title": title,
+            "image": (
+                f"http://emby.local:8096/emby/Items/{item_id}/Images/Primary"
+            ),
+            "percentage": 100,
+            "last_played": OLD,
+            "path": f"/media/Movies/{item_id}.mkv",
+        }
+
+    first = candidate("movie-1", "测试电影")
+    second = candidate("movie-2", "第二部电影")
+    third = candidate("movie-3", "第三部电影")
+    scheduled = []
+
+    class FakeThread:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def start(self):
+            scheduled.append(self.kwargs)
+
+    monkeypatch.setattr(plugin_module, "Thread", FakeThread)
+    sent = []
+    plugin.post_message = lambda **kwargs: sent.append(kwargs)
+    plugin._notify_scan_completed(
+        {
+            "scan_id": "scan-1",
+            "scanned": 2,
+            "candidates": [first, second],
+            "created_at": OLD,
+            "errors": [],
+        },
+        "扫描完成",
+    )
+
+    assert "本次新增：2" in sent[0]["text"]
+    assert len(scheduled[0]["args"][0]) == 2
+
+    sent.clear()
+    scheduled.clear()
+    plugin._notify_scan_completed(
+        {
+            "scan_id": "scan-2",
+            "scanned": 3,
+            "candidates": [first, second, third],
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "errors": [],
+        },
+        "扫描完成",
+    )
+
+    assert "本次新增：1" in sent[0]["text"]
+    assert "已推送过、暂不重复：2" in sent[0]["text"]
+    assert scheduled[0]["args"][0][0]["image"] == third["image"]
+
+    sent.clear()
+    scheduled.clear()
+    plugin._notify_scan_completed(
+        {
+            "scan_id": "scan-3",
+            "scanned": 3,
+            "candidates": [first, second, third],
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "errors": [],
+        },
+        "扫描完成",
+    )
+
+    assert sent == []
+    assert scheduled == []
+    assert set(data["scan_notified_candidates"]["items"]) == {
+        first["key"],
+        second["key"],
+        third["key"],
+    }
+
+
+def test_scan_push_migrates_previous_scan_without_repeating_it(monkeypatch):
+    plugin, data = _plugin(
+        monkeypatch,
+        notify_enabled=True,
+        notify_user="123456789",
+    )
+    first = {
+        "key": candidate_key("Emby", "movie", "movie-1"),
+        "server": "Emby",
+        "category": "movie",
+        "kind": "movie",
+        "title": "测试电影",
+        "image": "http://emby.local:8096/emby/Items/movie-1/Images/Primary",
+    }
+    second = {
+        **first,
+        "key": candidate_key("Emby", "movie", "movie-2"),
+        "title": "新增电影",
+        "image": "http://emby.local:8096/emby/Items/movie-2/Images/Primary",
+    }
+    previous_scan = {
+        "scan_id": "scan-old",
+        "created_at": OLD,
+        "candidates": [first],
+    }
+    scheduled = []
+
+    class FakeThread:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def start(self):
+            scheduled.append(self.kwargs)
+
+    monkeypatch.setattr(plugin_module, "Thread", FakeThread)
+    sent = []
+    plugin.post_message = lambda **kwargs: sent.append(kwargs)
+
+    plugin._notify_scan_completed(
+        {
+            "scan_id": "scan-new",
+            "scanned": 2,
+            "candidates": [first, second],
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "errors": [],
+        },
+        "扫描完成",
+        previous_scan=previous_scan,
+    )
+
+    assert "本次新增：1" in sent[0]["text"]
+    assert scheduled[0]["args"][0][0]["image"] == second["image"]
+    assert data["scan_notified_candidates"]["items"][first["key"]][
+        "scan_id"
+    ] == "scan-old"
+
+
 def test_delete_push_sends_each_result_with_its_poster(monkeypatch):
     plugin, _ = _plugin(
         monkeypatch,
@@ -1181,6 +1397,16 @@ def test_telegram_delete_callback_revalidates_and_deletes(monkeypatch):
         "last_played": YEAR_OLD,
         "added_at": YEAR_OLD,
     }
+    data["scan_notified_candidates"] = {
+        "version": 1,
+        "items": {
+            key: {
+                "first_notified_at": YEAR_OLD,
+                "last_notified_at": YEAR_OLD,
+                "scan_id": "scan-age",
+            }
+        },
+    }
     data["age_reminders"] = {
         "version": 1,
         "items": {
@@ -1233,6 +1459,7 @@ def test_telegram_delete_callback_revalidates_and_deletes(monkeypatch):
     assert adapter.deleted is True
     assert data["age_reminders"]["items"][key]["status"] == "deleted"
     assert data["last_scan"]["candidates"] == []
+    assert key not in data["scan_notified_candidates"]["items"]
     assert data["history"][0]["action"] == "telegram_delete"
     assert replies[-1]["title"] == "删除完成"
 
