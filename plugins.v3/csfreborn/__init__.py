@@ -51,6 +51,38 @@ IGNORED_MEDIA_DIRECTORIES = {
     "lost+found",
 }
 MAX_TMDB_METADATA_ITEMS = 500
+TMDB_IMAGE_HOSTS = {
+    "image.tmdb.org",
+    "media.themoviedb.org",
+    "themoviedb.org",
+    "www.themoviedb.org",
+}
+TMDB_INFO_FIELDS = (
+    "title",
+    "name",
+    "original_title",
+    "original_name",
+    "release_date",
+    "first_air_date",
+    "year",
+    "original_language",
+    "original_languages",
+    "language",
+    "languages",
+    "genre_ids",
+    "genres",
+    "genre",
+    "origin_country",
+    "production_countries",
+    "country",
+    "countries",
+    "country_codes",
+    "countryOfOrigin",
+    "poster_url",
+    "poster_path",
+    "poster",
+    "cover",
+)
 
 
 class CSFReborn(_PluginBase):
@@ -62,7 +94,7 @@ class CSFReborn(_PluginBase):
         "队列按季度展示封面，并支持手动挑选字幕。"
     )
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.10.5"
+    plugin_version = "0.10.6"
     plugin_author = "SubtitleForge contributors"
     author_url = "https://github.com/"
     plugin_config_prefix = "csfreborn_"
@@ -526,13 +558,34 @@ class CSFReborn(_PluginBase):
         language_count = sum(
             1 for item in metadata_items if item.get("original_language")
         )
+        poster_count = sum(
+            1 for item in metadata_items if item.get("poster_url")
+        )
         if targets:
             logger.info(
                 "SubtitleForge: 已为 "
                 f"{len(metadata_items)}/{min(len(targets), MAX_TMDB_METADATA_ITEMS)} "
                 "个媒体读取 MoviePilot/TMDB 元数据；"
                 f"国家字段 {country_count} 条、题材字段 {genre_count} 条、"
-                f"语言字段 {language_count} 条"
+                f"语言字段 {language_count} 条、海报 {poster_count} 条"
+            )
+        domestic_candidates = [
+            item
+            for item in metadata_items
+            if self._is_domestic_anime(item, [])
+        ]
+        if domestic_candidates:
+            samples = "; ".join(
+                (
+                    f"tmdb={item.get('tmdb_id')} "
+                    f"title={item.get('title') or '-'} "
+                    f"countries={item.get('origin_countries') or []}"
+                )
+                for item in domestic_candidates[:5]
+            )
+            logger.info(
+                "SubtitleForge: TMDB 自动识别国产动漫 "
+                f"{len(domestic_candidates)} 部；示例：{samples}"
             )
         incomplete = [
             item
@@ -727,27 +780,93 @@ class CSFReborn(_PluginBase):
         mtype = self._tmdb_media_type(media_type)
         chain = getattr(self, "chain", None)
         tmdb_info = getattr(chain, "tmdb_info", None)
+        primary = None
         if callable(tmdb_info):
             try:
-                info = tmdb_info(tmdbid=tmdb_id, mtype=mtype)
-                if info:
-                    return info
+                primary = tmdb_info(tmdbid=tmdb_id, mtype=mtype) or None
             except Exception as exc:  # noqa: BLE001 - fall back to TmdbApi
                 logger.debug(
                     "SubtitleForge: MoviePilot chain TMDB 查询失败 "
                     f"{tmdb_id}: {type(exc).__name__}: {exc}"
                 )
+        if primary is not None and not self._tmdb_info_needs_fallback(primary):
+            return primary
         client = self._get_tmdb_api_client()
         if client is None:
-            return None
+            return primary
+        fallback = None
         try:
-            return client.get_info(mtype=mtype, tmdbid=tmdb_id)
+            fallback = client.get_info(mtype=mtype, tmdbid=tmdb_id) or None
         except Exception as exc:  # noqa: BLE001 - one lookup must not stop a scan
             logger.debug(
                 f"SubtitleForge: TMDB {tmdb_id} 查询失败："
                 f"{type(exc).__name__}: {exc}"
             )
-            return None
+        return self._merge_tmdb_info(primary, fallback)
+
+    @classmethod
+    def _tmdb_info_needs_fallback(cls, info: Any) -> bool:
+        """Return whether a TMDB response lacks fields needed by the UI."""
+
+        if info is None:
+            return True
+        return not all(
+            (
+                cls._metadata_values(
+                    info,
+                    ("title", "name", "original_title", "original_name"),
+                ),
+                cls._metadata_values(
+                    info,
+                    ("genre_ids", "genres", "genre"),
+                ),
+                cls._metadata_values(
+                    info,
+                    (
+                        "origin_country",
+                        "production_countries",
+                        "country",
+                        "countries",
+                        "country_codes",
+                        "countryOfOrigin",
+                    ),
+                ),
+                cls._media_poster_url(info),
+            )
+        )
+
+    @classmethod
+    def _merge_tmdb_info(cls, primary: Any, fallback: Any) -> Any:
+        """Merge a chain response with the native TMDB compatibility result."""
+
+        if primary is None:
+            return fallback
+        if fallback is None:
+            return primary
+        merged: dict[str, Any] = {}
+        for name in TMDB_INFO_FIELDS:
+            primary_value = cls._field(primary, name)
+            if cls._metadata_has_value(primary_value):
+                merged[name] = primary_value
+                continue
+            fallback_value = cls._field(fallback, name)
+            if cls._metadata_has_value(fallback_value):
+                merged[name] = fallback_value
+        return merged or fallback
+
+    @staticmethod
+    def _metadata_has_value(value: Any) -> bool:
+        """Return whether a metadata field contains usable content."""
+
+        if value is None:
+            return False
+        if isinstance(value, str):
+            return bool(value.strip())
+        if isinstance(value, Mapping):
+            return bool(value)
+        if isinstance(value, (list, tuple, set)):
+            return bool(value)
+        return bool(value)
 
     def _get_tmdb_api_client(self) -> Any:
         """Lazily create a MoviePilot TmdbApi client for older hosts."""
@@ -890,11 +1009,17 @@ class CSFReborn(_PluginBase):
                 if domain:
                     if not domain.startswith(("http://", "https://")):
                         domain = f"https://{domain}"
-                    source_url = f"{domain.rstrip('/')}/t/p/w500{value}"
+                    source_url = (
+                        f"{domain.rstrip('/')}/t/p/w500/"
+                        f"{value.lstrip('/')}"
+                    )
                 else:
-                    source_url = f"https://image.tmdb.org/t/p/w500{value}"
+                    source_url = (
+                        "https://image.tmdb.org/t/p/w500/"
+                        f"{value.lstrip('/')}"
+                    )
         host = (urlsplit(source_url).hostname or "").casefold()
-        if host not in {"image.tmdb.org", "www.image.tmdb.org"}:
+        if host not in TMDB_IMAGE_HOSTS:
             return source_url
         api_prefix = str(
             getattr(settings, "API_V1_STR", "/api/v1") or "/api/v1"
@@ -926,6 +1051,8 @@ class CSFReborn(_PluginBase):
             ]
             media_type = str(group.get("media_type") or "movie")
             tmdb_id = self._optional_int(group.get("tmdb_id"))
+            if tmdb_id is not None and tmdb_id < 1:
+                tmdb_id = None
             if tmdb_id is None:
                 for item in items:
                     match = TMDB_PATH_PATTERN.search(
@@ -934,6 +1061,11 @@ class CSFReborn(_PluginBase):
                     if match:
                         tmdb_id = int(match.group(1))
                         break
+            current_poster = self._media_poster_url(
+                {"poster_url": group.get("poster")}
+            )
+            if current_poster:
+                group["poster"] = current_poster
             metadata = (
                 self._tmdb_metadata(tmdb_id, media_type)
                 if tmdb_id is not None
@@ -3473,12 +3605,35 @@ class CSFReborn(_PluginBase):
             text = str(value or "").strip()
             if not text:
                 continue
+            if text.startswith("//"):
+                text = f"https:{text}"
             if text.startswith(("http://", "https://")):
+                host = (urlsplit(text).hostname or "").casefold()
+                if host in TMDB_IMAGE_HOSTS:
+                    return cls._tmdb_image_url(text)
                 return text
-            if text.startswith("/"):
+            if text.startswith("data:image/"):
+                return text
+            api_prefix = str(
+                getattr(cls._moviepilot_settings(), "API_V1_STR", "/api/v1")
+                or "/api/v1"
+            ).rstrip("/")
+            if text.startswith(("/api/", "api/")):
+                return f"/{text.lstrip('/')}"
+            if text.startswith(("/system/", "system/")):
+                return f"{api_prefix}/{text.lstrip('/')}"
+            if text.startswith("/t/p/"):
                 return cls._tmdb_image_url(text)
-            if Path(text).is_absolute():
-                return text
+            if "imgurl=" in text and not Path(text).is_absolute():
+                query = text.split("imgurl=", 1)[1]
+                return f"{api_prefix}/system/img/1?imgurl={query}"
+            path_value = urlsplit(text).path
+            if (
+                "/" not in path_value.lstrip("/")
+                and Path(path_value).suffix.casefold()
+                in {".avif", ".jpeg", ".jpg", ".png", ".webp"}
+            ):
+                return cls._tmdb_image_url(f"/{text.lstrip('/')}")
         return None
 
     @staticmethod

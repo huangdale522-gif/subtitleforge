@@ -265,6 +265,72 @@ def test_media_poster_url_builds_tmdb_poster_url() -> None:
     )
 
 
+def test_media_poster_url_accepts_relative_moviepilot_proxy() -> None:
+    plugin_module = load_moviepilot_plugin()
+    plugin = plugin_module.CSFReborn()
+    media = types.SimpleNamespace(
+        poster_url=(
+            "api/v1/system/img/1?"
+            "imgurl=https%3A%2F%2Fimage.tmdb.org%2Ft%2Fp%2Fw500%2Fposter.jpg"
+        ),
+        poster_path=None,
+        poster=None,
+        cover=None,
+        tmdb_info={},
+    )
+
+    assert plugin._media_poster_url(media) == (
+        "/api/v1/system/img/1?"
+        "imgurl=https%3A%2F%2Fimage.tmdb.org%2Ft%2Fp%2Fw500%2Fposter.jpg"
+    )
+
+
+def test_media_poster_url_proxies_alternate_tmdb_cdn() -> None:
+    plugin_module = load_moviepilot_plugin()
+    plugin = plugin_module.CSFReborn()
+    media = types.SimpleNamespace(
+        poster_url="https://media.themoviedb.org/t/p/w500/poster.jpg",
+        poster_path=None,
+        poster=None,
+        cover=None,
+        tmdb_info={},
+    )
+
+    assert plugin._media_poster_url(media) == (
+        "/api/v1/system/img/1?"
+        "imgurl=https%3A%2F%2Fmedia.themoviedb.org%2Ft%2Fp%2Fw500%2Fposter.jpg"
+    )
+
+
+def test_fetch_tmdb_info_merges_native_fallback_when_chain_has_no_poster() -> None:
+    plugin_module = load_moviepilot_plugin()
+    plugin = plugin_module.CSFReborn()
+    plugin.chain = types.SimpleNamespace(
+        tmdb_info=lambda **_kwargs: {
+            "name": "葬送的芙莉莲",
+            "genre_ids": [16],
+            "origin_country": ["JP"],
+            "original_language": "ja",
+        }
+    )
+    plugin._tmdb_api_client = types.SimpleNamespace(
+        get_info=lambda **_kwargs: {
+            "name": "葬送的芙莉莲",
+            "genre_ids": [16],
+            "origin_country": ["JP"],
+            "original_language": "ja",
+            "poster_path": "/frieren.jpg",
+        }
+    )
+
+    metadata = plugin._tmdb_metadata(209867, "tv")
+
+    assert metadata is not None
+    assert metadata["title"] == "葬送的芙莉莲"
+    assert metadata["genres"] == ["16"]
+    assert "frieren.jpg" in metadata["poster_url"]
+
+
 def test_tmdb_image_url_uses_moviepilot_v3_runtime_settings(
     monkeypatch,
 ) -> None:
@@ -524,3 +590,71 @@ def test_queue_enrichment_hides_domestic_anime_and_adds_posters() -> None:
     assert [group["group_id"] for group in groups] == ["foreign"]
     assert "frieren.jpg" in groups[0]["poster"]
     assert "stale.jpg" not in groups[0]["poster"]
+
+
+def test_queue_enrichment_adds_posters_to_each_group() -> None:
+    plugin_module = load_moviepilot_plugin()
+    plugin = plugin_module.CSFReborn()
+    plugin._enabled = True
+    plugin._exclude_domestic_anime = True
+    plugin._domestic_anime_regions = "CN,TW,HK"
+    plugin._domestic_anime_path_keywords = "国漫,国产动画"
+    plugin.chain = types.SimpleNamespace(
+        tmdb_info=lambda tmdbid, **_kwargs: {
+            "name": f"Media {tmdbid}",
+            "genre_ids": [16] if int(tmdbid) == 209867 else [18],
+            "origin_country": ["JP"] if int(tmdbid) == 209867 else ["US"],
+            "original_language": "ja" if int(tmdbid) == 209867 else "en",
+            "poster_path": f"/{tmdbid}.jpg",
+        }
+    )
+    plugin._request_json = lambda *_args, **_kwargs: {
+        "status": "ok",
+        "queue": {"total": 3, "due": 3, "deferred": 0},
+        "queue_groups": {
+            "total": 3,
+            "due": 3,
+            "deferred": 0,
+            "groups": [
+                {
+                    "group_id": "movie",
+                    "title": "Movie",
+                    "media_type": "movie",
+                    "category": "movie",
+                    "tmdb_id": 1249289,
+                    "poster": None,
+                    "item_count": 1,
+                    "items": [{"video_path": "/plex/电影/Movie/movie.mkv"}],
+                },
+                {
+                    "group_id": "tv",
+                    "title": "Show",
+                    "media_type": "tv",
+                    "category": "tv",
+                    "tmdb_id": 1399,
+                    "poster": None,
+                    "item_count": 1,
+                    "items": [{"video_path": "/plex/电视剧/Show/S01E01.mkv"}],
+                },
+                {
+                    "group_id": "anime",
+                    "title": "Frieren",
+                    "media_type": "tv",
+                    "category": "anime",
+                    "tmdb_id": 209867,
+                    "poster": None,
+                    "item_count": 1,
+                    "items": [{"video_path": "/plex/动漫/Frieren/S01E01.mkv"}],
+                },
+            ],
+        },
+    }
+
+    result = asyncio.run(plugin.queue())
+
+    groups = result["queue_groups"]["groups"]
+    assert [group["group_id"] for group in groups] == ["movie", "tv", "anime"]
+    assert all(group["poster"] for group in groups)
+    assert "1249289.jpg" in groups[0]["poster"]
+    assert "1399.jpg" in groups[1]["poster"]
+    assert "209867.jpg" in groups[2]["poster"]
