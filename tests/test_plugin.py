@@ -486,7 +486,7 @@ def test_scan_library_forwards_selected_provider_sources() -> None:
     plugin._enabled = True
     plugin._scan_paths = ""
     plugin._scan_exclude_paths = ""
-    plugin._scan_provider_order = ["assrt", "xunlei"]
+    plugin._scan_provider_sources = ["assrt", "xunlei"]
     plugin._notify = False
     captured: dict = {}
 
@@ -515,18 +515,49 @@ def test_scan_provider_order_accepts_legacy_comma_text() -> None:
     ) == ["subtitle_best", "custom"]
 
 
+def test_scan_provider_sources_migrates_legacy_config() -> None:
+    plugin_module = load_moviepilot_plugin()
+    plugin = plugin_module.CSFReborn()
+
+    assert plugin._scan_provider_sources_from_config(
+        {"scan_provider_order": ""}
+    ) == []
+    assert plugin._scan_provider_sources_from_config(
+        {"scan_provider_order": "ASSRT,xunlei"}
+    ) == ["assrt", "xunlei"]
+    assert plugin._scan_provider_sources_from_config(
+        {
+            "scan_provider_sources": ["subtitle_best"],
+            "scan_provider_order": "assrt",
+        }
+    ) == ["subtitle_best"]
+
+
 def test_form_uses_multi_select_for_automatic_scan_sources() -> None:
     plugin_module = load_moviepilot_plugin()
     plugin = plugin_module.CSFReborn()
+    plugin._scan_provider_sources = ["assrt"]
 
     form, defaults = plugin.get_form()
     rendered = json.dumps(form, ensure_ascii=False)
 
-    assert '"model": "scan_provider_order"' in rendered
+    assert '"model": "scan_provider_sources"' in rendered
     assert '"multiple": true' in rendered
     assert "自动扫描字幕源（可选）" in rendered
     assert "SubtitleBest" in rendered
-    assert defaults["scan_provider_order"] == []
+    assert defaults["scan_provider_sources"] == ["assrt"]
+
+
+def test_manual_source_prompt_accepts_number_id_and_label() -> None:
+    plugin_module = load_moviepilot_plugin()
+    plugin = plugin_module.CSFReborn()
+
+    handler = plugin._manual_onclick("/plex/movie.mkv")
+
+    assert "可输入编号、ID 或名称" in handler
+    assert "optionKey" in handler
+    assert "labelKey" in handler
+    assert "未识别该字幕源" in handler
 
 
 def test_manual_search_forwards_selected_provider_source() -> None:
@@ -534,7 +565,7 @@ def test_manual_search_forwards_selected_provider_source() -> None:
     plugin = plugin_module.CSFReborn()
     plugin._enabled = True
     plugin._provider_order = "xunlei,assrt"
-    plugin._scan_provider_order = ["subtitle_best"]
+    plugin._scan_provider_sources = ["subtitle_best"]
     captured: dict = {}
 
     def request_json(method, path, payload, timeout=None):
@@ -561,7 +592,7 @@ def test_manual_search_auto_uses_global_order_not_scan_order() -> None:
     plugin = plugin_module.CSFReborn()
     plugin._enabled = True
     plugin._provider_order = "xunlei,assrt"
-    plugin._scan_provider_order = ["subtitle_best"]
+    plugin._scan_provider_sources = ["subtitle_best"]
     captured: dict = {}
 
     def request_json(method, path, payload, timeout=None):

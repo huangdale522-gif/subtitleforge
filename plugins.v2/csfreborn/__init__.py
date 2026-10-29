@@ -110,7 +110,7 @@ class CSFReborn(_PluginBase):
         "队列按季度展示封面，并支持手动挑选字幕。"
     )
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.10.9"
+    plugin_version = "0.10.10"
     plugin_author = "SubtitleForge contributors"
     author_url = "https://github.com/"
     plugin_config_prefix = "csfreborn_"
@@ -162,6 +162,8 @@ class CSFReborn(_PluginBase):
         self._scan_max_files = 10
         self._scan_daily_download_limit = 10
         self._scan_dry_run = True
+        self._scan_provider_sources: list[str] = []
+        # Kept as a read-only compatibility alias for older plugin data.
         self._scan_provider_order: list[str] = []
         self._scan_languages = ["zh-Hans"]
         self._managed_process: subprocess.Popen | None = None
@@ -238,9 +240,10 @@ class CSFReborn(_PluginBase):
         self._scan_languages = list(
             config.get("scan_languages") or ["zh-Hans"]
         )
-        self._scan_provider_order = self._normalize_provider_order(
-            config.get("scan_provider_order")
+        self._scan_provider_sources = self._scan_provider_sources_from_config(
+            config
         )
+        self._scan_provider_order = list(self._scan_provider_sources)
         try:
             self._scan_interval_hours = max(
                 1, int(config.get("scan_interval_hours") or 24)
@@ -510,7 +513,7 @@ class CSFReborn(_PluginBase):
             "overwrite": self._overwrite,
             "dry_run": self._scan_dry_run,
             "provider_failover": True,
-            "provider_order": self._scan_provider_order or None,
+            "provider_order": self._scan_provider_sources or None,
         }
         try:
             result = await asyncio.to_thread(
@@ -1740,7 +1743,7 @@ class CSFReborn(_PluginBase):
                     {
                         "component": "VSelect",
                         "props": {
-                            "model": "scan_provider_order",
+                            "model": "scan_provider_sources",
                             "label": "自动扫描字幕源（可选）",
                             "multiple": True,
                             "chips": True,
@@ -2023,7 +2026,7 @@ class CSFReborn(_PluginBase):
             "scan_max_files": 10,
             "scan_daily_download_limit": 10,
             "scan_dry_run": True,
-            "scan_provider_order": [],
+            "scan_provider_sources": list(self._scan_provider_sources),
             "scan_languages": ["zh-Hans"],
         }
 
@@ -3399,15 +3402,32 @@ class CSFReborn(_PluginBase):
             "return (i+1)+'. '+p.label;"
             "}).join('\\n');"
             "var sourceAnswer=prompt('选择本次手动搜索使用的字幕源："
-            "\\n\\n'+providerLines,'0');"
+            "\\n\\n可输入编号、ID 或名称。\\n\\n'+providerLines,'0');"
             "if(sourceAnswer===null){return;}"
             "sourceAnswer=String(sourceAnswer).trim();"
+            "var sourceKey=sourceAnswer.toLowerCase().replace("
+            "/[\\s_-]+/g,'');"
             "var providerOrder=null;"
-            "if(sourceAnswer!==''&&sourceAnswer!=='0'){"
-            "var sourceIndex=parseInt(sourceAnswer,10)-1;"
-            "if(isNaN(sourceIndex)||sourceIndex<0||"
-            "sourceIndex>=providerOptions.length){"
-            "alert('字幕源编号无效');return;}"
+            "if(sourceAnswer!==''&&sourceAnswer!=='0'&&"
+            "['auto','自动','自动顺序'].indexOf(sourceKey)===-1){"
+            "var sourceIndex=-1;"
+            "var numericIndex=parseInt(sourceAnswer,10);"
+            "if(String(numericIndex)===sourceAnswer&&"
+            "numericIndex>=1&&numericIndex<=providerOptions.length){"
+            "sourceIndex=numericIndex-1;"
+            "}else{"
+            "for(var i=0;i<providerOptions.length;i++){"
+            "var optionKey=String(providerOptions[i].value).toLowerCase()"
+            ".replace(/[\\s_-]+/g,'');"
+            "var labelKey=String(providerOptions[i].label).toLowerCase()"
+            ".replace(/[\\s_-]+/g,'');"
+            "if(sourceKey===optionKey||sourceKey===labelKey){"
+            "sourceIndex=i;break;}"
+            "}"
+            "}"
+            "if(sourceIndex<0){"
+            "alert('未识别该字幕源，请输入列表中的编号、ID 或名称');"
+            "return;}"
             "providerOrder=[providerOptions[sourceIndex].value];"
             "}"
             "var searchPayload={video_path:videoPath};"
@@ -3745,6 +3765,20 @@ class CSFReborn(_PluginBase):
             if name in PROVIDER_LABELS and name not in normalized:
                 normalized.append(name)
         return normalized
+
+    @classmethod
+    def _scan_provider_sources_from_config(
+        cls,
+        config: Mapping[str, Any],
+    ) -> list[str]:
+        """Read the new multi-select field, falling back to legacy text."""
+
+        key = (
+            "scan_provider_sources"
+            if "scan_provider_sources" in config
+            else "scan_provider_order"
+        )
+        return cls._normalize_provider_order(config.get(key))
 
     @staticmethod
     def _provider_select_items() -> list[dict[str, str]]:
