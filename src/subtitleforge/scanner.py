@@ -16,6 +16,7 @@ from datetime import UTC, datetime, timedelta
 from html import unescape
 from pathlib import Path
 from typing import Any, Iterable
+from xml.etree import ElementTree
 
 from .models import (
     ManualCandidateView,
@@ -57,9 +58,6 @@ POSTER_BASENAMES = (
     "folder",
     "show",
     "cover",
-    "thumb",
-    "fanart",
-    "banner",
 )
 POSTER_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp")
 POSTER_MAX_BYTES = 256 * 1024
@@ -583,6 +581,53 @@ def _nfo_values(content: str, *tags: str) -> list[str]:
     return list(dict.fromkeys(values))
 
 
+def _xml_local_name(tag: str) -> str:
+    """Return an XML tag without a namespace or namespace prefix."""
+
+    return tag.rsplit("}", 1)[-1].rsplit(":", 1)[-1].casefold()
+
+
+def _nfo_poster_values(content: str) -> list[str]:
+    """Read only root-level media artwork, never nested cast thumbnails."""
+
+    try:
+        root = ElementTree.fromstring(content)
+    except ElementTree.ParseError:
+        # A malformed NFO must not make us fall back to a broad regex that can
+        # accidentally select an actor/director headshot as the poster.
+        return []
+
+    values: list[str] = []
+
+    def add(value: str | None) -> None:
+        text = unescape(str(value or "")).strip()
+        if text:
+            values.append(text)
+
+    # Kodi/Jellyfin variants commonly use either <poster> directly or
+    # <art><poster>. Both are unambiguous media artwork.
+    for child in root:
+        if _xml_local_name(child.tag) == "poster":
+            add(child.text)
+    for child in root:
+        if _xml_local_name(child.tag) != "art":
+            continue
+        for nested in child:
+            if _xml_local_name(nested.tag) == "poster":
+                add(nested.text)
+
+    # A root-level <thumb aspect="poster"> is also valid. Ignore landscape
+    # thumbs because they are backdrops, not portrait cover art.
+    for child in root:
+        if _xml_local_name(child.tag) != "thumb":
+            continue
+        aspect = str(child.attrib.get("aspect") or "").casefold()
+        if aspect not in {"", "poster", "cover"}:
+            continue
+        add(child.text)
+    return list(dict.fromkeys(values))
+
+
 def _poster_data_uri(path: Path) -> str | None:
     """Embed a reasonably sized local poster without exposing NAS paths."""
 
@@ -676,19 +721,29 @@ def _media_category(video_path: Path, media_type: MediaType) -> str:
 def _read_nfo_metadata(path: Path) -> NfoMetadata:
     """Read IDs, genres and country metadata from nearby NFO files."""
 
-    show_dir = (
-        path.parent.parent
-        if SEASON_DIR_PATTERN.match(path.parent.name)
+    in_season_dir = bool(
+        SEASON_DIR_PATTERN.match(path.parent.name)
         or "season" in path.parent.name.casefold()
-        else path.parent
     )
-    candidates = [
-        path.with_suffix(".nfo"),
-        path.parent / "movie.nfo",
-        path.parent / "tvshow.nfo",
-        show_dir / "tvshow.nfo",
-        show_dir / "movie.nfo",
-    ]
+    is_tv = bool(
+        in_season_dir
+        or EPISODE_PATTERN.search(path.stem)
+        or CHINESE_EPISODE_PATTERN.search(path.stem)
+    )
+    show_dir = path.parent.parent if in_season_dir else path.parent
+    if is_tv:
+        candidates = [
+            show_dir / "tvshow.nfo",
+            path.parent / "season.nfo",
+            path.parent / "tvshow.nfo",
+            path.with_suffix(".nfo"),
+        ]
+    else:
+        candidates = [
+            path.with_suffix(".nfo"),
+            path.parent / "movie.nfo",
+            show_dir / "movie.nfo",
+        ]
     metadata = NfoMetadata()
     for candidate in dict.fromkeys(candidates):
         try:
@@ -717,8 +772,11 @@ def _read_nfo_metadata(path: Path) -> NfoMetadata:
         if not metadata.original_language:
             languages = _nfo_values(content, "original_language")
             metadata.original_language = languages[0] if languages else None
-        if not metadata.poster_url:
-            for value in _nfo_values(content, "thumb", "poster"):
+        allow_episode_poster = not (
+            is_tv and candidate == path.with_suffix(".nfo")
+        )
+        if not metadata.poster_url and allow_episode_poster:
+            for value in _nfo_poster_values(content):
                 if value.startswith(("http://", "https://")):
                     metadata.poster_url = value
                     break

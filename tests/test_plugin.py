@@ -211,6 +211,9 @@ def test_queue_page_shows_posters_seasons_and_manual_actions() -> None:
     rendered = json.dumps(plugin.get_page(), ensure_ascii=False)
 
     assert "VImg" in rendered
+    assert "VExpansionPanels" in rendered
+    assert "查看分集与手动选字幕" in rendered
+    assert "待处理分集" in rendered
     assert "手动选字幕" in rendered
     assert "第 1 季" in rendered
     assert "Some Show" in rendered
@@ -225,6 +228,21 @@ def test_plugin_registers_queue_and_manual_api_routes() -> None:
     paths = {route["path"] for route in plugin.get_api()}
 
     assert {"/queue", "/manual/search", "/manual/download"} <= paths
+
+
+def test_media_poster_url_does_not_use_landscape_backdrop() -> None:
+    plugin_module = load_moviepilot_plugin()
+    plugin = plugin_module.CSFReborn()
+    media = types.SimpleNamespace(
+        poster_url=None,
+        poster_path=None,
+        poster=None,
+        cover=None,
+        backdrop_path="/landscape-backdrop.jpg",
+        tmdb_info={"backdrop_path": "/another-backdrop.jpg"},
+    )
+
+    assert plugin._media_poster_url(media) is None
 
 
 def test_domestic_anime_filter_uses_moviepilot_metadata() -> None:

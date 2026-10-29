@@ -39,7 +39,7 @@ class CSFReborn(_PluginBase):
         "队列按季度展示封面，并支持手动挑选字幕。"
     )
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.10.0"
+    plugin_version = "0.10.1"
     plugin_author = "SubtitleForge contributors"
     author_url = "https://github.com/"
     plugin_config_prefix = "csfreborn_"
@@ -1870,8 +1870,8 @@ class CSFReborn(_PluginBase):
                 "component": "div",
                 "props": {"class": "text-caption mb-3"},
                 "text": (
-                    "电影单独显示；剧集和动漫按“名称 + 季度”合并。"
-                    "每个视频都可以手动搜索并指定要下载的字幕候选。"
+                    "电影单独显示；剧集和动漫按“名称 + 季度”合并，"
+                    "默认收起分集。展开本季后可逐集手动搜索并指定字幕。"
                 ),
             }
         ]
@@ -1941,33 +1941,72 @@ class CSFReborn(_PluginBase):
             for language in (group.get("missing_languages") or [])
         ) or "未标注"
         poster = str(group.get("poster") or "").strip()
-        poster_node: dict[str, Any] = (
-            {
-                "component": "VImg",
-                "props": {
-                    "src": poster,
-                    "alt": f"{title} 封面",
-                    "width": 76,
-                    "height": 112,
-                    "cover": True,
-                    "class": "rounded me-3 flex-shrink-0",
-                },
-            }
-            if poster
-            else {
-                "component": "VIcon",
-                "props": {
-                    "icon": "mdi-image-off-outline",
-                    "size": 46,
-                    "class": "me-3",
-                },
-            }
-        )
+        poster_frame_props = {
+            "class": (
+                "me-3 flex-shrink-0 rounded overflow-hidden "
+                "d-flex align-center justify-center"
+            ),
+            "style": (
+                "width:92px;height:138px;min-width:92px;"
+                "background:rgba(128,128,128,.12);"
+            ),
+        }
+        poster_node: dict[str, Any] = {
+            "component": "div",
+            "props": poster_frame_props,
+            "content": [
+                (
+                    {
+                        "component": "VImg",
+                        "props": {
+                            "src": poster,
+                            "alt": f"{title} 封面",
+                            "width": 92,
+                            "height": 138,
+                            "cover": True,
+                            "class": "w-100 h-100",
+                            "style": (
+                                "width:100%;height:100%;"
+                                "object-fit:cover;"
+                            ),
+                        },
+                    }
+                    if poster
+                    else {
+                        "component": "VIcon",
+                        "props": {
+                            "icon": "mdi-image-off-outline",
+                            "size": 42,
+                        },
+                    }
+                )
+            ],
+        }
         items = [
             item
             for item in (group.get("items") or [])
             if isinstance(item, dict)
         ]
+        is_series = category in {"tv", "anime"}
+        episode_numbers: list[int] = []
+        for item in items:
+            try:
+                episode_number = int(item.get("episode"))
+            except (TypeError, ValueError):
+                continue
+            if episode_number not in episode_numbers:
+                episode_numbers.append(episode_number)
+        episode_numbers.sort()
+        episode_preview = "、".join(
+            f"E{episode_number:02d}"
+            for episode_number in episode_numbers[:12]
+        )
+        if group.get("items_truncated") or len(episode_numbers) > 12:
+            episode_preview = (
+                f"{episode_preview} 等 {group.get('item_count', 0)} 集"
+                if episode_preview
+                else f"共 {group.get('item_count', 0)} 集"
+            )
         item_nodes = [self._queue_item_row(item) for item in items]
         if group.get("items_truncated"):
             item_nodes.append(
@@ -1988,6 +2027,32 @@ class CSFReborn(_PluginBase):
                     "text": "当前没有可展开的视频条目。",
                 }
             )
+        if is_series:
+            detail_nodes: list[dict[str, Any]] = [
+                {
+                    "component": "VExpansionPanels",
+                    "props": {"variant": "accordion", "flat": True},
+                    "content": [
+                        {
+                            "component": "VExpansionPanel",
+                            "props": {
+                                "title": (
+                                    "查看分集与手动选字幕"
+                                    f"（{group.get('item_count', len(items))} 集）"
+                                )
+                            },
+                            "content": [
+                                {
+                                    "component": "VExpansionPanelText",
+                                    "content": item_nodes,
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ]
+        else:
+            detail_nodes = item_nodes
         return {
             "component": "VCard",
             "props": {"variant": "tonal", "class": "mb-3"},
@@ -2027,7 +2092,13 @@ class CSFReborn(_PluginBase):
                                             },
                                             "content": [
                                                 self._chip(
-                                                    f"共 {group.get('item_count', len(items))} 个视频",
+                                                    (
+                                                        "待处理 "
+                                                        f"{group.get('item_count', len(items))} 集"
+                                                        if is_series
+                                                        else "共 "
+                                                        f"{group.get('item_count', len(items))} 个视频"
+                                                    ),
                                                     "info",
                                                 ),
                                                 self._chip(
@@ -2036,6 +2107,27 @@ class CSFReborn(_PluginBase):
                                                 ),
                                             ],
                                         },
+                                        *(
+                                            [
+                                                {
+                                                    "component": "div",
+                                                    "props": {
+                                                        "class": (
+                                                            "text-caption "
+                                                            "mt-2"
+                                                        )
+                                                    },
+                                                    "text": (
+                                                        "待处理分集："
+                                                        f"{episode_preview}"
+                                                        if episode_preview
+                                                        else "待处理分集：未识别"
+                                                    ),
+                                                }
+                                            ]
+                                            if is_series
+                                            else []
+                                        ),
                                     ],
                                 },
                             ],
@@ -2043,7 +2135,7 @@ class CSFReborn(_PluginBase):
                         {
                             "component": "div",
                             "props": {"class": "mt-2"},
-                            "content": item_nodes,
+                            "content": detail_nodes,
                         },
                     ],
                 }
@@ -2843,11 +2935,11 @@ class CSFReborn(_PluginBase):
         """Return a browser-safe MoviePilot/TMDB poster URL when available."""
 
         candidates: list[Any] = []
-        for name in ("poster_url", "poster_path", "poster", "cover", "backdrop_path"):
+        for name in ("poster_url", "poster_path", "poster", "cover"):
             candidates.append(cls._field(mediainfo, name))
         tmdb_info = cls._field(mediainfo, "tmdb_info")
         if isinstance(tmdb_info, Mapping):
-            for name in ("poster_path", "poster", "poster_url", "backdrop_path"):
+            for name in ("poster_path", "poster", "poster_url"):
                 candidates.append(tmdb_info.get(name))
         for value in candidates:
             text = str(value or "").strip()

@@ -9,6 +9,7 @@ from typing import Annotated, Any
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 from fastapi.responses import HTMLResponse
 
+from . import __version__
 from .config import Settings
 from .jobs import JobManager, JobStore
 from .models import (
@@ -51,7 +52,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(
         title="SubtitleForge",
-        version="0.4.0",
+        version=__version__,
         description="Provider-driven Chinese subtitle downloader for NAS and MoviePilot.",
         lifespan=lifespan,
     )
@@ -82,7 +83,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         service: SubtitleService = app.state.service
         return {
             "status": "ok",
-            "version": "0.4.0",
+            "version": __version__,
             "providers": {
                 name: provider.configured
                 for name, provider in service.providers.items()
@@ -101,7 +102,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         service: SubtitleService = app.state.service
         return {
             "status": "ok",
-            "version": "0.4.0",
+            "version": __version__,
             **scanner.status(daily_download_limit, queue_limit),
             "providers": service.status(),
         }

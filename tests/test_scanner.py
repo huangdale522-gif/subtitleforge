@@ -138,6 +138,56 @@ def test_parse_path_reads_imdb_from_kodi_nfo(tmp_path: Path) -> None:
     assert media.tmdb_id == 7654321
 
 
+def test_parse_movie_nfo_ignores_actor_thumb_and_uses_root_poster(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "电影" / "外语电影"
+    video = root / "Movie (2024)" / "Movie.2024.mkv"
+    video.parent.mkdir(parents=True)
+    video.write_bytes(b"video")
+    (video.parent / "poster.jpg").write_bytes(b"correct-poster")
+    (video.parent / "actor.jpg").write_bytes(b"actor-headshot")
+    (video.parent / "movie.nfo").write_text(
+        (
+            "<movie>"
+            "<poster>poster.jpg</poster>"
+            "<actor><name>Actor</name><thumb>actor.jpg</thumb></actor>"
+            "</movie>"
+        ),
+        encoding="utf-8",
+    )
+
+    media = parse_media_path(video, root)
+
+    assert media.poster_url == str(video.parent / "poster.jpg")
+
+
+def test_parse_tv_nfo_never_uses_nested_actor_thumb_as_poster(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "电视剧"
+    video = (
+        root
+        / "Some Show (2024)"
+        / "Season 1"
+        / "Some.Show.S01E01.mkv"
+    )
+    video.parent.mkdir(parents=True)
+    video.write_bytes(b"video")
+    (video.parent.parent / "tvshow.nfo").write_text(
+        (
+            "<tvshow>"
+            "<actor><name>Actor</name><thumb>actor.jpg</thumb></actor>"
+            "</tvshow>"
+        ),
+        encoding="utf-8",
+    )
+
+    media = parse_media_path(video, root)
+
+    assert media.poster_url is None
+
+
 def test_parse_path_reads_anime_metadata_from_nfo(tmp_path: Path) -> None:
     root = tmp_path / "动漫"
     video = (
