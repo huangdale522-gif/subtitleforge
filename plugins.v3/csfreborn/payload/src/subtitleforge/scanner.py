@@ -28,6 +28,7 @@ from .models import (
     QueueGroupView,
     QueueItemView,
     QueueView,
+    ScanMediaMetadata,
     ScanItemResult,
     ScanRequest,
     ScanResult,
@@ -169,6 +170,7 @@ class DiscoveredVideo:
     origin_countries: list[str] = field(default_factory=list)
     original_language: str | None = None
     poster_url: str | None = None
+    poster_source: str | None = None
 
 
 @dataclass(slots=True)
@@ -872,7 +874,61 @@ def parse_media_path(path: Path, root: Path) -> DiscoveredVideo:
         origin_countries=nfo.origin_countries,
         original_language=nfo.original_language,
         poster_url=nfo.poster_url,
+        poster_source="nfo" if nfo.poster_url else None,
     )
+
+
+def _path_prefix_matches(path: Path, prefix: str) -> bool:
+    """Return whether a media path is inside a configured metadata prefix."""
+
+    path_text = str(path).replace("\\", "/").rstrip("/").casefold()
+    prefix_text = str(prefix).replace("\\", "/").rstrip("/").casefold()
+    return bool(prefix_text) and (
+        path_text == prefix_text or path_text.startswith(f"{prefix_text}/")
+    )
+
+
+def _metadata_match_score(
+    media: DiscoveredVideo,
+    metadata: ScanMediaMetadata,
+) -> int:
+    """Score MoviePilot metadata so the most specific path wins."""
+
+    score = 0
+    for prefix in metadata.path_prefixes:
+        if _path_prefix_matches(media.path, prefix):
+            score = max(score, 10_000 + len(prefix))
+    if metadata.tmdb_id and metadata.tmdb_id == media.tmdb_id:
+        if metadata.media_type in (None, media.media_type):
+            score = max(score, 5_000)
+        else:
+            score = max(score, 4_000)
+    return score
+
+
+def _apply_scan_metadata(
+    media: DiscoveredVideo,
+    values: list[ScanMediaMetadata],
+) -> None:
+    """Overlay MoviePilot metadata without weakening existing NFO evidence."""
+
+    matches = [
+        (score, metadata)
+        for metadata in values
+        if (score := _metadata_match_score(media, metadata)) > 0
+    ]
+    if not matches:
+        return
+    _, metadata = max(matches, key=lambda item: item[0])
+    if metadata.genres:
+        media.genres = list(dict.fromkeys([*metadata.genres, *media.genres]))
+    if metadata.origin_countries:
+        media.origin_countries = list(metadata.origin_countries)
+    if metadata.original_language:
+        media.original_language = metadata.original_language
+    if metadata.poster_url:
+        media.poster_url = metadata.poster_url
+        media.poster_source = "moviepilot"
 
 
 def _region_key(value: Any) -> str:
@@ -1383,6 +1439,7 @@ class LibraryScanner:
         # Phase 1: inspect every file locally. This never queries a provider.
         for path, root in ordered:
             discovered_media = parse_media_path(path, root)
+            _apply_scan_metadata(discovered_media, request.media_metadata)
             if (
                 request.exclude_domestic_anime
                 and is_domestic_anime(
@@ -1457,9 +1514,7 @@ class LibraryScanner:
                     season=discovered_media.season,
                     episode=discovered_media.episode,
                     poster_url=discovered_media.poster_url,
-                    poster_source=(
-                        "nfo" if discovered_media.poster_url else None
-                    ),
+                    poster_source=discovered_media.poster_source,
                     languages=inspected.missing_languages,
                     overwrite=request.overwrite,
                     dry_run=False,

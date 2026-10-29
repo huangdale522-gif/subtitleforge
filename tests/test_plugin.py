@@ -19,6 +19,7 @@ def load_moviepilot_plugin():
         TransferComplete="TransferComplete",
     )
     types_module.MessageType = types.SimpleNamespace(Plugin="Plugin")
+    types_module.MediaType = types.SimpleNamespace(MOVIE="movie", TV="tv")
     events_module = types.ModuleType("app.sdk.events")
 
     class Event:
@@ -245,6 +246,61 @@ def test_media_poster_url_does_not_use_landscape_backdrop() -> None:
     assert plugin._media_poster_url(media) is None
 
 
+def test_media_poster_url_builds_tmdb_poster_url() -> None:
+    plugin_module = load_moviepilot_plugin()
+    plugin = plugin_module.CSFReborn()
+    media = types.SimpleNamespace(
+        poster_url=None,
+        poster_path="/poster.jpg",
+        poster=None,
+        cover=None,
+        tmdb_info={},
+    )
+
+    assert plugin._media_poster_url(media) == (
+        "/api/v1/system/img/0?"
+        "imgurl=https%3A%2F%2Fimage.tmdb.org%2Ft%2Fp%2Fw500%2Fposter.jpg"
+    )
+
+
+def test_tmdb_image_url_uses_moviepilot_v3_runtime_settings(
+    monkeypatch,
+) -> None:
+    plugin_module = load_moviepilot_plugin()
+    settings_module = types.ModuleType("app.runtime.config")
+    settings_module.settings = types.SimpleNamespace(
+        API_V1_STR="/api/v1",
+        TMDB_IMAGE_URL=lambda path, size: (
+            f"https://images.example/t/p/{size}/{str(path).lstrip('/')}"
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "app.runtime.config", settings_module)
+
+    assert plugin_module.CSFReborn._tmdb_image_url("/poster.jpg") == (
+        "https://images.example/t/p/w500/poster.jpg"
+    )
+
+
+def test_tmdb_image_url_proxies_default_domain_through_moviepilot(
+    monkeypatch,
+) -> None:
+    plugin_module = load_moviepilot_plugin()
+    settings_module = types.ModuleType("app.runtime.config")
+    settings_module.settings = types.SimpleNamespace(
+        API_V1_STR="/api/v1",
+        TMDB_IMAGE_DOMAIN="image.tmdb.org",
+        TMDB_IMAGE_URL=lambda path, size: (
+            f"https://image.tmdb.org/t/p/{size}/{str(path).lstrip('/')}"
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "app.runtime.config", settings_module)
+
+    assert plugin_module.CSFReborn._tmdb_image_url("/poster.jpg") == (
+        "/api/v1/system/img/0?"
+        "imgurl=https%3A%2F%2Fimage.tmdb.org%2Ft%2Fp%2Fw500%2Fposter.jpg"
+    )
+
+
 def test_domestic_anime_filter_uses_moviepilot_metadata() -> None:
     plugin_module = load_moviepilot_plugin()
     plugin = plugin_module.CSFReborn()
@@ -312,3 +368,129 @@ def test_scan_library_sends_domestic_anime_filter_settings() -> None:
     assert captured["exclude_domestic_anime"] is True
     assert captured["domestic_anime_regions"] == ["CN", "TW", "HK"]
     assert captured["domestic_anime_path_keywords"] == ["国漫", "国产动画"]
+
+
+def test_scan_library_sends_moviepilot_tmdb_metadata(tmp_path: Path) -> None:
+    plugin_module = load_moviepilot_plugin()
+    plugin = plugin_module.CSFReborn()
+    show = tmp_path / "牧神记 (2024) {tmdbid=236534}" / "Season 1"
+    show.mkdir(parents=True)
+    video = show / "牧神记 S01E08 2160p.OurTV.mp4"
+    video.write_bytes(b"video")
+    plugin._enabled = True
+    plugin._scan_paths = str(tmp_path)
+    plugin._scan_exclude_paths = ""
+    plugin._exclude_domestic_anime = True
+    plugin._domestic_anime_regions = "CN,TW,HK"
+    plugin._domestic_anime_path_keywords = "国漫,国产动画"
+    plugin._notify = False
+    plugin.chain = types.SimpleNamespace(
+        tmdb_info=lambda **_kwargs: {
+            "name": "牧神记",
+            "first_air_date": "2024-10-27",
+            "genre_ids": [16],
+            "origin_country": ["CN"],
+            "original_language": "zh",
+            "poster_path": "/mushenji.jpg",
+        }
+    )
+    captured: dict = {}
+
+    def request_json(method, path, payload, timeout=None):
+        captured.update(payload)
+        return {"status": "ok", "items": []}
+
+    plugin._request_json = request_json
+    plugin.save_data = lambda *_args, **_kwargs: None
+
+    result = asyncio.run(plugin.scan_library())
+
+    assert result["metadata_enriched"] == 1
+    metadata = captured["media_metadata"][0]
+    assert metadata["tmdb_id"] == 236534
+    assert metadata["media_type"] == "tv"
+    assert metadata["origin_countries"] == ["CN"]
+    assert metadata["genres"] == ["16"]
+    assert "mushenji.jpg" in metadata["poster_url"]
+    assert str(show.parent) in metadata["path_prefixes"]
+
+
+def test_queue_enrichment_hides_domestic_anime_and_adds_posters() -> None:
+    plugin_module = load_moviepilot_plugin()
+    plugin = plugin_module.CSFReborn()
+    plugin._enabled = True
+    plugin._exclude_domestic_anime = True
+    plugin._domestic_anime_regions = "CN,TW,HK"
+    plugin._domestic_anime_path_keywords = "国漫,国产动画"
+    plugin.chain = types.SimpleNamespace(
+        tmdb_info=lambda tmdbid, **_kwargs: (
+            {
+                "name": "牧神记",
+                "genre_ids": [16],
+                "origin_country": ["CN"],
+                "original_language": "zh",
+                "poster_path": "/mushenji.jpg",
+            }
+            if int(tmdbid) == 236534
+            else {
+                "name": "葬送的芙莉莲",
+                "genre_ids": [16],
+                "origin_country": ["JP"],
+                "original_language": "ja",
+                "poster_path": "/frieren.jpg",
+            }
+        )
+    )
+    plugin._request_json = lambda *_args, **_kwargs: {
+        "status": "ok",
+        "queue": {"total": 2, "due": 2, "deferred": 0},
+        "queue_groups": {
+            "total": 2,
+            "due": 2,
+            "deferred": 0,
+            "groups": [
+                {
+                    "group_id": "domestic",
+                    "title": "牧神记",
+                    "media_type": "tv",
+                    "category": "anime",
+                    "season": 1,
+                    "tmdb_id": 236534,
+                    "poster": None,
+                    "item_count": 1,
+                    "items": [
+                        {
+                            "video_path": "/plex/动漫/牧神记/Season 1/E08.mp4",
+                            "deferred": False,
+                        }
+                    ],
+                },
+                {
+                    "group_id": "foreign",
+                    "title": "葬送的芙莉莲",
+                    "media_type": "tv",
+                    "category": "anime",
+                    "season": 1,
+                    "tmdb_id": 209867,
+                    "poster": "https://image.tmdb.org/t/p/w500/stale.jpg",
+                    "item_count": 1,
+                    "items": [
+                        {
+                            "video_path": "/plex/动漫/芙莉莲/Season 1/E08.mkv",
+                            "deferred": False,
+                        }
+                    ],
+                },
+            ],
+        },
+    }
+
+    result = asyncio.run(plugin.queue())
+
+    assert result["excluded_in_queue"] == 1
+    assert result["queue"]["total"] == 1
+    assert result["queue_groups"]["total"] == 1
+    groups = result["queue_groups"]["groups"]
+    assert [group["group_id"] for group in groups] == ["foreign"]
+    assert "frieren.jpg" in groups[0]["poster"]
+    assert "stale.jpg" not in groups[0]["poster"]

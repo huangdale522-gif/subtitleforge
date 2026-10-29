@@ -122,6 +122,43 @@ class ProcessResult(BaseModel):
     dry_run: bool = False
 
 
+class ScanMediaMetadata(BaseModel):
+    """MoviePilot metadata attached to a library item before scanning."""
+
+    tmdb_id: int | None = Field(default=None, ge=1)
+    media_type: MediaType | None = None
+    genres: list[str] = Field(default_factory=list)
+    origin_countries: list[str] = Field(default_factory=list)
+    original_language: str | None = Field(default=None, max_length=32)
+    poster_url: str | None = Field(default=None, max_length=4096)
+    path_prefixes: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def normalize_metadata_lists(self) -> ScanMediaMetadata:
+        """Remove duplicate metadata while preserving the provider order."""
+
+        self.genres = list(
+            dict.fromkeys(value.strip() for value in self.genres if value.strip())
+        )
+        self.origin_countries = list(
+            dict.fromkeys(
+                value.strip()
+                for value in self.origin_countries
+                if value.strip()
+            )
+        )
+        self.path_prefixes = list(
+            dict.fromkeys(
+                value.strip()
+                for value in self.path_prefixes
+                if value.strip()
+            )
+        )
+        if self.original_language is not None:
+            self.original_language = self.original_language.strip() or None
+        return self
+
+
 class ScanRequest(BaseModel):
     """Configuration for a full inventory pass and a bounded download batch."""
 
@@ -141,6 +178,7 @@ class ScanRequest(BaseModel):
             "国创",
         ]
     )
+    media_metadata: list[ScanMediaMetadata] = Field(default_factory=list)
     video_extensions: list[str] = Field(
         default_factory=lambda: [
             ".mkv",

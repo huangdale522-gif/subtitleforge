@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -13,10 +14,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
 
 from fastapi import Body
-from app.schemas.types import EventType
+from app.schemas.types import EventType, MediaType
 
 try:
     from app.schemas.types import MessageType
@@ -30,6 +32,27 @@ except ImportError:
     from app.schemas.types import NotificationType as MessageType
 
 
+TMDB_PATH_PATTERN = re.compile(r"(?i)\{?\btmdbid\s*[=:]\s*(\d+)\}?")
+EPISODE_PATH_PATTERN = re.compile(
+    r"(?i)(?:^|[^a-z0-9])s(\d{1,2})[ ._-]*e(\d{1,3})(?:[^0-9]|$)"
+)
+EPISODE_ONLY_PATH_PATTERN = re.compile(
+    r"(?i)(?:^|[^a-z0-9])e(?:p)?(\d{1,3})(?:[^0-9]|$)"
+)
+CHINESE_EPISODE_PATH_PATTERN = re.compile(r"第\s*(\d{1,4})\s*[集话話]")
+SEASON_PATH_PATTERN = re.compile(r"(?i)^(?:season|s)\s*(\d{1,2})$")
+IGNORED_MEDIA_DIRECTORIES = {
+    "@eadir",
+    "#recycle",
+    "$recycle.bin",
+    ".recycle",
+    ".trash",
+    "bdmv",
+    "lost+found",
+}
+MAX_TMDB_METADATA_ITEMS = 500
+
+
 class CSFReborn(_PluginBase):
     """Complete subtitles after transfers and during scheduled library scans."""
 
@@ -39,7 +62,7 @@ class CSFReborn(_PluginBase):
         "队列按季度展示封面，并支持手动挑选字幕。"
     )
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.10.2"
+    plugin_version = "0.10.3"
     plugin_author = "SubtitleForge contributors"
     author_url = "https://github.com/"
     plugin_config_prefix = "csfreborn_"
@@ -100,6 +123,9 @@ class CSFReborn(_PluginBase):
         self._history_key = "download_history"
         self._latest_scan_key = "latest_scan"
         self._history_max = 30
+        self._tmdb_metadata_cache: dict[str, dict[str, Any]] = {}
+        self._tmdb_api_client: Any = None
+        self._tmdb_api_import_failed = False
 
     def init_plugin(self, config: dict | None = None) -> None:
         """Load configuration; safe to call repeatedly."""
@@ -297,7 +323,9 @@ class CSFReborn(_PluginBase):
                 None,
                 20,
             )
-            return result if isinstance(result, dict) else {"status": "error"}
+            if not isinstance(result, dict):
+                return {"status": "error"}
+            return await asyncio.to_thread(self._enrich_queue_view, result)
         except Exception as exc:  # noqa: BLE001 - page request must degrade
             return {
                 "status": "error",
@@ -407,6 +435,7 @@ class CSFReborn(_PluginBase):
         if self._scan_running:
             return {"status": "busy", "message": "已有媒体库扫描正在运行"}
         self._scan_running = True
+        media_metadata = await asyncio.to_thread(self._build_scan_media_metadata)
         payload = {
             "paths": self._split_list(self._scan_paths),
             "exclude_paths": self._split_list(self._scan_exclude_paths),
@@ -417,6 +446,7 @@ class CSFReborn(_PluginBase):
             "domestic_anime_path_keywords": self._split_list(
                 self._domestic_anime_path_keywords
             ),
+            "media_metadata": media_metadata,
             "video_extensions": self._split_list(self._scan_video_extensions),
             "languages": self._scan_languages or self._languages,
             "max_files": self._scan_max_files,
@@ -440,6 +470,7 @@ class CSFReborn(_PluginBase):
             )
             result["time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             result["trigger"] = "manual" if manual else "schedule"
+            result["metadata_enriched"] = len(media_metadata)
             self.save_data(
                 self._latest_scan_key,
                 json.dumps(result, ensure_ascii=False),
@@ -467,6 +498,437 @@ class CSFReborn(_PluginBase):
             return {"status": "error", "errors": [message]}
         finally:
             self._scan_running = False
+
+    def _build_scan_media_metadata(self) -> list[dict[str, Any]]:
+        """Build browser-safe MoviePilot/TMDB metadata for scheduled scans."""
+
+        targets = self._discover_scan_metadata_targets()
+        metadata_items: list[dict[str, Any]] = []
+        missing = 0
+        for target in targets[:MAX_TMDB_METADATA_ITEMS]:
+            metadata = self._tmdb_metadata(
+                int(target["tmdb_id"]),
+                str(target["media_type"]),
+            )
+            if not metadata:
+                missing += 1
+                continue
+            item = dict(metadata)
+            item["path_prefixes"] = sorted(target["path_prefixes"])
+            metadata_items.append(item)
+        if targets:
+            logger.info(
+                "SubtitleForge: 已为 "
+                f"{len(metadata_items)}/{min(len(targets), MAX_TMDB_METADATA_ITEMS)} "
+                "个媒体读取 MoviePilot/TMDB 元数据"
+            )
+        if missing:
+            logger.warning(
+                f"SubtitleForge: {missing} 个媒体未取得 TMDB 元数据，"
+                "将继续使用 NFO 和路径规则"
+            )
+        return metadata_items
+
+    def _discover_scan_metadata_targets(self) -> list[dict[str, Any]]:
+        """Group scanned video files by TMDB identity before calling the service."""
+
+        extensions = {
+            value.casefold() if value.startswith(".") else f".{value.casefold()}"
+            for value in self._split_list(self._scan_video_extensions)
+        }
+        excluded_paths = self._split_list(self._scan_exclude_paths)
+        targets: dict[str, dict[str, Any]] = {}
+        for raw_root in self._split_list(self._scan_paths):
+            root = Path(raw_root).expanduser()
+            if not root.exists():
+                continue
+            if root.is_file():
+                candidates = [(root.parent, [], [root.name])]
+            else:
+                candidates = os.walk(root, followlinks=False)
+            for current, directories, filenames in candidates:
+                current_path = Path(current)
+                if self._is_excluded_scan_path(current_path, excluded_paths):
+                    directories[:] = []
+                    continue
+                directories[:] = [
+                    name
+                    for name in directories
+                    if name.casefold() not in IGNORED_MEDIA_DIRECTORIES
+                    and not self._is_excluded_scan_path(
+                        current_path / name,
+                        excluded_paths,
+                    )
+                ]
+                for filename in filenames:
+                    video = current_path / filename
+                    if video.suffix.casefold() not in extensions:
+                        continue
+                    media_type = self._infer_scan_media_type(video)
+                    tmdb_id = self._extract_scan_tmdb_id(
+                        video,
+                        root if root.is_dir() else root.parent,
+                        media_type,
+                    )
+                    if not tmdb_id:
+                        continue
+                    key = f"{media_type}:{tmdb_id}"
+                    target = targets.setdefault(
+                        key,
+                        {
+                            "tmdb_id": tmdb_id,
+                            "media_type": media_type,
+                            "path_prefixes": set(),
+                        },
+                    )
+                    target["path_prefixes"].add(
+                        str(self._scan_media_directory(video, media_type))
+                    )
+        return list(targets.values())
+
+    @staticmethod
+    def _is_excluded_scan_path(path: Path, excluded_paths: list[str]) -> bool:
+        """Return whether a path is under one of the configured exclusions."""
+
+        path_text = str(path).replace("\\", "/").rstrip("/").casefold()
+        for raw_path in excluded_paths:
+            excluded = str(raw_path).replace("\\", "/").rstrip("/").casefold()
+            if excluded and (
+                path_text == excluded or path_text.startswith(f"{excluded}/")
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _infer_scan_media_type(video: Path) -> str:
+        """Infer TV versus movie from conventional season and episode names."""
+
+        if SEASON_PATH_PATTERN.match(video.parent.name):
+            return "tv"
+        if EPISODE_PATH_PATTERN.search(video.stem):
+            return "tv"
+        if EPISODE_ONLY_PATH_PATTERN.search(video.stem):
+            return "tv"
+        if CHINESE_EPISODE_PATH_PATTERN.search(video.stem):
+            return "tv"
+        return "movie"
+
+    @staticmethod
+    def _scan_media_directory(video: Path, media_type: str) -> Path:
+        """Return the stable show or movie directory for metadata matching."""
+
+        if media_type == "tv" and SEASON_PATH_PATTERN.match(video.parent.name):
+            return video.parent.parent
+        return video.parent
+
+    def _extract_scan_tmdb_id(
+        self,
+        video: Path,
+        root: Path,
+        media_type: str,
+    ) -> int | None:
+        """Read a TMDB ID from the renamed path, falling back to nearby NFO."""
+
+        try:
+            relative_parts = video.relative_to(root).parts
+        except ValueError:
+            relative_parts = video.parts
+        for value in (*reversed(relative_parts), video.stem):
+            match = TMDB_PATH_PATTERN.search(str(value))
+            if match:
+                return int(match.group(1))
+
+        media_dir = self._scan_media_directory(video, media_type)
+        candidates = (
+            [media_dir / "tvshow.nfo", video.with_suffix(".nfo")]
+            if media_type == "tv"
+            else [video.with_suffix(".nfo"), media_dir / "movie.nfo"]
+        )
+        for candidate in dict.fromkeys(candidates):
+            try:
+                content = candidate.read_text(
+                    encoding="utf-8",
+                    errors="ignore",
+                )[:262_144]
+            except OSError:
+                continue
+            for pattern in (
+                r"(?is)<tmdbid>\s*(\d+)\s*</tmdbid>",
+                (
+                    r"(?is)<uniqueid[^>]*type=[\"']tmdb[\"'][^>]*>"
+                    r"\s*(\d+)\s*</uniqueid>"
+                ),
+            ):
+                match = re.search(pattern, content)
+                if match:
+                    return int(match.group(1))
+        return None
+
+    @staticmethod
+    def _tmdb_metadata_key(tmdb_id: int, media_type: str) -> str:
+        """Build a cache key that keeps movie and TV namespaces separate."""
+
+        return f"{media_type}:{tmdb_id}"
+
+    def _tmdb_metadata(
+        self,
+        tmdb_id: int,
+        media_type: str,
+    ) -> dict[str, Any] | None:
+        """Return sanitized TMDB metadata suitable for the local service."""
+
+        key = self._tmdb_metadata_key(tmdb_id, media_type)
+        if key in self._tmdb_metadata_cache:
+            return dict(self._tmdb_metadata_cache[key])
+        info = self._fetch_tmdb_info(tmdb_id, media_type)
+        if not info:
+            return None
+        metadata = self._sanitize_tmdb_metadata(info, tmdb_id, media_type)
+        if not metadata:
+            return None
+        self._tmdb_metadata_cache[key] = metadata
+        return dict(metadata)
+
+    def _fetch_tmdb_info(self, tmdb_id: int, media_type: str) -> Any:
+        """Use MoviePilot's chain first, then the TMDB API compatibility path."""
+
+        mtype = self._tmdb_media_type(media_type)
+        chain = getattr(self, "chain", None)
+        tmdb_info = getattr(chain, "tmdb_info", None)
+        if callable(tmdb_info):
+            try:
+                info = tmdb_info(tmdbid=tmdb_id, mtype=mtype)
+                if info:
+                    return info
+            except Exception as exc:  # noqa: BLE001 - fall back to TmdbApi
+                logger.debug(
+                    "SubtitleForge: MoviePilot chain TMDB 查询失败 "
+                    f"{tmdb_id}: {type(exc).__name__}: {exc}"
+                )
+        client = self._get_tmdb_api_client()
+        if client is None:
+            return None
+        try:
+            return client.get_info(mtype=mtype, tmdbid=tmdb_id)
+        except Exception as exc:  # noqa: BLE001 - one lookup must not stop a scan
+            logger.debug(
+                f"SubtitleForge: TMDB {tmdb_id} 查询失败："
+                f"{type(exc).__name__}: {exc}"
+            )
+            return None
+
+    def _get_tmdb_api_client(self) -> Any:
+        """Lazily create a MoviePilot TmdbApi client for older hosts."""
+
+        if self._tmdb_api_client is not None:
+            return self._tmdb_api_client
+        if self._tmdb_api_import_failed:
+            return None
+        try:
+            try:
+                from app.modules.themoviedb.tmdbapi import TmdbApi
+            except ImportError:
+                from app.modules.themoviedb import TmdbApi
+            self._tmdb_api_client = TmdbApi()
+        except Exception as exc:  # noqa: BLE001 - optional compatibility path
+            self._tmdb_api_import_failed = True
+            logger.warning(
+                "SubtitleForge: 当前 MoviePilot 无法加载 TMDB 元数据接口，"
+                f"将仅使用 NFO/路径规则：{type(exc).__name__}: {exc}"
+            )
+            return None
+        return self._tmdb_api_client
+
+    @staticmethod
+    def _tmdb_media_type(media_type: str) -> Any:
+        """Return MoviePilot's MediaType enum for a canonical media type."""
+
+        return MediaType.MOVIE if media_type == "movie" else MediaType.TV
+
+    @classmethod
+    def _sanitize_tmdb_metadata(
+        cls,
+        info: Any,
+        tmdb_id: int,
+        media_type: str,
+    ) -> dict[str, Any]:
+        """Keep only safe, useful fields from a MoviePilot/TMDB response."""
+
+        title_values = cls._metadata_values(
+            info,
+            (
+                "title",
+                "name",
+                "original_title",
+                "original_name",
+            ),
+        )
+        date_values = cls._metadata_values(
+            info,
+            ("release_date", "first_air_date", "year"),
+        )
+        year = None
+        for value in date_values:
+            match = re.search(r"(?<!\d)((?:18|19|20)\d{2})(?!\d)", value)
+            if match:
+                year = int(match.group(1))
+                break
+        language_values = cls._metadata_values(
+            info,
+            ("original_language", "original_languages"),
+        )
+        return {
+            "tmdb_id": tmdb_id,
+            "media_type": media_type,
+            "title": title_values[0] if title_values else None,
+            "year": year,
+            "genres": cls._metadata_values(info, ("genre_ids", "genres")),
+            "origin_countries": cls._metadata_values(
+                info,
+                ("origin_country", "production_countries", "country"),
+            ),
+            "original_language": (
+                language_values[0] if language_values else None
+            ),
+            "poster_url": cls._media_poster_url(info),
+        }
+
+    @staticmethod
+    def _moviepilot_settings() -> Any:
+        """Load MoviePilot settings across V2, V3 and compatibility layouts."""
+
+        for module_name in (
+            "app.runtime.config",
+            "app.core.config",
+            "app.sdk.config",
+        ):
+            try:
+                module = __import__(module_name, fromlist=["settings"])
+                settings = getattr(module, "settings", None)
+                if settings is not None:
+                    return settings
+            except (ImportError, AttributeError):
+                continue
+        return None
+
+    @classmethod
+    def _tmdb_image_url(cls, path: str) -> str:
+        """Build a TMDB image URL, honoring MoviePilot's configured proxy."""
+
+        value = str(path or "").strip()
+        settings = cls._moviepilot_settings()
+        if value.startswith(("http://", "https://")):
+            source_url = value
+        else:
+            source_url = ""
+            builder = getattr(settings, "TMDB_IMAGE_URL", None)
+            if callable(builder):
+                try:
+                    built = builder(value, "w500")
+                    if isinstance(built, str) and built.strip():
+                        source_url = built.strip()
+                except Exception:  # noqa: BLE001 - use the public fallback
+                    pass
+            if not source_url:
+                domain = str(
+                    getattr(settings, "TMDB_IMAGE_DOMAIN", "") or ""
+                ).strip()
+                if domain:
+                    if not domain.startswith(("http://", "https://")):
+                        domain = f"https://{domain}"
+                    source_url = f"{domain.rstrip('/')}/t/p/w500{value}"
+                else:
+                    source_url = f"https://image.tmdb.org/t/p/w500{value}"
+        host = (urlsplit(source_url).hostname or "").casefold()
+        if host not in {"image.tmdb.org", "www.image.tmdb.org"}:
+            return source_url
+        api_prefix = str(
+            getattr(settings, "API_V1_STR", "/api/v1") or "/api/v1"
+        ).rstrip("/")
+        return (
+            f"{api_prefix}/system/img/0?"
+            f"imgurl={quote(source_url, safe='')}"
+        )
+
+    def _enrich_queue_view(self, result: dict[str, Any]) -> dict[str, Any]:
+        """Fill missing queue posters and hide known domestic anime groups."""
+
+        queue_groups = result.get("queue_groups")
+        if not isinstance(queue_groups, dict):
+            return result
+        groups = queue_groups.get("groups")
+        if not isinstance(groups, list):
+            return result
+
+        visible_groups: list[dict[str, Any]] = []
+        removed_total = removed_due = removed_deferred = 0
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            items = [
+                item
+                for item in (group.get("items") or [])
+                if isinstance(item, dict)
+            ]
+            media_type = str(group.get("media_type") or "movie")
+            tmdb_id = self._optional_int(group.get("tmdb_id"))
+            if tmdb_id is None:
+                for item in items:
+                    match = TMDB_PATH_PATTERN.search(
+                        str(item.get("video_path") or "")
+                    )
+                    if match:
+                        tmdb_id = int(match.group(1))
+                        break
+            metadata = (
+                self._tmdb_metadata(tmdb_id, media_type)
+                if tmdb_id is not None
+                else None
+            )
+            if metadata:
+                if metadata.get("poster_url"):
+                    group["poster"] = metadata["poster_url"]
+                paths = [
+                    str(item.get("video_path") or "")
+                    for item in items
+                    if item.get("video_path")
+                ]
+                if (
+                    self._exclude_domestic_anime
+                    and self._is_domestic_anime(metadata, paths)
+                ):
+                    item_count = int(group.get("item_count") or len(items))
+                    visible_due = sum(
+                        1 for item in items if not item.get("deferred")
+                    )
+                    visible_deferred = sum(
+                        1 for item in items if item.get("deferred")
+                    )
+                    removed_total += item_count
+                    removed_due += visible_due + max(
+                        0, item_count - len(items)
+                    )
+                    removed_deferred += visible_deferred
+                    continue
+            visible_groups.append(group)
+
+        if removed_total:
+            queue_groups["groups"] = visible_groups
+            for container in (result.get("queue"), queue_groups):
+                if not isinstance(container, dict):
+                    continue
+                for name, removed in (
+                    ("total", removed_total),
+                    ("due", removed_due),
+                    ("deferred", removed_deferred),
+                ):
+                    if name in container:
+                        container[name] = max(
+                            0,
+                            int(container.get(name) or 0) - removed,
+                        )
+            result["excluded_in_queue"] = removed_total
+        return result
 
     @staticmethod
     def _scan_notification_text(result: dict[str, Any]) -> str:
@@ -2949,7 +3411,7 @@ class CSFReborn(_PluginBase):
             if text.startswith(("http://", "https://")):
                 return text
             if text.startswith("/"):
-                return f"https://image.tmdb.org/t/p/w500{text}"
+                return cls._tmdb_image_url(text)
             if Path(text).is_absolute():
                 return text
         return None

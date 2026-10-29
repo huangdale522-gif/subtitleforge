@@ -12,6 +12,7 @@ from subtitleforge.models import (
     ManualDownloadRequest,
     ManualSearchRequest,
     MediaType,
+    ScanMediaMetadata,
     ScanRequest,
     SearchRequest,
     SubtitleCandidate,
@@ -273,6 +274,74 @@ async def test_scan_excludes_domestic_anime_but_keeps_foreign_anime(
     assert result.excluded_domestic_anime == 2
     assert result.items[0].title == "Foreign Anime"
     assert provider.search_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_scan_uses_moviepilot_metadata_for_domestic_anime_and_posters(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "动漫"
+    domestic = (
+        root
+        / "牧神记 (2024) {tmdbid=236534}"
+        / "Season 1"
+        / "牧神记 S01E08 2160p.OurTV.mp4"
+    )
+    foreign = (
+        root
+        / "葬送的芙莉莲 (2023) {tmdbid=209867}"
+        / "Season 1"
+        / "Frieren.S01E08.mkv"
+    )
+    for video in (domestic, foreign):
+        video.parent.mkdir(parents=True)
+        video.write_bytes(b"video")
+
+    service = make_service(tmp_path)
+    provider = NoResultProvider()
+    service.providers["custom"] = provider
+    scanner = LibraryScanner(service, service.settings.data_dir)
+    try:
+        result = await scanner.scan(
+            ScanRequest(
+                paths=[str(root)],
+                exclude_domestic_anime=True,
+                domestic_anime_regions=["CN", "TW", "HK"],
+                languages=[SubtitleLanguage.SIMPLIFIED],
+                dry_run=False,
+                media_metadata=[
+                    ScanMediaMetadata(
+                        tmdb_id=236534,
+                        media_type=MediaType.TV,
+                        genres=["16"],
+                        origin_countries=["CN"],
+                        original_language="zh",
+                        poster_url="https://image.tmdb.org/t/p/w500/mushenji.jpg",
+                    ),
+                    ScanMediaMetadata(
+                        tmdb_id=209867,
+                        media_type=MediaType.TV,
+                        genres=["16"],
+                        origin_countries=["JP"],
+                        original_language="ja",
+                        poster_url="https://image.tmdb.org/t/p/w500/frieren.jpg",
+                    ),
+                ],
+            )
+        )
+        queue = scanner.queue_view()
+    finally:
+        await service.close()
+
+    assert result.discovered == 2
+    assert result.excluded_domestic_anime == 1
+    assert result.checked == 1
+    assert provider.search_calls >= 1
+    assert len(queue.groups) == 1
+    assert queue.groups[0].title == "葬送的芙莉莲"
+    assert queue.groups[0].poster == (
+        "https://image.tmdb.org/t/p/w500/frieren.jpg"
+    )
 
 
 @pytest.mark.asyncio
