@@ -56,6 +56,7 @@ class ProcessRequest(SearchRequest):
 
     video_path: str = Field(min_length=1, max_length=4096)
     poster_url: str | None = Field(default=None, max_length=4096)
+    poster_source: str | None = Field(default=None, max_length=32)
     overwrite: bool = False
     dry_run: bool = False
     provider_failover: bool = False

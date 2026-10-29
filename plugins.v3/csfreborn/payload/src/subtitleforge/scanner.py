@@ -644,6 +644,20 @@ def _poster_data_uri(path: Path) -> str | None:
     return f"data:{mime_type};base64,{encoded}"
 
 
+def _poster_from_value(video_path: Path, value: Any) -> str | None:
+    """Resolve a stored poster URL or local artwork reference."""
+
+    raw_poster = str(value or "").strip()
+    if not raw_poster:
+        return None
+    if raw_poster.startswith(("http://", "https://")):
+        return raw_poster
+    local = Path(raw_poster).expanduser()
+    if not local.is_absolute():
+        local = video_path.parent / local
+    return _poster_data_uri(local)
+
+
 def _poster_for_video(
     video_path: Path,
     payload: dict[str, Any] | None = None,
@@ -651,25 +665,22 @@ def _poster_for_video(
     """Find a browser-safe poster from queue metadata or nearby artwork."""
 
     payload = payload or {}
-    raw_poster = str(payload.get("poster_url") or "").strip()
-    if raw_poster.startswith(("http://", "https://")):
-        return raw_poster
-    if raw_poster:
-        local = Path(raw_poster).expanduser()
-        if not local.is_absolute():
-            local = video_path.parent / local
-        poster = _poster_data_uri(local)
+    payload_source = str(payload.get("poster_source") or "").casefold()
+    if payload_source == "moviepilot":
+        poster = _poster_from_value(video_path, payload.get("poster_url"))
         if poster:
             return poster
 
-    # Old queue rows may predate poster_url. Re-read nearby NFO metadata so a
-    # completed upgrade does not require a full library scan just for artwork.
+    # Prefer a fresh, root-level NFO poster. Legacy queue rows have no source
+    # marker and may contain a nested actor thumbnail in poster_url, so their
+    # stored artwork must not be trusted until the next scan refreshes it.
     nfo_poster = _read_nfo_metadata(video_path).poster_url
-    if nfo_poster:
-        if nfo_poster.startswith(("http://", "https://")):
-            return nfo_poster
-        local = Path(nfo_poster).expanduser()
-        poster = _poster_data_uri(local)
+    poster = _poster_from_value(video_path, nfo_poster)
+    if poster:
+        return poster
+
+    if payload_source in {"nfo", "local"}:
+        poster = _poster_from_value(video_path, payload.get("poster_url"))
         if poster:
             return poster
 
@@ -1446,6 +1457,9 @@ class LibraryScanner:
                     season=discovered_media.season,
                     episode=discovered_media.episode,
                     poster_url=discovered_media.poster_url,
+                    poster_source=(
+                        "nfo" if discovered_media.poster_url else None
+                    ),
                     languages=inspected.missing_languages,
                     overwrite=request.overwrite,
                     dry_run=False,

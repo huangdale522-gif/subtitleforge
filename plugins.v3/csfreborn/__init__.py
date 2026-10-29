@@ -39,7 +39,7 @@ class CSFReborn(_PluginBase):
         "队列按季度展示封面，并支持手动挑选字幕。"
     )
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.10.1"
+    plugin_version = "0.10.2"
     plugin_author = "SubtitleForge contributors"
     author_url = "https://github.com/"
     plugin_config_prefix = "csfreborn_"
@@ -764,6 +764,7 @@ class CSFReborn(_PluginBase):
             "season": self._optional_int(getattr(meta, "begin_season", None)),
             "episode": self._optional_int(getattr(meta, "begin_episode", None)),
             "poster_url": self._media_poster_url(mediainfo),
+            "poster_source": "moviepilot",
             "languages": self._languages,
             "overwrite": self._overwrite,
             "dry_run": self._dry_run,

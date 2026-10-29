@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 from pathlib import Path
 
@@ -370,6 +371,40 @@ async def test_queue_view_groups_tv_by_season_and_adds_local_poster(
     )
     assert movie_group.title == "Movie"
     assert movie_group.item_count == 1
+
+
+@pytest.mark.asyncio
+async def test_queue_view_ignores_legacy_actor_poster(
+    tmp_path: Path,
+) -> None:
+    video = tmp_path / "电影" / "Movie (2024)" / "Movie.2024.mkv"
+    video.parent.mkdir(parents=True)
+    video.write_bytes(b"video")
+    (video.parent / "poster.jpg").write_bytes(b"correct-poster")
+    (video.parent / "actor.jpg").write_bytes(b"actor-headshot")
+
+    service = make_service(tmp_path)
+    store = ScanStore(service.settings.data_dir)
+    store.upsert_queue_item(
+        video,
+        {
+            "video_path": str(video),
+            "title": "Movie",
+            "year": 2024,
+            "media_type": "movie",
+            "poster_url": str(video.parent / "actor.jpg"),
+            "languages": ["zh-Hans"],
+        },
+    )
+    scanner = LibraryScanner(service, service.settings.data_dir)
+    try:
+        view = scanner.queue_view()
+    finally:
+        await service.close()
+
+    poster = view.groups[0].poster or ""
+    encoded = poster.split(",", 1)[1]
+    assert base64.b64decode(encoded) == b"correct-poster"
 
 
 @pytest.mark.asyncio

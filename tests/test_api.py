@@ -51,7 +51,7 @@ def test_healthz_is_public(tmp_path: Path) -> None:
         response = client.get("/healthz")
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
-    assert response.json()["version"] == "0.4.1"
+    assert response.json()["version"] == "0.4.2"
 
 
 def test_runtime_status_reports_quota_queue_and_providers(tmp_path: Path) -> None:
@@ -71,7 +71,7 @@ def test_runtime_status_reports_quota_queue_and_providers(tmp_path: Path) -> Non
     assert response.status_code == 200
     payload = response.json()
     assert payload["status"] == "ok"
-    assert payload["version"] == "0.4.1"
+    assert payload["version"] == "0.4.2"
     assert payload["quota"] == {"used": 0, "limit": 7, "remaining": 7}
     assert payload["queue"] == {"total": 0, "due": 0, "deferred": 0}
     assert payload["providers"]["order"] == ["xunlei", "assrt"]
