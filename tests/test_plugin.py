@@ -285,6 +285,22 @@ def test_media_poster_url_accepts_relative_moviepilot_proxy() -> None:
     )
 
 
+def test_media_poster_url_preserves_absolute_local_poster() -> None:
+    plugin_module = load_moviepilot_plugin()
+    plugin = plugin_module.CSFReborn()
+    media = types.SimpleNamespace(
+        poster_url="/config/cache/MediaCover/poster.jpg",
+        poster_path=None,
+        poster=None,
+        cover=None,
+        tmdb_info={},
+    )
+
+    assert plugin._media_poster_url(media) == (
+        "/config/cache/MediaCover/poster.jpg"
+    )
+
+
 def test_media_poster_url_proxies_alternate_tmdb_cdn() -> None:
     plugin_module = load_moviepilot_plugin()
     plugin = plugin_module.CSFReborn()

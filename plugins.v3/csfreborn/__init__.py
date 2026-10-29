@@ -94,7 +94,7 @@ class CSFReborn(_PluginBase):
         "队列按季度展示封面，并支持手动挑选字幕。"
     )
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.10.6"
+    plugin_version = "0.10.7"
     plugin_author = "SubtitleForge contributors"
     author_url = "https://github.com/"
     plugin_config_prefix = "csfreborn_"
@@ -3628,9 +3628,17 @@ class CSFReborn(_PluginBase):
                 query = text.split("imgurl=", 1)[1]
                 return f"{api_prefix}/system/img/1?imgurl={query}"
             path_value = urlsplit(text).path
+            local_path = Path(path_value)
+            if (
+                local_path.is_absolute()
+                and len(local_path.parts) > 2
+                and local_path.suffix.casefold()
+                in {".avif", ".jpeg", ".jpg", ".png", ".webp"}
+            ):
+                return text
             if (
                 "/" not in path_value.lstrip("/")
-                and Path(path_value).suffix.casefold()
+                and local_path.suffix.casefold()
                 in {".avif", ".jpeg", ".jpg", ".png", ".webp"}
             ):
                 return cls._tmdb_image_url(f"/{text.lstrip('/')}")
