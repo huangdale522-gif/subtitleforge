@@ -55,6 +55,7 @@ class ProcessRequest(SearchRequest):
     """Request to find and install subtitles beside a video file."""
 
     video_path: str = Field(min_length=1, max_length=4096)
+    poster_url: str | None = Field(default=None, max_length=4096)
     overwrite: bool = False
     dry_run: bool = False
     provider_failover: bool = False
@@ -243,3 +244,100 @@ class JobRecord(BaseModel):
     request: ProcessRequest
     result: ProcessResult | None = None
     error: str | None = None
+
+
+class QueueItemView(BaseModel):
+    """Public metadata for one video waiting in the subtitle queue."""
+
+    video_path: str
+    filename: str
+    title: str
+    year: int | None = None
+    media_type: MediaType
+    season: int | None = None
+    episode: int | None = None
+    languages: list[SubtitleLanguage] = Field(default_factory=list)
+    attempts: int = 0
+    queued_at: str | None = None
+    next_attempt_at: str | None = None
+    last_error: str | None = None
+    deferred: bool = False
+
+
+class QueueGroupView(BaseModel):
+    """Queue entries grouped into a movie or one TV/anime season."""
+
+    group_id: str
+    title: str
+    year: int | None = None
+    media_type: MediaType
+    category: str = "movie"
+    season: int | None = None
+    tmdb_id: int | None = None
+    poster: str | None = None
+    missing_languages: list[SubtitleLanguage] = Field(default_factory=list)
+    item_count: int = 0
+    items_truncated: bool = False
+    items: list[QueueItemView] = Field(default_factory=list)
+
+
+class QueueView(BaseModel):
+    """A bounded, grouped view of the persistent subtitle queue."""
+
+    total: int = 0
+    due: int = 0
+    deferred: int = 0
+    groups: list[QueueGroupView] = Field(default_factory=list)
+    truncated: bool = False
+
+
+class ManualSearchRequest(BaseModel):
+    """Search one queued video and retain candidates for explicit selection."""
+
+    video_path: str = Field(min_length=1, max_length=4096)
+    provider_order: list[str] | None = None
+
+
+class ManualCandidateView(BaseModel):
+    """A subtitle candidate safe to display in the MoviePilot plugin page."""
+
+    selection_id: str
+    provider: str
+    title: str
+    release_name: str | None = None
+    language: SubtitleLanguage | None = None
+    format: str = "unknown"
+    season: int | None = None
+    episode: int | None = None
+    year: int | None = None
+    rank: int = 0
+    score: float = 0.0
+    download_count: int = 0
+    machine_translated: bool = False
+
+
+class ManualSearchResult(BaseModel):
+    """Public result of an interactive subtitle search."""
+
+    search_id: str
+    video_path: str
+    title: str
+    year: int | None = None
+    media_type: MediaType
+    season: int | None = None
+    episode: int | None = None
+    poster: str | None = None
+    languages: list[SubtitleLanguage] = Field(default_factory=list)
+    candidates: list[ManualCandidateView] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
+    expires_at: str
+
+
+class ManualDownloadRequest(BaseModel):
+    """Download one explicitly selected subtitle candidate."""
+
+    search_id: str = Field(min_length=1, max_length=128)
+    selection_id: str = Field(min_length=1, max_length=128)
+    language: SubtitleLanguage | None = None
+    overwrite: bool = False
+    daily_download_limit: int | None = Field(default=None, ge=1, le=1000)

@@ -35,7 +35,7 @@ class OpenSubtitlesProvider(SubtitleProvider):
         api_key: str,
         username: str = "",
         password: str = "",
-        user_agent: str = "SubtitleForge/0.3.3",
+        user_agent: str = "SubtitleForge/0.4.0",
     ) -> None:
         self._client = client
         self._api_key = api_key.strip()

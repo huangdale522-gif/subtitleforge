@@ -25,6 +25,9 @@ installation logic, or MoviePilot integration.
 - MoviePilot V3 adapter that listens for `TransferComplete`.
 - Full-library scans with external and embedded Chinese subtitle detection,
   a persistent missing-subtitle queue, exclusions, and dry-run preview.
+- Queue views grouped by movie or TV/anime season, with artwork from NFO,
+  local library images, or MoviePilot metadata.
+- Interactive manual search and explicit candidate selection for queued videos.
 - Blu-ray `BDMV/STREAM` segments are ignored so disc fragments are not treated
   as independent movies.
 - Separate per-run and per-day download limits, including a daily ledger that
@@ -185,6 +188,14 @@ configuration/cooldown state. The MoviePilot plugin uses this endpoint to render
 its live status dashboard. The daily cap is global across all providers; the
 external services may enforce separate account quotas that are not knowable in
 advance.
+
+`GET /v1/queue?limit=30` returns the queue grouped into movies and TV/anime
+seasons. Each group includes a browser-safe poster, missing languages, episode
+count, and a bounded episode list. `POST /v1/manual/search` returns ranked
+public candidate metadata for one queued video; provider download references
+remain server-side. `POST /v1/manual/download` installs only the candidate
+explicitly selected by the user. Manual downloads share the persistent daily
+quota ledger with automatic queue processing.
 
 ## Custom provider contract
 

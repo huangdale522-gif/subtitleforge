@@ -161,6 +161,72 @@ def test_status_page_explains_quota_queue_and_provider_health() -> None:
     assert "ASSRT" in rendered
 
 
+def test_queue_page_shows_posters_seasons_and_manual_actions() -> None:
+    plugin_module = load_moviepilot_plugin()
+    plugin = plugin_module.CSFReborn()
+    plugin._enabled = True
+    plugin._scan_dry_run = False
+    plugin.get_data = lambda _key: None
+    plugin._request_json = lambda *_args, **_kwargs: {
+        "status": "ok",
+        "quota": {"used": 0, "limit": 10, "remaining": 10},
+        "queue": {"total": 2, "due": 2, "deferred": 0},
+        "queue_groups": {
+            "total": 2,
+            "due": 2,
+            "deferred": 0,
+            "truncated": False,
+            "groups": [
+                {
+                    "group_id": "season-1",
+                    "title": "Some Show",
+                    "year": 2024,
+                    "media_type": "tv",
+                    "category": "anime",
+                    "season": 1,
+                    "tmdb_id": 42,
+                    "poster": "data:image/jpeg;base64,cG9zdGVy",
+                    "missing_languages": ["zh-Hans"],
+                    "item_count": 2,
+                    "items_truncated": False,
+                    "items": [
+                        {
+                            "video_path": "/plex/动漫/Some Show/Season 1/E01.mkv",
+                            "filename": "E01.mkv",
+                            "title": "Some Show",
+                            "year": 2024,
+                            "media_type": "tv",
+                            "season": 1,
+                            "episode": 1,
+                            "languages": ["zh-Hans"],
+                            "attempts": 0,
+                            "deferred": False,
+                        }
+                    ],
+                }
+            ],
+        },
+    }
+
+    rendered = json.dumps(plugin.get_page(), ensure_ascii=False)
+
+    assert "VImg" in rendered
+    assert "手动选字幕" in rendered
+    assert "第 1 季" in rendered
+    assert "Some Show" in rendered
+    assert "manual/search" in rendered
+    assert "manual/download" in rendered
+
+
+def test_plugin_registers_queue_and_manual_api_routes() -> None:
+    plugin_module = load_moviepilot_plugin()
+    plugin = plugin_module.CSFReborn()
+
+    paths = {route["path"] for route in plugin.get_api()}
+
+    assert {"/queue", "/manual/search", "/manual/download"} <= paths
+
+
 def test_domestic_anime_filter_uses_moviepilot_metadata() -> None:
     plugin_module = load_moviepilot_plugin()
     plugin = plugin_module.CSFReborn()

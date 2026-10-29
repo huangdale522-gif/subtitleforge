@@ -15,6 +15,7 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from fastapi import Body
 from app.schemas.types import EventType
 
 try:
@@ -34,10 +35,11 @@ class CSFReborn(_PluginBase):
 
     plugin_name = "SubtitleForge 字幕补全"
     plugin_desc = (
-        "接入 SubtitleBest、ASSRT、迅雷等中文字幕源，为电影、剧集和动漫自动补全字幕。"
+        "接入 SubtitleBest、ASSRT、迅雷等中文字幕源，为电影、剧集和动漫自动补全字幕；"
+        "队列按季度展示封面，并支持手动挑选字幕。"
     )
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.9.0"
+    plugin_version = "0.10.0"
     plugin_author = "SubtitleForge contributors"
     author_url = "https://github.com/"
     plugin_config_prefix = "csfreborn_"
@@ -224,7 +226,7 @@ class CSFReborn(_PluginBase):
         ]
 
     def get_api(self) -> list[dict[str, Any]]:
-        """Expose health and manual scan endpoints."""
+        """Expose health, queue, and interactive subtitle endpoints."""
 
         return [
             {
@@ -240,6 +242,27 @@ class CSFReborn(_PluginBase):
                 "methods": ["POST"],
                 "auth": "bear",
                 "summary": "立即扫描媒体库",
+            },
+            {
+                "path": "/queue",
+                "endpoint": self.queue,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "读取按季度分组的字幕队列",
+            },
+            {
+                "path": "/manual/search",
+                "endpoint": self.manual_search,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "搜索一个队列视频的字幕候选",
+            },
+            {
+                "path": "/manual/download",
+                "endpoint": self.manual_download,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "下载用户明确选择的字幕候选",
             },
         ]
 
@@ -262,6 +285,97 @@ class CSFReborn(_PluginBase):
         """Run one scan using the saved preview/download settings."""
 
         return await self.scan_library(manual=True)
+
+    async def queue(self) -> dict[str, Any]:
+        """Return the grouped queue for the plugin page."""
+
+        try:
+            result = await asyncio.to_thread(
+                self._request_json,
+                "GET",
+                "/v1/queue?limit=30",
+                None,
+                20,
+            )
+            return result if isinstance(result, dict) else {"status": "error"}
+        except Exception as exc:  # noqa: BLE001 - page request must degrade
+            return {
+                "status": "error",
+                "errors": [f"{type(exc).__name__}: {exc}"],
+            }
+
+    async def manual_search(
+        self,
+        payload: dict[str, Any] | None = Body(default=None),
+    ) -> dict[str, Any]:
+        """Search all providers for one queued video."""
+
+        if not self._enabled:
+            return {"status": "disabled", "message": "插件尚未启用"}
+        data = payload or {}
+        video_path = str(data.get("video_path") or "").strip()
+        if not video_path:
+            return {"status": "error", "message": "缺少视频路径"}
+        try:
+            result = await asyncio.to_thread(
+                self._request_json,
+                "POST",
+                "/v1/manual/search",
+                {
+                    "video_path": video_path,
+                    "provider_order": (
+                        self._split_list(self._scan_provider_order)
+                        if self._scan_provider_order
+                        else None
+                    ),
+                },
+                600,
+            )
+            return result if isinstance(result, dict) else {"status": "error"}
+        except Exception as exc:  # noqa: BLE001 - keep API response structured
+            logger.warning(f"SubtitleForge 手动搜索失败：{type(exc).__name__}: {exc}")
+            return {
+                "status": "error",
+                "errors": [f"{type(exc).__name__}: {exc}"],
+            }
+
+    async def manual_download(
+        self,
+        payload: dict[str, Any] | None = Body(default=None),
+    ) -> dict[str, Any]:
+        """Install one subtitle candidate explicitly chosen by the user."""
+
+        if not self._enabled:
+            return {"status": "disabled", "message": "插件尚未启用"}
+        data = payload or {}
+        search_id = str(data.get("search_id") or "").strip()
+        selection_id = str(data.get("selection_id") or "").strip()
+        if not search_id or not selection_id:
+            return {"status": "error", "message": "缺少字幕候选信息"}
+        request_payload: dict[str, Any] = {
+            "search_id": search_id,
+            "selection_id": selection_id,
+            "overwrite": bool(data.get("overwrite", self._overwrite)),
+            "daily_download_limit": self._scan_daily_download_limit,
+        }
+        language = data.get("language")
+        if language in {"zh-Hans", "zh-Hant"}:
+            request_payload["language"] = language
+        try:
+            result = await asyncio.to_thread(
+                self._request_json,
+                "POST",
+                "/v1/manual/download",
+                request_payload,
+                600,
+            )
+            return result if isinstance(result, dict) else {"status": "error"}
+        except Exception as exc:  # noqa: BLE001 - keep API response structured
+            logger.warning(f"SubtitleForge 手动下载失败：{type(exc).__name__}: {exc}")
+            return {
+                "status": "error",
+                "errors": [f"{type(exc).__name__}: {exc}"],
+            }
 
     @eventmanager.register(EventType.PluginAction)
     async def on_plugin_action(self, event: Event) -> None:
@@ -649,6 +763,7 @@ class CSFReborn(_PluginBase):
             "media_type": media_type,
             "season": self._optional_int(getattr(meta, "begin_season", None)),
             "episode": self._optional_int(getattr(meta, "begin_episode", None)),
+            "poster_url": self._media_poster_url(mediainfo),
             "languages": self._languages,
             "overwrite": self._overwrite,
             "dry_run": self._dry_run,
@@ -1235,6 +1350,11 @@ class CSFReborn(_PluginBase):
         runtime, status_error = self._load_runtime_status()
         quota = runtime.get("quota") if isinstance(runtime.get("quota"), dict) else {}
         queue = runtime.get("queue") if isinstance(runtime.get("queue"), dict) else {}
+        queue_groups = (
+            runtime.get("queue_groups")
+            if isinstance(runtime.get("queue_groups"), dict)
+            else {}
+        )
         provider_data = runtime.get("providers")
         provider_data = provider_data if isinstance(provider_data, dict) else {}
         temporary_cooldown = int(
@@ -1574,6 +1694,20 @@ class CSFReborn(_PluginBase):
             ]
         )
 
+        if queue_total:
+            groups = queue_groups.get("groups")
+            groups = groups if isinstance(groups, list) else []
+            if groups:
+                page.append(self._queue_card(queue_groups))
+            else:
+                page.append(
+                    self._alert(
+                        "info",
+                        "队列中有待处理视频，但当前服务版本还没有返回季度分组数据。"
+                        "请更新插件内置服务后再刷新页面。",
+                    )
+                )
+
         page.append(
             {
                 "component": "VCard",
@@ -1722,12 +1856,268 @@ class CSFReborn(_PluginBase):
             )
         return page
 
+    def _queue_card(self, queue_view: dict[str, Any]) -> dict[str, Any]:
+        """Build the grouped queue with posters and manual subtitle actions."""
+
+        raw_groups = queue_view.get("groups")
+        groups = [
+            group
+            for group in (raw_groups if isinstance(raw_groups, list) else [])
+            if isinstance(group, dict)
+        ]
+        content: list[dict[str, Any]] = [
+            {
+                "component": "div",
+                "props": {"class": "text-caption mb-3"},
+                "text": (
+                    "电影单独显示；剧集和动漫按“名称 + 季度”合并。"
+                    "每个视频都可以手动搜索并指定要下载的字幕候选。"
+                ),
+            }
+        ]
+        content.extend(self._queue_group_card(group) for group in groups[:30])
+        if queue_view.get("truncated"):
+            content.append(
+                self._alert(
+                    "info",
+                    "队列较大，页面只显示前 30 个分组；完整队列仍会继续自动处理。",
+                )
+            )
+        return {
+            "component": "VCard",
+            "props": {"class": "mb-3", "variant": "outlined"},
+            "content": [
+                {
+                    "component": "VCardTitle",
+                    "props": {
+                        "class": (
+                            "text-subtitle-1 d-flex flex-wrap align-center ga-2"
+                        )
+                    },
+                    "content": [
+                        {"component": "span", "text": "待处理字幕队列"},
+                        self._chip(
+                            f"{queue_view.get('total', 0)} 个视频",
+                            "primary",
+                        ),
+                        self._chip(
+                            f"{len(groups)} 个分组",
+                            "info",
+                        ),
+                    ],
+                },
+                {
+                    "component": "VCardText",
+                    "props": {"class": "pt-0"},
+                    "content": content,
+                },
+            ],
+        }
+
+    def _queue_group_card(self, group: dict[str, Any]) -> dict[str, Any]:
+        """Build one movie or one TV/anime season card."""
+
+        title = str(group.get("title") or "未知标题")
+        year = group.get("year")
+        season = group.get("season")
+        category = str(group.get("category") or group.get("media_type") or "movie")
+        category_label = {
+            "movie": "电影",
+            "tv": "剧集",
+            "anime": "动漫",
+        }.get(category, "媒体")
+        season_label = (
+            f"第 {int(season)} 季"
+            if season is not None
+            else "未识别季度"
+        )
+        meta_parts = [category_label]
+        if year is not None:
+            meta_parts.append(f"{year} 年")
+        if category in {"tv", "anime"}:
+            meta_parts.append(season_label)
+        missing = "、".join(
+            self._language_label(language)
+            for language in (group.get("missing_languages") or [])
+        ) or "未标注"
+        poster = str(group.get("poster") or "").strip()
+        poster_node: dict[str, Any] = (
+            {
+                "component": "VImg",
+                "props": {
+                    "src": poster,
+                    "alt": f"{title} 封面",
+                    "width": 76,
+                    "height": 112,
+                    "cover": True,
+                    "class": "rounded me-3 flex-shrink-0",
+                },
+            }
+            if poster
+            else {
+                "component": "VIcon",
+                "props": {
+                    "icon": "mdi-image-off-outline",
+                    "size": 46,
+                    "class": "me-3",
+                },
+            }
+        )
+        items = [
+            item
+            for item in (group.get("items") or [])
+            if isinstance(item, dict)
+        ]
+        item_nodes = [self._queue_item_row(item) for item in items]
+        if group.get("items_truncated"):
+            item_nodes.append(
+                {
+                    "component": "div",
+                    "props": {"class": "text-caption text-medium-emphasis py-2"},
+                    "text": (
+                        f"该分组共 {group.get('item_count', 0)} 个视频，"
+                        "页面只展开前 100 个。"
+                    ),
+                }
+            )
+        if not item_nodes:
+            item_nodes.append(
+                {
+                    "component": "div",
+                    "props": {"class": "text-caption text-medium-emphasis py-2"},
+                    "text": "当前没有可展开的视频条目。",
+                }
+            )
+        return {
+            "component": "VCard",
+            "props": {"variant": "tonal", "class": "mb-3"},
+            "content": [
+                {
+                    "component": "VCardText",
+                    "content": [
+                        {
+                            "component": "div",
+                            "props": {
+                                "class": "d-flex align-start flex-wrap"
+                            },
+                            "content": [
+                                poster_node,
+                                {
+                                    "component": "div",
+                                    "props": {"class": "flex-grow-1"},
+                                    "content": [
+                                        {
+                                            "component": "div",
+                                            "props": {
+                                                "class": "text-h6 font-weight-bold"
+                                            },
+                                            "text": title,
+                                        },
+                                        {
+                                            "component": "div",
+                                            "props": {"class": "text-caption mt-1"},
+                                            "text": " · ".join(meta_parts),
+                                        },
+                                        {
+                                            "component": "div",
+                                            "props": {
+                                                "class": (
+                                                    "d-flex flex-wrap ga-2 mt-2"
+                                                )
+                                            },
+                                            "content": [
+                                                self._chip(
+                                                    f"共 {group.get('item_count', len(items))} 个视频",
+                                                    "info",
+                                                ),
+                                                self._chip(
+                                                    f"缺失 {missing}",
+                                                    "warning",
+                                                ),
+                                            ],
+                                        },
+                                    ],
+                                },
+                            ],
+                        },
+                        {
+                            "component": "div",
+                            "props": {"class": "mt-2"},
+                            "content": item_nodes,
+                        },
+                    ],
+                }
+            ],
+        }
+
+    def _queue_item_row(self, item: dict[str, Any]) -> dict[str, Any]:
+        """Build one queue item with a manual subtitle button."""
+
+        season = item.get("season")
+        episode = item.get("episode")
+        episode_label = (
+            f"S{int(season):02d}E{int(episode):02d}"
+            if season is not None and episode is not None
+            else "单文件"
+        )
+        filename = str(item.get("filename") or item.get("title") or "未知视频")
+        languages = "、".join(
+            self._language_label(language)
+            for language in (item.get("languages") or [])
+        ) or "未标注"
+        state = (
+            "等待重试"
+            if item.get("deferred")
+            else f"尝试 {item.get('attempts', 0)} 次"
+        )
+        video_path = str(item.get("video_path") or "")
+        return {
+            "component": "div",
+            "props": {
+                "class": (
+                    "d-flex flex-wrap align-center ga-2 "
+                    "border-b py-2"
+                )
+            },
+            "content": [
+                {
+                    "component": "div",
+                    "props": {"class": "flex-grow-1"},
+                    "content": [
+                        {
+                            "component": "div",
+                            "props": {"class": "font-weight-medium"},
+                            "text": f"{episode_label} · {filename}",
+                        },
+                        {
+                            "component": "div",
+                            "props": {"class": "text-caption"},
+                            "text": f"缺失 {languages} · {state}",
+                        },
+                    ],
+                },
+                {
+                    "component": "VBtn",
+                    "props": {
+                        "size": "small",
+                        "color": "primary",
+                        "variant": "tonal",
+                        "prepend-icon": "mdi-magnify",
+                        "disabled": not self._enabled or not video_path,
+                        "onclick": self._manual_onclick(video_path),
+                    },
+                    "text": "手动选字幕",
+                },
+            ],
+        }
+
     def _load_runtime_status(self) -> tuple[dict[str, Any], str]:
         """Read the live service status and degrade gracefully when offline."""
 
         path = (
             "/v1/status?daily_download_limit="
             f"{max(1, int(self._scan_daily_download_limit))}"
+            "&queue_limit=30"
         )
         try:
             value = self._request_json("GET", path, None, timeout=2)
@@ -2202,6 +2592,65 @@ class CSFReborn(_PluginBase):
             "})()"
         )
 
+    def _manual_onclick(self, video_path: str) -> str:
+        """Build the interactive search-and-download handler for one video."""
+
+        search_api = json.dumps(
+            f"plugin/{self.__class__.__name__}/manual/search"
+        )
+        download_api = json.dumps(
+            f"plugin/{self.__class__.__name__}/manual/download"
+        )
+        video_literal = json.dumps(video_path, ensure_ascii=True)
+        return (
+            "(function(){"
+            f"var videoPath={video_literal};"
+            "if(!confirm('搜索这个视频的全部字幕候选？')){return;}"
+            f"window.MoviePilotAPI.post({search_api},{{video_path:videoPath}})"
+            ".then(function(r){"
+            "if(!r||r.status==='error'||r.status==='disabled'){"
+            "alert((r&&(r.message||r.errors&&r.errors[0]))||'搜索失败');return null;}"
+            "var list=r.candidates||[];"
+            "if(!list.length){"
+            "var extra=(r.errors&&r.errors.length)?('\\n'+r.errors.join('\\n')):'';"
+            "alert('没有找到可用字幕候选。'+extra);return null;}"
+            "var lines=list.map(function(c,i){"
+            "return (i+1)+'. '+(c.language||'未知语言')+' / '"
+            "+(c.provider||'-')+' / '+(c.format||'-')+'\\n   '"
+            "+(c.release_name||c.title||'');"
+            "});"
+            "var answer=prompt('选择要下载的字幕编号：\\n\\n'+"
+            "lines.join('\\n\\n'),'1');"
+            "if(answer===null){return null;}"
+            "var index=parseInt(answer,10)-1;"
+            "if(isNaN(index)||index<0||index>=list.length){"
+            "alert('字幕编号无效');return null;}"
+            "var candidate=list[index];"
+            "var language=candidate.language||null;"
+            "if(!language){"
+            "var lang=prompt('该字幕未标注语言，请输入 1=简体 2=繁体','1');"
+            "if(lang==='1'){language='zh-Hans';}"
+            "else if(lang==='2'){language='zh-Hant';}"
+            "else if(lang!==null){alert('语言无效');return null;}"
+            "}"
+            "if(language===null){return null;}"
+            f"return window.MoviePilotAPI.post({download_api},{{"
+            "search_id:r.search_id,selection_id:candidate.selection_id,"
+            "language:language,overwrite:"
+            + json.dumps(bool(self._overwrite))
+            + "});"
+            "}).then(function(r){"
+            "if(!r){return;}"
+            "if(r.status==='error'||r.status==='disabled'){"
+            "alert((r.message||(r.errors&&r.errors[0]))||'字幕下载失败');return;}"
+            "var count=(r.downloaded||[]).length;"
+            "if(count){alert('字幕已下载并写入视频目录。');location.reload();}"
+            "else {alert('字幕未下载：'+((r.errors||[]).join('\\n')||"
+            "r.status||'未知错误'));}"
+            "}).catch(function(err){console.error(err);alert('手动选字幕失败');});"
+            "})()"
+        )
+
     def stop_service(self) -> None:
         """Stop the optional local service process owned by this plugin."""
 
@@ -2388,6 +2837,29 @@ class CSFReborn(_PluginBase):
                 for token in value.split(",")
             )
         )
+
+    @classmethod
+    def _media_poster_url(cls, mediainfo: Any) -> str | None:
+        """Return a browser-safe MoviePilot/TMDB poster URL when available."""
+
+        candidates: list[Any] = []
+        for name in ("poster_url", "poster_path", "poster", "cover", "backdrop_path"):
+            candidates.append(cls._field(mediainfo, name))
+        tmdb_info = cls._field(mediainfo, "tmdb_info")
+        if isinstance(tmdb_info, Mapping):
+            for name in ("poster_path", "poster", "poster_url", "backdrop_path"):
+                candidates.append(tmdb_info.get(name))
+        for value in candidates:
+            text = str(value or "").strip()
+            if not text:
+                continue
+            if text.startswith(("http://", "https://")):
+                return text
+            if text.startswith("/"):
+                return f"https://image.tmdb.org/t/p/w500{text}"
+            if Path(text).is_absolute():
+                return text
+        return None
 
     @staticmethod
     def _media_type(value: Any) -> str:

@@ -13,8 +13,12 @@ from .config import Settings
 from .jobs import JobManager, JobStore
 from .models import (
     JobRecord,
+    ManualDownloadRequest,
+    ManualSearchRequest,
+    ManualSearchResult,
     ProcessRequest,
     ProcessResult,
+    QueueView,
     ScanRequest,
     ScanResult,
     SearchRequest,
@@ -47,7 +51,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(
         title="SubtitleForge",
-        version="0.3.3",
+        version="0.4.0",
         description="Provider-driven Chinese subtitle downloader for NAS and MoviePilot.",
         lifespan=lifespan,
     )
@@ -78,7 +82,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         service: SubtitleService = app.state.service
         return {
             "status": "ok",
-            "version": "0.3.3",
+            "version": "0.4.0",
             "providers": {
                 name: provider.configured
                 for name, provider in service.providers.items()
@@ -88,6 +92,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/v1/status")
     async def runtime_status(
         daily_download_limit: int = Query(default=10, ge=1, le=1000),
+        queue_limit: int = Query(default=30, ge=1, le=100),
         _: None = Depends(require_token),
     ) -> dict[str, Any]:
         """Return live quota, queue, and provider health for the plugin page."""
@@ -96,10 +101,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         service: SubtitleService = app.state.service
         return {
             "status": "ok",
-            "version": "0.3.3",
-            **scanner.status(daily_download_limit),
+            "version": "0.4.0",
+            **scanner.status(daily_download_limit, queue_limit),
             "providers": service.status(),
         }
+
+    @app.get("/v1/queue", response_model=QueueView)
+    async def queue_view(
+        limit: int = Query(default=30, ge=1, le=100),
+        _: None = Depends(require_token),
+    ) -> QueueView:
+        """Return the pending subtitle queue grouped by season."""
+
+        scanner: LibraryScanner = app.state.scanner
+        return scanner.queue_view(limit)
 
     @app.get("/", response_class=HTMLResponse)
     async def index() -> str:
@@ -173,6 +188,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         scanner: LibraryScanner = app.state.scanner
         return await scanner.scan(request)
+
+    @app.post("/v1/manual/search", response_model=ManualSearchResult)
+    async def manual_search(
+        request: ManualSearchRequest,
+        _: None = Depends(require_token),
+    ) -> ManualSearchResult:
+        """Search every configured source for one queued video."""
+
+        scanner: LibraryScanner = app.state.scanner
+        try:
+            return await scanner.manual_search(request)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/v1/manual/download", response_model=ProcessResult)
+    async def manual_download(
+        request: ManualDownloadRequest,
+        _: None = Depends(require_token),
+    ) -> ProcessResult:
+        """Download and install one explicitly selected subtitle."""
+
+        scanner: LibraryScanner = app.state.scanner
+        try:
+            return await scanner.manual_download(request)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/v1/jobs/{job_id}", response_model=JobRecord)
     async def get_job(

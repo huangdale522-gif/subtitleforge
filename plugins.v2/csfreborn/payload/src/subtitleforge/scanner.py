@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import json
+import mimetypes
 import os
 import re
 import sqlite3
+import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from html import unescape
@@ -14,12 +18,20 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .models import (
+    ManualCandidateView,
+    ManualDownloadRequest,
+    ManualSearchResult,
     MediaType,
     ProcessRequest,
     ProcessResult,
+    QueueGroupView,
+    QueueItemView,
+    QueueView,
     ScanItemResult,
     ScanRequest,
     ScanResult,
+    SubtitleCandidate,
+    SubtitleLanguage,
 )
 from .service import SubtitleService
 from .subtitle_files import ensure_path_allowed
@@ -40,6 +52,19 @@ IGNORED_DIRECTORIES = {
     "bdmv",
     "lost+found",
 }
+POSTER_BASENAMES = (
+    "poster",
+    "folder",
+    "show",
+    "cover",
+    "thumb",
+    "fanart",
+    "banner",
+)
+POSTER_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp")
+POSTER_MAX_BYTES = 256 * 1024
+QUEUE_ENTRY_SCAN_LIMIT = 5000
+QUEUE_MAX_ITEMS_PER_GROUP = 100
 TRAILING_RELEASE_TOKENS = re.compile(
     r"(?i)(?:[ ._-]+(?:2160p|1080p|720p|480p|bluray|blu-ray|webrip|web-dl|"
     r"hdtv|remux|x264|x265|h264|h265|hevc|avc|aac|dts|proper|repack).*)$"
@@ -104,6 +129,31 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _optional_int(value: Any) -> int | None:
+    """Convert an optional persisted value to an integer."""
+
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    """Parse an optional ISO timestamp into an aware UTC datetime."""
+
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
 @dataclass(slots=True)
 class DiscoveredVideo:
     """Filesystem metadata plus the best title information derived from a path."""
@@ -120,6 +170,7 @@ class DiscoveredVideo:
     genres: list[str] = field(default_factory=list)
     origin_countries: list[str] = field(default_factory=list)
     original_language: str | None = None
+    poster_url: str | None = None
 
 
 @dataclass(slots=True)
@@ -129,6 +180,9 @@ class QueueEntry:
     video_path: str
     payload: dict[str, Any]
     attempts: int
+    queued_at: str | None = None
+    next_attempt_at: str | None = None
+    last_error: str | None = None
 
 
 @dataclass(slots=True)
@@ -140,6 +194,17 @@ class NfoMetadata:
     genres: list[str] = field(default_factory=list)
     origin_countries: list[str] = field(default_factory=list)
     original_language: str | None = None
+    poster_url: str | None = None
+
+
+@dataclass(slots=True)
+class ManualSearchSession:
+    """Short-lived server-side candidate references for manual selection."""
+
+    search_id: str
+    request: ProcessRequest
+    candidates: dict[str, SubtitleCandidate]
+    expires_at: datetime
 
 
 class ScanStore:
@@ -273,6 +338,65 @@ class ScanStore:
             )
             connection.commit()
 
+    @staticmethod
+    def _queue_entry(row: tuple[Any, ...]) -> QueueEntry | None:
+        """Convert a queue row into a typed entry."""
+
+        if len(row) < 3:
+            return None
+        video_path, payload_json, attempts = row[:3]
+        try:
+            payload = json.loads(str(payload_json))
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return QueueEntry(
+            video_path=str(video_path),
+            payload=payload,
+            attempts=int(attempts or 0),
+            queued_at=str(row[3]) if len(row) > 3 and row[3] else None,
+            next_attempt_at=str(row[4]) if len(row) > 4 and row[4] else None,
+            last_error=str(row[5]) if len(row) > 5 and row[5] else None,
+        )
+
+    def get_queue_item(self, video_path: Path) -> QueueEntry | None:
+        """Return one pending queue entry by its exact video path."""
+
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    video_path, payload_json, attempts,
+                    queued_at, next_attempt_at, last_error
+                FROM download_queue
+                WHERE video_path = ? AND status = 'pending'
+                """,
+                (str(video_path),),
+            ).fetchone()
+        return self._queue_entry(tuple(row)) if row else None
+
+    def queue_entries(self, limit: int = 500) -> list[QueueEntry]:
+        """Return pending queue entries for the grouped plugin view."""
+
+        if limit <= 0:
+            return []
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    video_path, payload_json, attempts,
+                    queued_at, next_attempt_at, last_error
+                FROM download_queue
+                WHERE status = 'pending'
+                ORDER BY queued_at, video_path
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        entries = [self._queue_entry(tuple(row)) for row in rows]
+        return [entry for entry in entries if entry is not None]
+
     def next_queue_items(self, limit: int) -> list[QueueEntry]:
         """Return due queue tasks in oldest-first order."""
 
@@ -294,21 +418,8 @@ class ScanStore:
                 """,
                 (now, limit),
             ).fetchall()
-        entries: list[QueueEntry] = []
-        for video_path, payload_json, attempts in rows:
-            try:
-                payload = json.loads(str(payload_json))
-            except (TypeError, ValueError):
-                continue
-            if not isinstance(payload, dict):
-                continue
-            entries.append(
-                QueueEntry(
-                    video_path=str(video_path),
-                    payload=payload,
-                    attempts=int(attempts or 0),
-                )
-            )
+        entries = [self._queue_entry(tuple(row)) for row in rows]
+        entries = [entry for entry in entries if entry is not None]
         return entries
 
     def mark_queue_result(
@@ -472,6 +583,96 @@ def _nfo_values(content: str, *tags: str) -> list[str]:
     return list(dict.fromkeys(values))
 
 
+def _poster_data_uri(path: Path) -> str | None:
+    """Embed a reasonably sized local poster without exposing NAS paths."""
+
+    try:
+        if not path.is_file() or path.stat().st_size > POSTER_MAX_BYTES:
+            return None
+        content = path.read_bytes()
+    except OSError:
+        return None
+    mime_type = mimetypes.guess_type(path.name)[0] or "image/jpeg"
+    if not mime_type.startswith("image/"):
+        return None
+    encoded = base64.b64encode(content).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
+
+
+def _poster_for_video(
+    video_path: Path,
+    payload: dict[str, Any] | None = None,
+) -> str | None:
+    """Find a browser-safe poster from queue metadata or nearby artwork."""
+
+    payload = payload or {}
+    raw_poster = str(payload.get("poster_url") or "").strip()
+    if raw_poster.startswith(("http://", "https://")):
+        return raw_poster
+    if raw_poster:
+        local = Path(raw_poster).expanduser()
+        if not local.is_absolute():
+            local = video_path.parent / local
+        poster = _poster_data_uri(local)
+        if poster:
+            return poster
+
+    # Old queue rows may predate poster_url. Re-read nearby NFO metadata so a
+    # completed upgrade does not require a full library scan just for artwork.
+    nfo_poster = _read_nfo_metadata(video_path).poster_url
+    if nfo_poster:
+        if nfo_poster.startswith(("http://", "https://")):
+            return nfo_poster
+        local = Path(nfo_poster).expanduser()
+        poster = _poster_data_uri(local)
+        if poster:
+            return poster
+
+    season = payload.get("season")
+    try:
+        season_number = int(season) if season is not None else None
+    except (TypeError, ValueError):
+        season_number = None
+    names: list[str] = []
+    if season_number is not None:
+        names.extend(
+            (
+                f"season{season_number:02d}-poster",
+                f"season{season_number}-poster",
+                f"season {season_number:02d}",
+                f"season {season_number}",
+            )
+        )
+    names.extend(POSTER_BASENAMES)
+    directories = [video_path.parent]
+    if (
+        SEASON_DIR_PATTERN.match(video_path.parent.name)
+        or "season" in video_path.parent.name.casefold()
+    ):
+        directories.append(video_path.parent.parent)
+    for directory in directories:
+        for name in names:
+            for extension in POSTER_EXTENSIONS:
+                poster = _poster_data_uri(directory / f"{name}{extension}")
+                if poster:
+                    return poster
+    return None
+
+
+def _media_category(video_path: Path, media_type: MediaType) -> str:
+    """Return the display category used by the queue page."""
+
+    if media_type is not MediaType.TV:
+        return "movie"
+    if any(
+        marker in part.casefold()
+        for part in video_path.parts
+        for marker in ANIME_PATH_MARKERS
+    ):
+        return "anime"
+    return "tv"
+
+
 def _read_nfo_metadata(path: Path) -> NfoMetadata:
     """Read IDs, genres and country metadata from nearby NFO files."""
 
@@ -516,12 +717,24 @@ def _read_nfo_metadata(path: Path) -> NfoMetadata:
         if not metadata.original_language:
             languages = _nfo_values(content, "original_language")
             metadata.original_language = languages[0] if languages else None
+        if not metadata.poster_url:
+            for value in _nfo_values(content, "thumb", "poster"):
+                if value.startswith(("http://", "https://")):
+                    metadata.poster_url = value
+                    break
+                local_poster = Path(value).expanduser()
+                if not local_poster.is_absolute():
+                    local_poster = candidate.parent / local_poster
+                if local_poster.is_file():
+                    metadata.poster_url = str(local_poster)
+                    break
         if (
             metadata.tmdb_id is not None
             and metadata.imdb_id is not None
             and metadata.genres
             and metadata.origin_countries
             and metadata.original_language
+            and metadata.poster_url
         ):
             break
     return metadata
@@ -589,6 +802,7 @@ def parse_media_path(path: Path, root: Path) -> DiscoveredVideo:
         genres=nfo.genres,
         origin_countries=nfo.origin_countries,
         original_language=nfo.original_language,
+        poster_url=nfo.poster_url,
     )
 
 
@@ -774,13 +988,18 @@ class LibraryScanner:
         self._service = service
         self._store = ScanStore(data_dir)
         self._scan_lock = asyncio.Lock()
+        self._manual_sessions: dict[str, ManualSearchSession] = {}
 
     def queue_status(self) -> dict[str, int]:
         """Return the persisted missing-subtitle queue summary."""
 
         return self._store.queue_status()
 
-    def status(self, daily_download_limit: int) -> dict[str, Any]:
+    def status(
+        self,
+        daily_download_limit: int,
+        queue_limit: int = 30,
+    ) -> dict[str, Any]:
         """Return live queue and local daily-quota state for the plugin page."""
 
         limit = max(1, int(daily_download_limit))
@@ -793,7 +1012,246 @@ class LibraryScanner:
                 "remaining": max(0, limit - used_today),
             },
             "queue": self._store.queue_status(),
+            "queue_groups": self.queue_view(queue_limit).model_dump(mode="json"),
         }
+
+    def queue_view(self, limit: int = 30) -> QueueView:
+        """Return pending items grouped by movie or TV/anime season."""
+
+        limit = max(1, min(int(limit), 100))
+        queue_status = self._store.queue_status()
+        entries = self._store.queue_entries(limit=QUEUE_ENTRY_SCAN_LIMIT)
+        groups: dict[str, dict[str, Any]] = {}
+        now = datetime.now(UTC)
+        for entry in entries:
+            payload = entry.payload
+            try:
+                media_type = MediaType(str(payload.get("media_type") or "movie"))
+            except ValueError:
+                media_type = MediaType.MOVIE
+            title = str(payload.get("title") or Path(entry.video_path).stem)
+            season = _optional_int(payload.get("season"))
+            episode = _optional_int(payload.get("episode"))
+            year = _optional_int(payload.get("year"))
+            tmdb_id = _optional_int(payload.get("tmdb_id"))
+            video = Path(entry.video_path)
+            if media_type is MediaType.TV:
+                show_dir = video.parent
+                if (
+                    SEASON_DIR_PATTERN.match(video.parent.name)
+                    or "season" in video.parent.name.casefold()
+                ):
+                    show_dir = video.parent.parent
+                key_source = (
+                    f"tv|{show_dir}|{title.casefold()}|{year or ''}|"
+                    f"{season if season is not None else ''}|{tmdb_id or ''}"
+                )
+            else:
+                key_source = f"movie|{video}"
+            group_id = hashlib.sha1(
+                key_source.encode("utf-8", errors="ignore")
+            ).hexdigest()[:16]
+            group = groups.get(group_id)
+            if group is None:
+                group = {
+                    "group_id": group_id,
+                    "title": title,
+                    "year": year,
+                    "media_type": media_type,
+                    "category": _media_category(video, media_type),
+                    "season": season,
+                    "tmdb_id": tmdb_id,
+                    "poster": _poster_for_video(video, payload),
+                    "missing_languages": [],
+                    "item_count": 0,
+                    "items": [],
+                }
+                groups[group_id] = group
+            elif not group["poster"]:
+                group["poster"] = _poster_for_video(video, payload)
+            for language in payload.get("languages") or []:
+                try:
+                    normalized = SubtitleLanguage(str(language))
+                except ValueError:
+                    continue
+                if normalized not in group["missing_languages"]:
+                    group["missing_languages"].append(normalized)
+            next_attempt = _parse_datetime(entry.next_attempt_at)
+            group["items"].append(
+                QueueItemView(
+                    video_path=entry.video_path,
+                    filename=video.name,
+                    title=title,
+                    year=year,
+                    media_type=media_type,
+                    season=season,
+                    episode=episode,
+                    languages=[
+                        SubtitleLanguage(str(language))
+                        for language in (payload.get("languages") or [])
+                        if str(language)
+                        in {
+                            SubtitleLanguage.SIMPLIFIED.value,
+                            SubtitleLanguage.TRADITIONAL.value,
+                        }
+                    ],
+                    attempts=entry.attempts,
+                    queued_at=entry.queued_at,
+                    next_attempt_at=entry.next_attempt_at,
+                    last_error=entry.last_error,
+                    deferred=bool(next_attempt and next_attempt > now),
+                )
+            )
+            group["item_count"] += 1
+
+        ordered_groups = sorted(
+            groups.values(),
+            key=lambda group: (
+                str(group["title"]).casefold(),
+                int(group["season"] or 0),
+                str(group["group_id"]),
+            ),
+        )
+        for group in ordered_groups:
+            group["items"].sort(
+                key=lambda item: (
+                    int(item.season or 0),
+                    int(item.episode or 0),
+                    item.filename.casefold(),
+                )
+            )
+        limited = ordered_groups[:limit]
+        for group in limited:
+            item_count = int(group["item_count"])
+            group["items"] = group["items"][:QUEUE_MAX_ITEMS_PER_GROUP]
+            group["items_truncated"] = item_count > len(group["items"])
+        return QueueView(
+            total=queue_status["total"],
+            due=queue_status["due"],
+            deferred=queue_status["deferred"],
+            groups=[QueueGroupView.model_validate(group) for group in limited],
+            truncated=len(ordered_groups) > len(limited)
+            or len(entries) >= QUEUE_ENTRY_SCAN_LIMIT,
+        )
+
+    def _cleanup_manual_sessions(self) -> None:
+        """Discard expired candidate references."""
+
+        now = datetime.now(UTC)
+        expired = [
+            search_id
+            for search_id, session in self._manual_sessions.items()
+            if session.expires_at <= now
+        ]
+        for search_id in expired:
+            self._manual_sessions.pop(search_id, None)
+
+    async def manual_search(
+        self,
+        request: ManualSearchRequest,
+    ) -> ManualSearchResult:
+        """Search all configured providers for one queued video."""
+
+        self._cleanup_manual_sessions()
+        video = ensure_path_allowed(
+            Path(request.video_path).expanduser(),
+            self._service.settings.media_root_paths,
+        )
+        if not video.is_file():
+            raise ValueError("Video file does not exist")
+        entry = self._store.get_queue_item(video)
+        if entry is None:
+            raise ValueError("该视频不在待处理字幕队列中，请重新扫描")
+        process_request = ProcessRequest.model_validate(entry.payload)
+        provider_order = request.provider_order or process_request.provider_order
+        candidates, errors = await self._service.search(
+            # Keep ProcessRequest so fingerprint providers can still see
+            # video_path while searching for a manual selection.
+            process_request,
+            provider_order=provider_order,
+            provider_failover=False,
+        )
+        search_id = uuid.uuid4().hex
+        selection_map: dict[str, SubtitleCandidate] = {}
+        public_candidates: list[ManualCandidateView] = []
+        for rank, candidate in enumerate(candidates[:100], start=1):
+            selection_id = hashlib.sha256(
+                (
+                    f"{candidate.provider}\0{candidate.candidate_id}\0"
+                    f"{candidate.release_name or ''}\0{rank}"
+                ).encode("utf-8", errors="ignore")
+            ).hexdigest()[:20]
+            selection_map[selection_id] = candidate
+            public_candidates.append(
+                ManualCandidateView(
+                    selection_id=selection_id,
+                    provider=candidate.provider,
+                    title=candidate.title,
+                    release_name=candidate.release_name,
+                    language=candidate.language,
+                    format=candidate.format,
+                    season=candidate.season,
+                    episode=candidate.episode,
+                    year=candidate.year,
+                    rank=rank,
+                    score=candidate.score,
+                    download_count=candidate.download_count,
+                    machine_translated=candidate.machine_translated,
+                )
+            )
+        expires_at = datetime.now(UTC) + timedelta(minutes=30)
+        self._manual_sessions[search_id] = ManualSearchSession(
+            search_id=search_id,
+            request=process_request,
+            candidates=selection_map,
+            expires_at=expires_at,
+        )
+        return ManualSearchResult(
+            search_id=search_id,
+            video_path=str(video),
+            title=process_request.title,
+            year=process_request.year,
+            media_type=process_request.media_type,
+            season=process_request.season,
+            episode=process_request.episode,
+            poster=_poster_for_video(video, entry.payload),
+            languages=process_request.languages,
+            candidates=public_candidates,
+            errors=errors,
+            expires_at=expires_at.isoformat(),
+        )
+
+    async def manual_download(
+        self,
+        request: ManualDownloadRequest,
+    ) -> ProcessResult:
+        """Install one explicitly selected subtitle candidate."""
+
+        self._cleanup_manual_sessions()
+        session = self._manual_sessions.get(request.search_id)
+        if session is None:
+            raise ValueError("手动搜索已过期，请重新搜索字幕")
+        candidate = session.candidates.get(request.selection_id)
+        if candidate is None:
+            raise ValueError("所选字幕候选已失效，请重新搜索")
+        language = request.language or candidate.language
+        if language is None:
+            raise ValueError("该字幕未标注语言，请明确选择简体或繁体中文")
+        if request.daily_download_limit is not None:
+            if self._store.downloads_today() >= request.daily_download_limit:
+                raise ValueError("今日字幕下载额度已用完，请明天再试")
+        result = await self._service.install_candidate(
+            Path(session.request.video_path),
+            candidate,
+            language,
+            overwrite=request.overwrite,
+        )
+        if result.status == "completed" and result.downloaded:
+            self._store.record_downloads(len(result.downloaded))
+            self._store.remove_queue_item(Path(session.request.video_path))
+            self._store.mark_checked(Path(session.request.video_path), "completed")
+            self._manual_sessions.pop(request.search_id, None)
+        return result
 
     async def scan(self, request: ScanRequest) -> ScanResult:
         """Serialize full scans so concurrent triggers cannot exceed daily quota."""
@@ -929,6 +1387,7 @@ class LibraryScanner:
                     media_type=discovered_media.media_type,
                     season=discovered_media.season,
                     episode=discovered_media.episode,
+                    poster_url=discovered_media.poster_url,
                     languages=inspected.missing_languages,
                     overwrite=request.overwrite,
                     dry_run=False,

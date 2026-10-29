@@ -1,4 +1,5 @@
 import asyncio
+import json
 from pathlib import Path
 
 import httpx
@@ -7,6 +8,8 @@ import pytest
 from subtitleforge.config import Settings
 from subtitleforge.models import (
     DownloadedAsset,
+    ManualDownloadRequest,
+    ManualSearchRequest,
     MediaType,
     ScanRequest,
     SearchRequest,
@@ -60,6 +63,29 @@ class SlowScanProvider(ScanProvider):
     async def search(self, request: SearchRequest) -> list[SubtitleCandidate]:
         await asyncio.sleep(0.02)
         return await super().search(request)
+
+
+class ManualSelectionProvider(ScanProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.requested_video_paths: list[str] = []
+
+    async def search(self, request: SearchRequest) -> list[SubtitleCandidate]:
+        self.search_calls += 1
+        self.requested_video_paths.append(
+            str(getattr(request, "video_path", "") or "")
+        )
+        return [
+            SubtitleCandidate(
+                provider=self.name,
+                candidate_id="manual-test",
+                title=request.title,
+                release_name=f"{request.title}.manual.zh-cn.srt",
+                language=SubtitleLanguage.SIMPLIFIED,
+                format="srt",
+                download_ref={"url": "https://private.example/subtitle"},
+            )
+        ]
 
 
 def make_service(tmp_path: Path) -> SubtitleService:
@@ -223,6 +249,128 @@ async def test_scanner_status_reports_live_quota_and_queue(tmp_path: Path) -> No
 
     assert status["quota"] == {"used": 3, "limit": 10, "remaining": 7}
     assert status["queue"] == {"total": 1, "due": 1, "deferred": 0}
+
+
+@pytest.mark.asyncio
+async def test_queue_view_groups_tv_by_season_and_adds_local_poster(
+    tmp_path: Path,
+) -> None:
+    show_root = tmp_path / "动漫" / "Some Show (2024) {tmdbid=42}"
+    season_one = show_root / "Season 1"
+    season_two = show_root / "Season 2"
+    movie_root = tmp_path / "电影" / "Movie (2023)"
+    season_one.mkdir(parents=True)
+    season_two.mkdir(parents=True)
+    movie_root.mkdir(parents=True)
+    (show_root / "poster.jpg").write_bytes(b"fake-poster")
+    videos = [
+        season_one / "Some.Show.S01E01.mkv",
+        season_one / "Some.Show.S01E02.mkv",
+        season_two / "Some.Show.S02E01.mkv",
+        movie_root / "Movie.2023.mkv",
+    ]
+    for video in videos:
+        video.write_bytes(b"video")
+
+    service = make_service(tmp_path)
+    store = ScanStore(service.settings.data_dir)
+    for video in videos[:3]:
+        store.upsert_queue_item(
+            video,
+            {
+                "video_path": str(video),
+                "title": "Some Show",
+                "year": 2024,
+                "tmdb_id": 42,
+                "media_type": "tv",
+                "season": 1 if "S01" in video.name else 2,
+                "episode": int(video.stem.rsplit("E", 1)[1]),
+                "languages": ["zh-Hans"],
+            },
+        )
+    store.upsert_queue_item(
+        videos[3],
+        {
+            "video_path": str(videos[3]),
+            "title": "Movie",
+            "year": 2023,
+            "media_type": "movie",
+            "languages": ["zh-Hans"],
+        },
+    )
+    scanner = LibraryScanner(service, service.settings.data_dir)
+    try:
+        view = scanner.queue_view()
+    finally:
+        await service.close()
+
+    assert view.total == 4
+    assert len(view.groups) == 3
+    tv_groups = [
+        group for group in view.groups if group.media_type is MediaType.TV
+    ]
+    assert [group.season for group in tv_groups] == [1, 2]
+    assert tv_groups[0].category == "anime"
+    assert tv_groups[0].item_count == 2
+    assert len(tv_groups[0].items) == 2
+    assert tv_groups[0].poster is not None
+    assert tv_groups[0].poster.startswith("data:image/jpeg;base64,")
+    movie_group = next(
+        group for group in view.groups if group.media_type is MediaType.MOVIE
+    )
+    assert movie_group.title == "Movie"
+    assert movie_group.item_count == 1
+
+
+@pytest.mark.asyncio
+async def test_manual_search_keeps_video_path_and_downloads_selected_candidate(
+    tmp_path: Path,
+) -> None:
+    video = tmp_path / "Show (2024)" / "Season 1" / "Show.S01E01.mkv"
+    video.parent.mkdir(parents=True)
+    video.write_bytes(b"video")
+    service = make_service(tmp_path)
+    provider = ManualSelectionProvider()
+    service.providers["custom"] = provider
+    store = ScanStore(service.settings.data_dir)
+    store.upsert_queue_item(
+        video,
+        {
+            "video_path": str(video),
+            "title": "Show",
+            "year": 2024,
+            "media_type": "tv",
+            "season": 1,
+            "episode": 1,
+            "languages": ["zh-Hans"],
+        },
+    )
+    scanner = LibraryScanner(service, service.settings.data_dir)
+    try:
+        search = await scanner.manual_search(
+            ManualSearchRequest(video_path=str(video))
+        )
+        public_payload = search.model_dump(mode="json")
+        assert "download_ref" not in json.dumps(public_payload)
+        assert provider.requested_video_paths == [str(video)]
+        assert search.candidates
+
+        result = await scanner.manual_download(
+            ManualDownloadRequest(
+                search_id=search.search_id,
+                selection_id=search.candidates[0].selection_id,
+                language=SubtitleLanguage.SIMPLIFIED,
+                daily_download_limit=10,
+            )
+        )
+        status = scanner.status(daily_download_limit=10)
+    finally:
+        await service.close()
+
+    assert result.status == "completed"
+    assert result.downloaded
+    assert scanner.queue_status()["total"] == 0
+    assert status["quota"]["used"] == 1
 
 
 @pytest.mark.asyncio

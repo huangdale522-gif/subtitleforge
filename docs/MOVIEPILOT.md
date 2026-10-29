@@ -70,6 +70,18 @@ daily limit applies to all providers together. Quotas enforced by ASSRT,
 SubtitleBest, OpenSubtitles, or a custom source remain authoritative on those
 services and may change without notice.
 
+The queue section groups movies separately and combines TV/anime episodes by
+season. It reads artwork from MoviePilot/TMDB metadata, NFO poster fields, or
+local `poster`/`folder`/`seasonXX-poster` files. Each queued video exposes a
+manual subtitle picker backed by:
+
+- `GET /api/v1/plugin/CSFReborn/queue`
+- `POST /api/v1/plugin/CSFReborn/manual/search`
+- `POST /api/v1/plugin/CSFReborn/manual/download`
+
+The browser only receives public candidate metadata and short-lived selection
+IDs. Provider URLs, tokens, and download references stay on the service.
+
 When `notify` is enabled, MoviePilot sends the scan summary through its
 configured Telegram or other notification channel. A successful scan message
 lists the actual subtitle filenames written beside the videos, including

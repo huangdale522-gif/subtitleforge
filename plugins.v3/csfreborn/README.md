@@ -3,6 +3,8 @@
 This plugin listens for `TransferComplete` events and can also scan the media
 library on a schedule. It can start the bundled SubtitleForge service inside the
 MoviePilot container and uses MoviePilot's own title, year and IMDb metadata.
+Its queue page groups movies separately and combines TV/anime episodes by
+season, with cover artwork and an interactive subtitle picker.
 
 Configuration:
 
@@ -73,6 +75,32 @@ cooldowns. `scan_daily_download_limit` is one global cap across all providers,
 not a separate allowance for each source. ASSRT, SubtitleBest, OpenSubtitles,
 and custom sources can also enforce account quotas which this plugin cannot
 query in advance.
+
+## Queue artwork and manual subtitle selection
+
+The queue is grouped as:
+
+- One card per movie.
+- One card per TV/anime title and season, for example `Some Show · 第 2 季`.
+
+Cover artwork is loaded from, in order, MoviePilot/TMDB metadata, NFO
+`<thumb>`/`<poster>`, a season poster such as `season02-poster.jpg`, or common
+local artwork names such as `poster.jpg`, `folder.jpg`, `thumb.jpg`, and
+`fanart.jpg`. Local images are embedded as data URIs so the browser does not
+need direct access to NAS paths.
+
+Each queued video has a `手动选字幕` button. It searches all configured sources,
+shows ranked candidates with language, format, provider, release name, score,
+and download count, then downloads only the candidate selected by the user.
+Provider download URLs and credentials remain on the SubtitleForge service.
+Candidate references expire after 30 minutes. A manual download uses the same
+`scan_daily_download_limit` ledger as automatic queue processing.
+
+Authenticated plugin APIs:
+
+- `GET /api/v1/plugin/CSFReborn/queue`
+- `POST /api/v1/plugin/CSFReborn/manual/search`
+- `POST /api/v1/plugin/CSFReborn/manual/download`
 
 When the bundled service is managed by the plugin, it uses the paths visible in
 the MoviePilot container. For the common MoviePilot layout, `media_roots` is

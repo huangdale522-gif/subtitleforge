@@ -54,7 +54,7 @@ class SubtitleService:
         self._client = client or httpx.AsyncClient(
             timeout=settings.request_timeout_seconds,
             follow_redirects=True,
-            headers={"User-Agent": "SubtitleForge/0.3.3"},
+            headers={"User-Agent": "SubtitleForge/0.4.0"},
         )
         self.providers: dict[str, SubtitleProvider] = {
             "xunlei": XunleiProvider(
@@ -248,6 +248,112 @@ class SubtitleService:
         async with lock:
             return await self._process_locked(request, video)
 
+    async def install_candidate(
+        self,
+        video_path: Path,
+        candidate: SubtitleCandidate,
+        language: SubtitleLanguage,
+        *,
+        overwrite: bool = False,
+    ) -> ProcessResult:
+        """Install one candidate explicitly selected by a user."""
+
+        video = ensure_path_allowed(video_path.expanduser(), self.settings.media_root_paths)
+        if not video.is_file():
+            raise ValueError("Video file does not exist")
+        lock_key = str(video)
+        async with self._locks_guard:
+            lock = self._locks.setdefault(lock_key, asyncio.Lock())
+        async with lock:
+            result = ProcessResult(
+                status="processing",
+                video_path=str(video),
+                missing_languages=[language],
+                dry_run=False,
+            )
+            try:
+                downloaded = await self._install_candidate_locked(
+                    video,
+                    candidate,
+                    language,
+                    overwrite,
+                )
+                result.downloaded.append(downloaded)
+                result.missing_languages = []
+                result.status = "completed"
+            except ProviderQuotaError as exc:
+                result.errors.append(
+                    f"{candidate.provider}/{candidate.candidate_id}: {exc}"
+                )
+                self._activate_provider_cooldown(candidate.provider)
+                result.status = "not_found"
+            except ProviderUnavailableError as exc:
+                minutes = max(
+                    0, self.settings.provider_unavailable_cooldown_minutes
+                )
+                result.errors.append(
+                    f"{candidate.provider}/{candidate.candidate_id}: {exc}; "
+                    f"cooling down for {minutes} minutes"
+                )
+                self._activate_provider_cooldown(
+                    candidate.provider, minutes * 60
+                )
+                result.status = "not_found"
+            except (ProviderError, ValueError, FileExistsError, OSError) as exc:
+                result.errors.append(
+                    f"{candidate.provider}/{candidate.candidate_id}: {exc}"
+                )
+                result.status = "not_found"
+            return result
+
+    async def _install_candidate_locked(
+        self,
+        video: Path,
+        candidate: SubtitleCandidate,
+        language: SubtitleLanguage,
+        overwrite: bool,
+    ) -> DownloadedSubtitle:
+        """Download, validate and write one candidate while the file lock is held."""
+
+        provider = self.providers.get(candidate.provider)
+        if provider is None or not provider.configured:
+            raise ProviderError(
+                f"Subtitle provider {candidate.provider} is not configured"
+            )
+        if self._provider_in_cooldown(candidate.provider):
+            raise ProviderUnavailableError(
+                f"Subtitle provider {candidate.provider} is cooling down"
+            )
+        asset = await provider.download(candidate)
+        if len(asset.content) > self.settings.max_download_mb * 1024 * 1024:
+            raise ValueError(
+                "Downloaded subtitle exceeds the configured size limit"
+            )
+        content, file_name = select_subtitle(
+            asset,
+            language,
+            self.settings.max_download_mb * 1024 * 1024,
+        )
+        detected = language_from_content(content)
+        if detected is not None and detected is not language:
+            raise ValueError(
+                f"Detected {detected.value} instead of {language.value}"
+            )
+        destination, file_format = install_subtitle(
+            video,
+            content,
+            file_name,
+            language,
+            overwrite,
+        )
+        return DownloadedSubtitle(
+            language=language,
+            provider=candidate.provider,
+            candidate=candidate.display_name,
+            path=str(destination),
+            format=file_format,
+        )
+
     async def _process_locked(
         self, request: ProcessRequest, video: Path
     ) -> ProcessResult:
@@ -301,35 +407,12 @@ class SubtitleService:
                 if self._provider_in_cooldown(candidate.provider):
                     continue
                 try:
-                    asset = await provider.download(candidate)
-                    if len(asset.content) > self.settings.max_download_mb * 1024 * 1024:
-                        raise ValueError(
-                            "Downloaded subtitle exceeds the configured size limit"
-                        )
-                    content, file_name = select_subtitle(
-                        asset,
-                        language,
-                        self.settings.max_download_mb * 1024 * 1024,
-                    )
-                    detected = language_from_content(content)
-                    if detected is not None and detected is not language:
-                        raise ValueError(
-                            f"Detected {detected.value} instead of {language.value}"
-                        )
-                    destination, file_format = install_subtitle(
-                        video,
-                        content,
-                        file_name,
-                        language,
-                        request.overwrite,
-                    )
                     result.downloaded.append(
-                        DownloadedSubtitle(
-                            language=language,
-                            provider=candidate.provider,
-                            candidate=candidate.display_name,
-                            path=str(destination),
-                            format=file_format,
+                        await self._install_candidate_locked(
+                            video,
+                            candidate,
+                            language,
+                            request.overwrite,
                         )
                     )
                     installed = True
