@@ -494,6 +494,56 @@ async def test_queue_view_groups_tv_by_season_and_adds_local_poster(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("poster_url", "expected"),
+    [
+        (
+            "/api/v1/system/img/1?imgurl=https%3A%2F%2Fimage.tmdb.org%2Fposter.jpg",
+            "/api/v1/system/img/1?imgurl=https%3A%2F%2Fimage.tmdb.org%2Fposter.jpg",
+        ),
+        (
+            "api/v1/system/img/1?imgurl=https%3A%2F%2Fimage.tmdb.org%2Fposter.jpg",
+            "/api/v1/system/img/1?imgurl=https%3A%2F%2Fimage.tmdb.org%2Fposter.jpg",
+        ),
+        (
+            "data:image/jpeg;base64,cG9zdGVy",
+            "data:image/jpeg;base64,cG9zdGVy",
+        ),
+    ],
+)
+async def test_queue_view_preserves_moviepilot_proxy_poster(
+    tmp_path: Path,
+    poster_url: str,
+    expected: str,
+) -> None:
+    video = tmp_path / "电影" / "Movie (2024)" / "Movie.2024.mkv"
+    video.parent.mkdir(parents=True)
+    video.write_bytes(b"video")
+
+    service = make_service(tmp_path)
+    store = ScanStore(service.settings.data_dir)
+    store.upsert_queue_item(
+        video,
+        {
+            "video_path": str(video),
+            "title": "Movie",
+            "year": 2024,
+            "media_type": "movie",
+            "poster_url": poster_url,
+            "poster_source": "moviepilot",
+            "languages": ["zh-Hans"],
+        },
+    )
+    scanner = LibraryScanner(service, service.settings.data_dir)
+    try:
+        view = scanner.queue_view()
+    finally:
+        await service.close()
+
+    assert view.groups[0].poster == expected
+
+
+@pytest.mark.asyncio
 async def test_queue_view_ignores_legacy_actor_poster(
     tmp_path: Path,
 ) -> None:

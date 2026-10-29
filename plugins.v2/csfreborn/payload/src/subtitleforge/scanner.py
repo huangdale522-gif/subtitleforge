@@ -686,7 +686,13 @@ def _poster_from_value(video_path: Path, value: Any) -> str | None:
     raw_poster = str(value or "").strip()
     if not raw_poster:
         return None
-    if raw_poster.startswith(("http://", "https://")):
+    if raw_poster.startswith(("http://", "https://", "data:image/")):
+        return raw_poster
+    if raw_poster.startswith("api/"):
+        raw_poster = f"/{raw_poster}"
+    if raw_poster.startswith("/api/"):
+        # MoviePilot's image proxy is a browser-relative URL. Treating it as a
+        # local path makes every proxied TMDB poster fail on the NAS.
         return raw_poster
     local = Path(raw_poster).expanduser()
     if not local.is_absolute():
