@@ -50,6 +50,8 @@ IGNORED_MEDIA_DIRECTORIES = {
     "bdmv",
     "lost+found",
 }
+SUBTITLE_FILE_EXTENSIONS = {".srt", ".ass", ".ssa", ".vtt", ".sub"}
+GENERATED_SUBTITLE_MARKERS = (".chi.zh-cn", ".zh-tw")
 MAX_TMDB_METADATA_ITEMS = 500
 TMDB_IMAGE_HOSTS = {
     "image.tmdb.org",
@@ -110,7 +112,7 @@ class CSFReborn(_PluginBase):
         "队列按季度展示封面，并支持手动挑选字幕。"
     )
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.10.10"
+    plugin_version = "0.10.11"
     plugin_author = "SubtitleForge contributors"
     author_url = "https://github.com/"
     plugin_config_prefix = "csfreborn_"
@@ -339,6 +341,13 @@ class CSFReborn(_PluginBase):
                 "auth": "bear",
                 "summary": "下载用户明确选择的字幕候选",
             },
+            {
+                "path": "/cleanup/bluray",
+                "endpoint": self.cleanup_bluray_subtitles,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "清理蓝光原盘分片误生成的字幕",
+            },
         ]
 
     def get_service(self) -> list[dict[str, Any]]:
@@ -459,6 +468,29 @@ class CSFReborn(_PluginBase):
             return result if isinstance(result, dict) else {"status": "error"}
         except Exception as exc:  # noqa: BLE001 - keep API response structured
             logger.warning(f"SubtitleForge 手动下载失败：{type(exc).__name__}: {exc}")
+            return {
+                "status": "error",
+                "errors": [f"{type(exc).__name__}: {exc}"],
+            }
+
+    async def cleanup_bluray_subtitles(
+        self,
+        payload: dict[str, Any] | None = Body(default=None),
+    ) -> dict[str, Any]:
+        """Remove subtitles accidentally generated inside BDMV directories."""
+
+        data = payload or {}
+        if data.get("confirm") is not True:
+            return {
+                "status": "error",
+                "message": "清理蓝光分片字幕需要明确确认",
+            }
+        try:
+            return await asyncio.to_thread(self._cleanup_bluray_subtitles)
+        except Exception as exc:  # noqa: BLE001 - keep API response structured
+            logger.warning(
+                f"SubtitleForge 蓝光字幕清理失败：{type(exc).__name__}: {exc}"
+            )
             return {
                 "status": "error",
                 "errors": [f"{type(exc).__name__}: {exc}"],
@@ -1486,8 +1518,7 @@ class CSFReborn(_PluginBase):
                 text=f"已下载字幕文件：\n{names}",
             )
 
-    @staticmethod
-    def _extract_video_paths(transferinfo: Any) -> list[str]:
+    def _extract_video_paths(self, transferinfo: Any) -> list[str]:
         """Read file paths from both MoviePilot V2 and V3 transfer payloads."""
 
         if transferinfo is None:
@@ -1507,7 +1538,30 @@ class CSFReborn(_PluginBase):
             target_path = getattr(target_item, "path", None)
             if target_path:
                 candidates.append(str(target_path))
-        return list(dict.fromkeys(path for path in candidates if path))
+        extensions = {
+            value.casefold() if value.startswith(".") else f".{value.casefold()}"
+            for value in self._split_list(self._scan_video_extensions)
+        }
+        filtered: list[str] = []
+        for path in candidates:
+            if not path or self._is_bluray_path(path):
+                continue
+            if Path(path).suffix.casefold() not in extensions:
+                continue
+            filtered.append(path)
+        if candidates and not filtered:
+            logger.info(
+                "SubtitleForge: 已跳过蓝光原盘或非独立视频整理项，"
+                "不会逐段下载字幕"
+            )
+        return list(dict.fromkeys(filtered))
+
+    @staticmethod
+    def _is_bluray_path(path: str) -> bool:
+        """Return whether a path belongs to a Blu-ray BDMV tree."""
+
+        parts = str(path).replace("\\", "/").split("/")
+        return any(part.casefold() == "bdmv" for part in parts)
 
     def _request_json(
         self,
@@ -2034,6 +2088,7 @@ class CSFReborn(_PluginBase):
         """Render live quota, provider health, scan results, and history."""
 
         history = self._load_history()
+        bluray_cleanup_roots = self._history_bdmv_roots(history)
         latest_scan = self._load_latest_scan()
         runtime, status_error = self._load_runtime_status()
         quota = runtime.get("quota") if isinstance(runtime.get("quota"), dict) else {}
@@ -2183,6 +2238,25 @@ class CSFReborn(_PluginBase):
                         },
                         "text": "刷新状态",
                     },
+                    *(
+                        [
+                            {
+                                "component": "VBtn",
+                                "props": {
+                                    "color": "warning",
+                                    "variant": "tonal",
+                                    "prepend-icon": "mdi-delete-sweep-outline",
+                                    "onclick": self._cleanup_bluray_onclick(),
+                                },
+                                "text": (
+                                    "清理蓝光分片误生成字幕"
+                                    f"（{len(bluray_cleanup_roots)}）"
+                                ),
+                            }
+                        ]
+                        if bluray_cleanup_roots
+                        else []
+                    ),
                     self._chip(
                         f"今日扫描下载 {used_today}/{daily_limit}",
                         (
@@ -3376,6 +3450,27 @@ class CSFReborn(_PluginBase):
             "})()"
         )
 
+    def _cleanup_bluray_onclick(self) -> str:
+        """Build the confirmed Blu-ray subtitle cleanup handler."""
+
+        api = json.dumps(
+            f"plugin/{self.__class__.__name__}/cleanup/bluray"
+        )
+        return (
+            "(function(){"
+            "if(!confirm('将删除历史记录中蓝光 BDMV 目录内由 SubtitleForge "
+            "生成的简体/繁体中文字幕。仅删除旁边存在同名视频的文件。继续？'))"
+            "{return;}"
+            f"window.MoviePilotAPI.post({api},{{confirm:true}})"
+            ".then(function(r){"
+            "if(!r||r.status==='error'){"
+            "alert((r&&(r.message||r.errors&&r.errors[0]))||'清理失败');return;}"
+            "alert('已清理 '+(r.deleted||0)+' 个字幕文件。');"
+            "location.reload();"
+            "}).catch(function(err){console.error(err);alert('清理失败');});"
+            "})()"
+        )
+
     def _manual_onclick(self, video_path: str) -> str:
         """Build the interactive search-and-download handler for one video."""
 
@@ -3492,6 +3587,149 @@ class CSFReborn(_PluginBase):
             except json.JSONDecodeError:
                 return []
         return value if isinstance(value, list) else []
+
+    @staticmethod
+    def _bdmv_root(path_value: Any) -> Path | None:
+        """Return the BDMV root for a path, if it belongs to a Blu-ray tree."""
+
+        raw = str(path_value or "").replace("\\", "/")
+        parts = [part for part in raw.split("/") if part]
+        for index, part in enumerate(parts):
+            if part.casefold() != "bdmv":
+                continue
+            root_text = "/".join(parts[: index + 1])
+            return Path(f"/{root_text}" if raw.startswith("/") else root_text)
+        return None
+
+    @classmethod
+    def _history_bdmv_roots(cls, history: list[dict]) -> list[Path]:
+        """Collect BDMV roots referenced by generated subtitle history."""
+
+        roots: dict[str, Path] = {}
+        for entry in history:
+            if not isinstance(entry, dict):
+                continue
+            result = entry.get("result")
+            if not isinstance(result, dict):
+                continue
+            for item in result.get("downloaded") or []:
+                if not isinstance(item, dict):
+                    continue
+                root = cls._bdmv_root(item.get("path"))
+                if root is not None:
+                    roots[str(root)] = root
+        return [roots[key] for key in sorted(roots)]
+
+    def _cleanup_path_allowed(self, path: Path) -> bool:
+        """Keep cleanup operations inside configured media roots."""
+
+        target = path.expanduser().resolve(strict=False)
+        for raw_root in self._split_list(self._media_roots):
+            root = Path(raw_root).expanduser().resolve(strict=False)
+            if target == root or root in target.parents:
+                return True
+        return False
+
+    def _cleanup_bluray_subtitles(self) -> dict[str, Any]:
+        """Delete only SubtitleForge subtitles beside BDMV video fragments."""
+
+        history = self._load_history()
+        roots = self._history_bdmv_roots(history)
+        extensions = {
+            value.casefold() if value.startswith(".") else f".{value.casefold()}"
+            for value in self._split_list(self._scan_video_extensions)
+        }
+        errors: list[str] = []
+        candidates: list[Path] = []
+        seen: set[str] = set()
+        for root in roots:
+            if not self._cleanup_path_allowed(root):
+                errors.append(f"{root}: 不在媒体根目录内，已跳过")
+                continue
+            if not root.is_dir():
+                errors.append(f"{root}: BDMV 目录不存在")
+                continue
+            for subtitle in root.rglob("*"):
+                try:
+                    if (
+                        not subtitle.is_file()
+                        or subtitle.suffix.casefold()
+                        not in SUBTITLE_FILE_EXTENSIONS
+                    ):
+                        continue
+                    stem_lower = subtitle.stem.casefold()
+                    marker = next(
+                        (
+                            value
+                            for value in GENERATED_SUBTITLE_MARKERS
+                            if stem_lower.endswith(value)
+                        ),
+                        None,
+                    )
+                    if marker is None:
+                        continue
+                    video_stem = subtitle.stem[: -len(marker)]
+                    if not video_stem:
+                        continue
+                    sibling_names = {
+                        item.stem.casefold()
+                        for item in subtitle.parent.iterdir()
+                        if item.is_file()
+                        and item.suffix.casefold() in extensions
+                    }
+                    if video_stem.casefold() not in sibling_names:
+                        continue
+                    key = str(subtitle)
+                    if key not in seen:
+                        seen.add(key)
+                        candidates.append(subtitle)
+                except OSError as exc:
+                    errors.append(f"{subtitle}: {exc}")
+
+        deleted: list[Path] = []
+        for subtitle in candidates:
+            try:
+                subtitle.unlink()
+                deleted.append(subtitle)
+            except OSError as exc:
+                errors.append(f"{subtitle}: {exc}")
+
+        if deleted:
+            deleted_paths = {str(path) for path in deleted}
+            changed = False
+            for entry in history:
+                if not isinstance(entry, dict):
+                    continue
+                result = entry.get("result")
+                if not isinstance(result, dict):
+                    continue
+                downloaded = result.get("downloaded")
+                if not isinstance(downloaded, list):
+                    continue
+                kept = [
+                    item
+                    for item in downloaded
+                    if not (
+                        isinstance(item, dict)
+                        and str(item.get("path") or "") in deleted_paths
+                    )
+                ]
+                if len(kept) != len(downloaded):
+                    result["downloaded"] = kept
+                    changed = True
+            if changed:
+                self.save_data(
+                    self._history_key,
+                    json.dumps(history, ensure_ascii=False),
+                )
+
+        return {
+            "status": "ok",
+            "targets": len(roots),
+            "candidates": len(candidates),
+            "deleted": len(deleted),
+            "errors": errors,
+        }
 
     def _load_latest_scan(self) -> dict[str, Any]:
         """Read the most recent library scan summary."""

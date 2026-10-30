@@ -232,7 +232,126 @@ def test_plugin_registers_queue_and_manual_api_routes() -> None:
 
     paths = {route["path"] for route in plugin.get_api()}
 
-    assert {"/queue", "/manual/search", "/manual/download"} <= paths
+    assert {
+        "/queue",
+        "/manual/search",
+        "/manual/download",
+        "/cleanup/bluray",
+    } <= paths
+
+
+def test_transfer_paths_skip_bluray_and_non_video_files() -> None:
+    plugin_module = load_moviepilot_plugin()
+    plugin = plugin_module.CSFReborn()
+    movie_dir = "/plex/电影/外语电影/Evil Dead Burn (2026)"
+    transferinfo = types.SimpleNamespace(
+        target_diritem=types.SimpleNamespace(path=movie_dir),
+        file_list_new=[
+            "BDMV/STREAM/00000.m2ts",
+            "BDMV/JAR/logger.m2ts",
+            "BDMV/META/DL/loadingAnimation.m2ts",
+            "poster.jpg",
+            "Evil.Dead.Burn.2026.mkv",
+        ],
+        target_item=None,
+    )
+
+    assert plugin._extract_video_paths(transferinfo) == [
+        f"{movie_dir}/Evil.Dead.Burn.2026.mkv"
+    ]
+
+
+def test_transfer_complete_ignores_bluray_only_payload() -> None:
+    plugin_module = load_moviepilot_plugin()
+    plugin = plugin_module.CSFReborn()
+    plugin._enabled = True
+    plugin._notify = True
+    transferinfo = types.SimpleNamespace(
+        target_diritem=types.SimpleNamespace(
+            path="/plex/电影/外语电影/Evil Dead Burn (2026)"
+        ),
+        file_list_new=[
+            "BDMV/STREAM/00000.m2ts",
+            "BDMV/JAR/logger.m2ts",
+        ],
+        target_item=None,
+    )
+    called = False
+
+    def request_json(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        return {"status": "ok"}
+
+    plugin._request_json = request_json
+    plugin.post_message = lambda **_kwargs: (_ for _ in ()).throw(
+        AssertionError("BDMV payload must not notify")
+    )
+    event = types.SimpleNamespace(
+        event_data={"transferinfo": transferinfo, "mediainfo": None}
+    )
+
+    asyncio.run(plugin.on_transfer_complete(event))
+
+    assert called is False
+
+
+def test_cleanup_bluray_subtitles_only_removes_generated_siblings(
+    tmp_path: Path,
+) -> None:
+    plugin_module = load_moviepilot_plugin()
+    plugin = plugin_module.CSFReborn()
+    stream = tmp_path / "Evil Dead Burn (2026)" / "BDMV" / "STREAM"
+    stream.mkdir(parents=True)
+    first_video = stream / "00000.m2ts"
+    second_video = stream / "00001.m2ts"
+    first_video.write_bytes(b"video")
+    second_video.write_bytes(b"video")
+    generated = [
+        stream / "00000.chi.zh-cn.srt",
+        stream / "00001.zh-tw.ass",
+    ]
+    for subtitle in generated:
+        subtitle.write_text("subtitle", encoding="utf-8")
+    manual = stream / "00000.manual.srt"
+    manual.write_text("manual", encoding="utf-8")
+    orphan = stream / "99999.chi.zh-cn.srt"
+    orphan.write_text("orphan", encoding="utf-8")
+
+    plugin._media_roots = str(tmp_path)
+    history = [
+        {
+            "result": {
+                "downloaded": [
+                    {"path": str(path)} for path in generated
+                ]
+            }
+        }
+    ]
+    plugin._load_history = lambda: history
+    saved: dict = {}
+    plugin.save_data = lambda key, value: saved.update({key: value})
+
+    result = plugin._cleanup_bluray_subtitles()
+
+    assert result["status"] == "ok"
+    assert result["candidates"] == 2
+    assert result["deleted"] == 2
+    assert all(not path.exists() for path in generated)
+    assert manual.exists()
+    assert orphan.exists()
+    assert history[0]["result"]["downloaded"] == []
+    assert "download_history" in saved
+
+
+def test_cleanup_bluray_api_requires_confirmation() -> None:
+    plugin_module = load_moviepilot_plugin()
+    plugin = plugin_module.CSFReborn()
+
+    result = asyncio.run(plugin.cleanup_bluray_subtitles({}))
+
+    assert result["status"] == "error"
+    assert "明确确认" in result["message"]
 
 
 def test_media_poster_url_does_not_use_landscape_backdrop() -> None:
