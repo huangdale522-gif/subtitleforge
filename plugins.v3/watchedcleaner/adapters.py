@@ -25,7 +25,8 @@ from .policy import (
 EMBY_ITEM_FIELDS = (
     "Path,DateCreated,Genres,ProviderIds,RunTimeTicks,SeriesId,SeriesName,"
     "SeasonId,ParentIndexNumber,IndexNumber,UserDataPlayCount,UserDataLastPlayedDate,"
-    "UserDataPlayedPercentage,UserDataIsFavorite,ImageTags,SeriesPrimaryImageTag"
+    "UserDataPlayedPercentage,UserDataIsFavorite,ImageTags,SeriesPrimaryImageTag,"
+    "ChildCount,RecursiveItemCount,Status"
 )
 
 
@@ -139,6 +140,8 @@ def _series_record(
             ),
             "favorite": any(as_bool(episode.get("favorite")) for episode in episode_records),
             "genres": genres,
+            "expected_episode_count": series_meta.get("expected_episode_count"),
+            "status": series_meta.get("status"),
         }
     )
 
@@ -224,6 +227,12 @@ def _season_record(
             ),
             "favorite": any(as_bool(episode.get("favorite")) for episode in episode_records),
             "genres": genres,
+            "expected_episode_count": season_meta.get("expected_episode_count"),
+            "status": season_meta.get("status"),
+            "series_expected_episode_count": series_meta.get(
+                "expected_episode_count"
+            ),
+            "series_status": series_meta.get("status"),
         }
     )
 
@@ -278,6 +287,12 @@ def _candidate_from_record(
         "last_played": iso_timestamp(record.get("last_played")),
         "added_at": iso_timestamp(record.get("added_at")),
         "favorite": as_bool(record.get("favorite")),
+        "expected_episode_count": record.get("expected_episode_count"),
+        "status": str(record.get("status") or ""),
+        "series_expected_episode_count": record.get(
+            "series_expected_episode_count"
+        ),
+        "series_status": str(record.get("series_status") or ""),
         "library": library_name,
         "genres": split_values(record.get("genres")),
         "scanned_at": datetime.now(timezone.utc).isoformat(),
@@ -484,6 +499,10 @@ class MediaAdapter(ABC):
     def refresh(self, candidate: Mapping[str, Any]) -> dict[str, Any]:
         """Re-read current media state immediately before deletion."""
 
+    def resolve_user(self, requested_username: str = "") -> tuple[str, str]:
+        """Resolve the current viewing account when the server supports users."""
+        return "", ""
+
     @abstractmethod
     def delete(self, candidate: Mapping[str, Any]) -> str:
         """Delete one item and return a human-readable success message."""
@@ -582,23 +601,42 @@ class EmbyFamilyAdapter(MediaAdapter):
         requested = requested_username.strip()
         if requested:
             for user in users:
-                if str(user.get("Name") or "") == requested:
-                    return requested, str(user.get("Id") or "")
+                if (
+                    str(user.get("Name") or "").casefold()
+                    == requested.casefold()
+                ):
+                    user_id = str(user.get("Id") or "").strip()
+                    if user_id:
+                        return str(user.get("Name") or requested), user_id
             raise AdapterError(f"{self.service_type} 中找不到用户 {requested}")
         if self.instance_user_id:
             for user in users:
                 if str(user.get("Id") or "") == self.instance_user_id:
                     return str(user.get("Name") or requested), self.instance_user_id
+            raise AdapterError(
+                f"{self.service_type} 中找不到已配置用户 ID "
+                f"{self.instance_user_id}，请重新选择观看状态用户"
+            )
         if self.configured_username:
             for user in users:
-                if str(user.get("Name") or "") == self.configured_username:
-                    return self.configured_username, str(user.get("Id") or "")
-        for user in users:
-            policy = user.get("Policy") or {}
-            if policy.get("IsAdministrator"):
-                return str(user.get("Name") or ""), str(user.get("Id") or "")
-        first = users[0]
-        return str(first.get("Name") or ""), str(first.get("Id") or "")
+                if (
+                    str(user.get("Name") or "").casefold()
+                    == self.configured_username.casefold()
+                ):
+                    user_id = str(user.get("Id") or "").strip()
+                    if user_id:
+                        return str(user.get("Name") or ""), user_id
+            raise AdapterError(
+                f"{self.service_type} 中找不到服务器配置用户 "
+                f"{self.configured_username}，请填写观看状态用户"
+            )
+        raise AdapterError(
+            f"请明确填写 {self.service_type} 观看状态用户；"
+            "为避免误删，不会回退到管理员或首个用户"
+        )
+
+    def resolve_user(self, requested_username: str = "") -> tuple[str, str]:
+        return self._resolve_user(requested_username)
 
     def _libraries(self, user_id: str) -> list[dict[str, Any]]:
         return _items(self._get_json(f"Users/{user_id}/Views"), key="")
@@ -721,6 +759,14 @@ class EmbyFamilyAdapter(MediaAdapter):
                 "added_at": item.get("DateCreated"),
                 "favorite": as_bool(user_data.get("IsFavorite")),
                 "genres": item.get("Genres") or [],
+                "expected_episode_count": (
+                    item.get("RecursiveItemCount")
+                    if kind == "series"
+                    else item.get("ChildCount")
+                    if kind == "season"
+                    else None
+                ),
+                "status": item.get("Status"),
             }
         )
 
@@ -1034,6 +1080,12 @@ class PlexAdapter(MediaAdapter):
                 "added_at": item.get("addedAt"),
                 "favorite": favorite,
                 "genres": genres,
+                "expected_episode_count": (
+                    item.get("leafCount")
+                    if item_type in {"show", "season"}
+                    else None
+                ),
+                "status": item.get("status") or item.get("showStatus"),
             }
         )
 
@@ -1100,7 +1152,21 @@ class PlexAdapter(MediaAdapter):
                 metadata = self._section_items(section_key, plex_type)
                 records = [self._record(item) for item in metadata]
                 if base_category == "tv":
-                    records = [record for record in records if record.get("kind") == "episode"]
+                    records = [
+                        record
+                        for record in records
+                        if record.get("kind") == "episode"
+                    ]
+                    records.extend(
+                        self._record(item)
+                        for item in self._section_items(section_key, 2)
+                        if str(item.get("type") or "").lower() == "show"
+                    )
+                    records.extend(
+                        self._record(item)
+                        for item in self._section_items(section_key, 3)
+                        if str(item.get("type") or "").lower() == "season"
+                    )
                 scanned += len(records)
                 result = _collect_candidates(
                     records=records,

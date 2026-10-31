@@ -7,6 +7,7 @@ import app.plugins.watchedcleaner as plugin_module
 from app.plugins.watchedcleaner import WatchedCleaner
 from app.plugins.watchedcleaner import adapters as adapter_module
 from app.plugins.watchedcleaner.adapters import (
+    AdapterError,
     EmbyFamilyAdapter,
     PlexAdapter,
     _collect_candidates,
@@ -40,6 +41,7 @@ def _plugin(monkeypatch, **overrides):
         "min_days_since_played": 7,
         "min_days_since_added": 7,
         "protect_favorites": True,
+        "require_season_complete": True,
         "notify_enabled": False,
         "notify_user": "",
         "notify_scan_results": True,
@@ -190,8 +192,22 @@ def test_season_mode_groups_watched_episodes_into_one_season_candidate():
         "max_candidates": 100,
     }
 
+    season = _movie_record(
+        kind="season",
+        item_id="season-1",
+        series_id="show-1",
+        expected_episode_count=2,
+        status="Ended",
+    )
+    second_season = _movie_record(
+        kind="season",
+        item_id="season-2",
+        series_id="show-1",
+        expected_episode_count=1,
+        status="Ended",
+    )
     result = _collect_candidates(
-        records=episodes,
+        records=[*episodes, season, second_season],
         options=options,
         service_name="Emby",
         service_type="emby",
@@ -315,6 +331,119 @@ def test_recent_play_and_favorite_are_protected():
     assert record_block_reason(recent, options) == "收藏条目受保护"
     recent["favorite"] = False
     assert "播放过" in record_block_reason(recent, options)
+
+
+def test_missing_or_invalid_timestamps_cannot_bypass_retention_guards():
+    options = {
+        "watched_threshold": 90,
+        "min_days_since_played": 7,
+        "min_days_since_added": 7,
+        "protect_favorites": True,
+        "allowed_roots": ["/media"],
+    }
+    missing_played = _movie_record(last_played="")
+    assert "播放时间" in record_block_reason(missing_played, options)
+    invalid_added = _movie_record(added_at="not-a-date")
+    assert "入库时间" in record_block_reason(invalid_added, options)
+
+    options["min_days_since_played"] = 0
+    options["min_days_since_added"] = 0
+    assert record_block_reason(missing_played, options) == ""
+
+
+def _emby_adapter(**config):
+    service = SimpleNamespace(
+        type="emby",
+        config=SimpleNamespace(
+            config={
+                "host": "http://emby.local:8096",
+                "apikey": "secret",
+                **config,
+            }
+        ),
+        instance=None,
+    )
+    return EmbyFamilyAdapter("客厅 Emby", service, "emby")
+
+
+def test_emby_user_resolution_never_falls_back_to_admin(monkeypatch):
+    adapter = _emby_adapter()
+    monkeypatch.setattr(
+        adapter,
+        "_users",
+        lambda: [
+            {"Name": "管理员", "Id": "admin", "Policy": {"IsAdministrator": True}},
+            {"Name": "Viewer", "Id": "viewer"},
+        ],
+    )
+    assert adapter._resolve_user("viewer") == ("Viewer", "viewer")
+    try:
+        adapter._resolve_user("")
+    except AdapterError as error:
+        assert "不会回退" in str(error)
+    else:
+        raise AssertionError("未指定用户时必须拒绝扫描")
+
+
+def _complete_season_record(**overrides):
+    episodes = [
+        _movie_record(
+            kind="episode",
+            item_id=f"episode-{number}",
+            paths=[f"/media/TV/Test/S01E0{number}.mkv"],
+        )
+        for number in (1, 2)
+    ]
+    record = _movie_record(
+        kind="season",
+        item_id="season-1",
+        episodes=episodes,
+        expected_episode_count=2,
+        series_status="Ended",
+    )
+    record.update(overrides)
+    return normalize_record(record)
+
+
+def test_season_requires_ended_status_and_complete_episode_count():
+    options = {
+        "watched_threshold": 90,
+        "min_days_since_played": 7,
+        "min_days_since_added": 7,
+        "protect_favorites": True,
+        "require_season_complete": True,
+        "allowed_roots": ["/media"],
+    }
+    assert record_block_reason(_complete_season_record(), options) == ""
+    assert "已完结" in record_block_reason(
+        _complete_season_record(series_status="Continuing"), options
+    )
+    assert "分集总数" in record_block_reason(
+        _complete_season_record(expected_episode_count=None), options
+    )
+    assert "不完整" in record_block_reason(
+        _complete_season_record(expected_episode_count=3), options
+    )
+
+
+def test_plex_parser_preserves_season_episode_count_and_show_status():
+    service = SimpleNamespace(
+        type="plex",
+        config=SimpleNamespace(
+            config={"host": "http://plex.local:32400", "token": "secret"}
+        ),
+        instance=None,
+    )
+    adapter = PlexAdapter("Plex", service)
+    season = adapter._record(
+        {"type": "season", "ratingKey": "s1", "leafCount": 12}
+    )
+    show = adapter._record(
+        {"type": "show", "ratingKey": "show", "leafCount": 24, "status": "ended"}
+    )
+    assert season["expected_episode_count"] == 12
+    assert show["expected_episode_count"] == 24
+    assert show["status"] == "ended"
 
 
 def test_emby_parser_uses_user_state_and_file_path():
@@ -688,6 +817,158 @@ def test_scan_only_stores_candidates_and_never_deletes(monkeypatch):
     assert plugin._load_scan()["scan_id"] == response.data["scan_id"]
 
 
+def test_partial_scan_preserves_failed_server_snapshot_and_age_scope(monkeypatch):
+    plugin, _ = _plugin(monkeypatch, dry_run=True, notify_enabled=False)
+    plugin._discover_services = lambda: (
+        {"Broken": object(), "Working": object()},
+        "",
+    )
+    old = {
+        "key": candidate_key("Broken", "movie", "movie-1"),
+        "server": "Broken",
+        "server_type": "emby",
+        "category": "movie",
+        "kind": "movie",
+        "item_id": "movie-1",
+        "title": "上次扫描的电影",
+        "added_at": YEAR_OLD,
+    }
+    plugin._store_scan(
+        {
+            "scan_id": "scan-old",
+            "servers": [{"name": "Broken", "complete": True}],
+            "candidates": [old],
+        }
+    )
+
+    class FakeAdapter:
+        def __init__(self, name):
+            self.service_type = "emby"
+            self.name = name
+
+        def scan(self, _options, scan_id):
+            if self.name == "Broken":
+                return {"errors": ["媒体库读取失败"], "candidates": []}
+            return {
+                "scanned": 1,
+                "candidates": [
+                    {
+                        **old,
+                        "key": candidate_key("Working", "movie", "movie-2"),
+                        "server": "Working",
+                        "item_id": "movie-2",
+                        "scan_id": scan_id,
+                    }
+                ],
+                "skipped": {},
+                "truncated": False,
+                "errors": [],
+            }
+
+    monkeypatch.setattr(
+        plugin_module, "build_adapter", lambda name, _: FakeAdapter(name)
+    )
+    response = plugin.api_scan({})
+    assert response.success is True
+    scan = plugin._load_scan()
+    assert {candidate["key"] for candidate in scan["candidates"]} == {
+        old["key"],
+        candidate_key("Working", "movie", "movie-2"),
+    }
+    eligible = plugin._eligible_age_reminder_candidates(
+        [
+            candidate
+            for candidate in scan["candidates"]
+            if candidate["server"]
+            in {
+                server["name"]
+                for server in scan["servers"]
+                if server.get("complete") is not False
+            }
+        ],
+        {},
+    )
+    assert [candidate["server"] for candidate in eligible] == ["Working"]
+
+
+def test_completely_failed_scan_keeps_previous_snapshot(monkeypatch):
+    plugin, data = _plugin(monkeypatch, dry_run=True)
+    previous = {"scan_id": "last-good", "candidates": [{"key": "kept"}]}
+    plugin._store_scan(previous)
+    plugin._discover_services = lambda: ({"Broken": object()}, "")
+    monkeypatch.setattr(
+        plugin_module,
+        "build_adapter",
+        lambda *_: (_ for _ in ()).throw(AdapterError("连接失败")),
+    )
+    response = plugin.api_scan({})
+    assert response.success is False
+    assert data["last_scan"]["scan_id"] == "last-good"
+
+
+def test_legacy_snapshot_has_no_trusted_complete_server(monkeypatch):
+    plugin, _ = _plugin(monkeypatch)
+    plugin._store_scan(
+        {
+            "candidates": [
+                {
+                    "key": candidate_key("Emby", "movie", "movie-1"),
+                    "server": "Emby",
+                    "kind": "movie",
+                    "added_at": YEAR_OLD,
+                }
+            ]
+        }
+    )
+    complete_servers = {
+        server["name"]
+        for server in plugin._load_scan().get("servers", [])
+        if server.get("complete") is not False
+    }
+    assert complete_servers == set()
+
+
+def test_delete_rechecks_candidate_viewing_user(monkeypatch):
+    plugin, _ = _plugin(monkeypatch)
+
+    class FakeAdapter:
+        service_type = "emby"
+
+        @staticmethod
+        def resolve_user(_user):
+            return "另一个用户", "other-user"
+
+        @staticmethod
+        def refresh(_candidate):
+            raise AssertionError("用户不一致时不应读取或删除媒体")
+
+    try:
+        plugin._revalidate_candidate(
+            FakeAdapter(),
+            {"user": "admin", "user_id": "user-1"},
+        )
+    except AdapterError as error:
+        assert "观看用户已变化" in str(error)
+    else:
+        raise AssertionError("候选用户变化时必须拒绝删除")
+
+
+def test_plex_delete_does_not_require_separate_user_lookup(monkeypatch):
+    plugin, _ = _plugin(monkeypatch)
+    record = _movie_record()
+
+    class FakePlexAdapter:
+        service_type = "plex"
+
+        @staticmethod
+        def refresh(_candidate):
+            return record
+
+    assert plugin._revalidate_candidate(
+        FakePlexAdapter(), {"user_id": "token"}
+    ) is record
+
+
 def test_api_scan_pushes_each_candidate_only_once(monkeypatch):
     plugin, _ = _plugin(
         monkeypatch,
@@ -790,7 +1071,11 @@ def test_dry_run_revalidates_and_never_calls_adapter_delete(monkeypatch):
     plugin._discover_services = lambda: ({"Emby": object()}, "")
 
     class FakeAdapter:
+        service_type = "emby"
         deleted = False
+
+        def resolve_user(self, _user):
+            return "admin", "user-1"
 
         def refresh(self, _candidate):
             return _movie_record()
@@ -892,6 +1177,7 @@ def test_age_reminder_filters_old_candidates_and_sends_buttons(monkeypatch):
         {
             "scan_id": "scan-age",
             "created_at": datetime.now(timezone.utc).isoformat(),
+            "servers": [{"name": "Emby", "complete": True}],
             "scanned": 2,
             "candidates": [old, recent],
             "errors": [],
@@ -1121,6 +1407,11 @@ def test_scan_push_only_sends_candidates_not_notified_before(monkeypatch):
 
     assert "本次新增：2" in sent[0]["text"]
     assert len(scheduled[0]["args"][0]) == 2
+    for kwargs in scheduled:
+        kwargs["target"](
+            *kwargs["args"],
+            **kwargs["kwargs"],
+        )
 
     sent.clear()
     scheduled.clear()
@@ -1138,6 +1429,11 @@ def test_scan_push_only_sends_candidates_not_notified_before(monkeypatch):
     assert "本次新增：1" in sent[0]["text"]
     assert "已推送过、暂不重复：2" in sent[0]["text"]
     assert scheduled[0]["args"][0][0]["image"] == third["image"]
+    for kwargs in scheduled:
+        kwargs["target"](
+            *kwargs["args"],
+            **kwargs["kwargs"],
+        )
 
     sent.clear()
     scheduled.clear()
@@ -1159,6 +1455,88 @@ def test_scan_push_only_sends_candidates_not_notified_before(monkeypatch):
         second["key"],
         third["key"],
     }
+
+
+def test_scan_push_marks_only_individually_successful_items(monkeypatch):
+    plugin, data = _plugin(
+        monkeypatch,
+        notify_enabled=True,
+        notify_user="123456789",
+    )
+    candidates = [
+        {
+            "key": candidate_key("Emby", "movie", f"movie-{number}"),
+            "server": "Emby",
+            "category": "movie",
+            "kind": "movie",
+            "title": f"电影 {number}",
+            "percentage": 100,
+            "path": f"/media/Movies/{number}.mkv",
+        }
+        for number in (1, 2)
+    ]
+    calls = 0
+
+    def send(**_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("Telegram 临时失败")
+
+    plugin.post_message = send
+    result = plugin._send_notification_items(
+        [plugin._scan_notification_item(candidate) for candidate in candidates],
+        title_prefix="扫描候选",
+        delay_seconds=0,
+        notified_candidates=candidates,
+        scan_id="scan-1",
+    )
+    assert result["sent"] == 1
+    assert data["scan_notified_candidates"]["items"].keys() == {
+        candidates[0]["key"]
+    }
+
+    sent = []
+    plugin.post_message = lambda **kwargs: sent.append(kwargs)
+    plugin._notify_scan_completed(
+        {
+            "scan_id": "scan-2",
+            "servers": [{"name": "Emby", "complete": True}],
+            "candidates": candidates,
+            "errors": [],
+        },
+        "扫描完成",
+    )
+    assert "本次新增：1" in sent[0]["text"]
+
+
+def test_scan_push_does_not_retry_items_from_failed_server(monkeypatch):
+    plugin, _ = _plugin(
+        monkeypatch,
+        notify_enabled=True,
+        notify_user="123456789",
+    )
+    candidate = {
+        "key": candidate_key("Broken", "movie", "movie-1"),
+        "server": "Broken",
+        "category": "movie",
+        "kind": "movie",
+        "title": "保留的旧候选",
+    }
+    sent = []
+    plugin.post_message = lambda **kwargs: sent.append(kwargs)
+    plugin._notify_scan_completed(
+        {
+            "scan_id": "scan-new",
+            "servers": [{"name": "Broken", "complete": False}],
+            "candidates": [candidate],
+            "errors": ["Broken: 扫描失败"],
+        },
+        "扫描失败，保留旧快照",
+    )
+    assert len(sent) == 1
+    assert "本次新增：0" in sent[0]["text"]
+    assert "逐条推送：0 条" in sent[0]["text"]
 
 
 def test_scan_push_migrates_previous_scan_without_repeating_it(monkeypatch):
@@ -1387,6 +1765,7 @@ def test_telegram_delete_callback_revalidates_and_deletes(monkeypatch):
         "server": "Emby",
         "server_type": "emby",
         "user": "admin",
+        "user_id": "user-1",
         "category": "movie",
         "kind": "movie",
         "item_id": "movie-1",
@@ -1432,7 +1811,11 @@ def test_telegram_delete_callback_revalidates_and_deletes(monkeypatch):
     plugin.post_message = lambda **kwargs: replies.append(kwargs)
 
     class FakeAdapter:
+        service_type = "emby"
         deleted = False
+
+        def resolve_user(self, _user):
+            return "admin", "user-1"
 
         def refresh(self, _candidate):
             return _movie_record(added_at=YEAR_OLD, last_played=YEAR_OLD)

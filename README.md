@@ -19,7 +19,9 @@ installation logic, or MoviePilot integration.
 - Optional Shooter adapter using the exact video file hash fingerprint.
 - Custom HTTP manifest adapter for your own source.
 - Media-id/title matching, season/episode filtering, machine-translation filtering.
-- External and embedded subtitle detection using `ffprobe`.
+- External subtitle detection with strict per-video language suffix matching,
+  and embedded Simplified/Traditional Chinese detection using `ffprobe`
+  language and track-title metadata.
 - Safe ZIP extraction and atomic subtitle placement.
 - SQLite job history.
 - MoviePilot V3 adapter that listens for `TransferComplete`.

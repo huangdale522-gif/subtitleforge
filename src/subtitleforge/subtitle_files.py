@@ -30,6 +30,8 @@ GENERIC_CHINESE_MARKERS = (
     "简中",
     "繁中",
 )
+SUBTITLE_QUALIFIER_MARKERS = {"forced", "default", "sdh", "cc", "hi"}
+GENERIC_CHINESE_TOKENS = {"zh", "chi", "zho", "chinese", "中字", "中文", "简中", "繁中"}
 SIMPLIFIED_CHARS = set(
     "这为说时会过个们来学开关头门体国对发现后经么样点从当还没给让问听实际报长东动里种类华机产万话风电业处际识达罗马鱼鸟龙书"
 )
@@ -104,11 +106,10 @@ def scan_external_languages(video_path: Path) -> set[SubtitleLanguage]:
     found: set[SubtitleLanguage] = set()
     if not video_path.parent.exists():
         return found
-    video_stem = video_path.stem.casefold()
     for candidate in video_path.parent.iterdir():
         if not candidate.is_file() or _subtitle_suffix(candidate) is None:
             continue
-        if not candidate.name.casefold().startswith(video_stem):
+        if not _subtitle_belongs_to_video(candidate, video_path):
             continue
         language = language_from_name(candidate.name)
         if language is not None:
@@ -131,6 +132,36 @@ def scan_external_languages(video_path: Path) -> set[SubtitleLanguage]:
     return found
 
 
+def _subtitle_belongs_to_video(candidate: Path, video_path: Path) -> bool:
+    """Require an exact stem or a separator followed by subtitle markers."""
+
+    stem = video_path.stem
+    if not candidate.name[: len(stem)].casefold() == stem.casefold():
+        return False
+    suffix = candidate.suffix
+    basename = candidate.name[: -len(suffix)] if suffix else candidate.name
+    qualifier = basename[len(stem) :]
+    if not qualifier:
+        return True
+    if qualifier[0] not in " ._-":
+        return False
+    remainder = qualifier.casefold()
+    language_markers = (
+        *SIMPLIFIED_MARKERS,
+        *TRADITIONAL_MARKERS,
+        *GENERIC_CHINESE_TOKENS,
+    )
+    for marker in sorted(language_markers, key=len, reverse=True):
+        remainder = remainder.replace(marker, "")
+    tokens = [token for token in re.split(r"[ ._-]+", remainder) if token]
+    if any(token not in SUBTITLE_QUALIFIER_MARKERS for token in tokens):
+        # Numeric or arbitrary release tokens (for example .2024.zh-cn and
+        # .Extended.zh-cn) belong to another video, not this video's subtitle.
+        return False
+    # Untagged default/forced tracks can still be identified from content.
+    return True
+
+
 async def probe_embedded_languages(
     video_path: Path, ffprobe_path: str = "ffprobe"
 ) -> set[SubtitleLanguage]:
@@ -144,7 +175,7 @@ async def probe_embedded_languages(
             "-select_streams",
             "s",
             "-show_entries",
-            "stream_tags=language:stream_disposition=forced",
+            "stream_tags=language,title:stream_disposition=forced",
             "-of",
             "json",
             str(video_path),
@@ -162,14 +193,19 @@ async def probe_embedded_languages(
     for stream in payload.get("streams", []) if isinstance(payload, dict) else []:
         tags = stream.get("tags") if isinstance(stream, dict) else None
         code = str((tags or {}).get("language") or "").lower()
+        title = str((tags or {}).get("title") or "")
         if code in {"zh-cn", "zh-hans", "zho-hans", "chs", "chi-sim"}:
             found.add(SubtitleLanguage.SIMPLIFIED)
         elif code in {"zh-tw", "zh-hant", "zho-hant", "cht", "chi-tra", "zh-hk"}:
             found.add(SubtitleLanguage.TRADITIONAL)
         elif code in {"zh", "chi", "zho", "chinese"}:
-            found.update(
-                {SubtitleLanguage.SIMPLIFIED, SubtitleLanguage.TRADITIONAL}
-            )
+            title_language = language_from_name(title)
+            if title_language is not None:
+                found.add(title_language)
+            else:
+                found.update(
+                    {SubtitleLanguage.SIMPLIFIED, SubtitleLanguage.TRADITIONAL}
+                )
     return found
 
 

@@ -58,6 +58,12 @@ persistent queue; only queued items then consume provider downloads. Scheduled
 and manual scans share the same daily ledger, and simultaneous triggers are
 serialized.
 
+External subtitles are associated with a video only when its name is followed
+by a valid language or subtitle-purpose suffix. For example,
+`Movie.2024.zh-cn.srt` does not count as a subtitle for `Movie.mkv`. Embedded
+generic `zh` tracks also use their track titles to distinguish Simplified from
+Traditional Chinese when that metadata is available.
+
 Domestic-animation exclusion uses NFO `genre`, `origin_country`/`country`, and
 `original_language` fields during scans, and MoviePilot `genre_ids`,
 `origin_country`, and `production_countries` during `TransferComplete` events.

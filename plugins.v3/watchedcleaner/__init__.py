@@ -43,7 +43,7 @@ class WatchedCleaner(_PluginBase):
         "显示海报，支持按季清理、Telegram 图片提醒和人工确认后安全删除。"
     )
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.3.3"
+    plugin_version = "1.4.0"
     plugin_author = "huangdale522-gif"
     author_url = "https://github.com/huangdale522-gif"
     plugin_config_prefix = "watchedcleaner_"
@@ -59,6 +59,7 @@ class WatchedCleaner(_PluginBase):
     _min_days_since_played = 7
     _min_days_since_added = 7
     _protect_favorites = True
+    _require_season_complete = True
     _anime_keywords = list(DEFAULT_ANIME_KEYWORDS)
     _allowed_roots = ""
     _allow_delete = False
@@ -102,6 +103,9 @@ class WatchedCleaner(_PluginBase):
         )
         self._protect_favorites = as_bool(
             config.get("protect_favorites"), True
+        )
+        self._require_season_complete = as_bool(
+            config.get("require_season_complete"), True
         )
         keywords = split_values(config.get("anime_keywords"))
         self._anime_keywords = keywords or list(DEFAULT_ANIME_KEYWORDS)
@@ -262,9 +266,12 @@ class WatchedCleaner(_PluginBase):
                 "server_user",
                 "观看状态用户（Emby/Jellyfin）",
                 md=5,
-                placeholder="留空使用服务器当前管理用户",
+                placeholder="填写实际观看用户的名称",
                 **{"persistent-hint": True},
-                hint="Plex 只能使用 Token 对应用户的观看状态。",
+                hint=(
+                    "Emby/Jellyfin 必须明确匹配观看用户，不会回退到管理员；"
+                    "Plex 使用 Token 对应用户。"
+                ),
             ),
             self._field(
                 "VSelect",
@@ -322,6 +329,14 @@ class WatchedCleaner(_PluginBase):
                 "protect_favorites",
                 "收藏条目永不删除",
                 md=3,
+            ),
+            self._field(
+                "VSwitch",
+                "require_season_complete",
+                "要求季已完结且入库分集完整",
+                md=3,
+                **{"persistent-hint": True},
+                hint="按季清理时默认开启；元数据不足或缺集会跳过。",
             ),
             self._field(
                 "VTextField",
@@ -727,6 +742,7 @@ class WatchedCleaner(_PluginBase):
                 return self._failure("没有找到匹配且受支持的媒体服务器")
 
             scan_id = uuid.uuid4().hex
+            previous_scan = self._load_scan()
             created = datetime.now(timezone.utc)
             expires = created + timedelta(hours=self._scan_ttl_hours)
             candidates: list[dict[str, Any]] = []
@@ -735,15 +751,19 @@ class WatchedCleaner(_PluginBase):
             scanned = 0
             truncated = False
             servers: list[dict[str, Any]] = []
+            complete_servers: set[str] = set()
 
             for name, service in sorted(selected_services.items()):
                 try:
                     adapter = build_adapter(name, service)
                     result = adapter.scan(options, scan_id)
+                    result_errors = list(result.get("errors") or [])
+                    if not result_errors:
+                        complete_servers.add(name)
                     scanned += int(result.get("scanned") or 0)
                     candidates.extend(result.get("candidates") or [])
                     truncated = truncated or bool(result.get("truncated"))
-                    errors.extend(result.get("errors") or [])
+                    errors.extend(result_errors)
                     for reason, count in (result.get("skipped") or {}).items():
                         skipped[reason] = skipped.get(reason, 0) + int(count)
                     servers.append(
@@ -751,16 +771,51 @@ class WatchedCleaner(_PluginBase):
                             "name": name,
                             "type": adapter.service_type,
                             "user": result.get("user"),
+                            "complete": not result_errors,
                         }
                     )
                 except Exception as error:
                     message = f"{name}: {error}"
                     errors.append(message)
+                    servers.append(
+                        {
+                            "name": name,
+                            "type": self._service_type(service),
+                            "complete": False,
+                        }
+                    )
                     logger.warning(f"[已观看媒体清理] {message}")
 
-            if not servers:
+            if not complete_servers:
                 detail = "；".join(errors) or "所有媒体服务器均未返回扫描结果"
                 return self._failure(f"扫描失败：{detail}")
+            if len(complete_servers) < len(selected_services) or any(
+                not server.get("complete") for server in servers
+            ):
+                previous_complete_servers = {
+                    str(server.get("name") or "")
+                    for server in (previous_scan.get("servers") or [])
+                    if server.get("complete") is True
+                }
+                candidates.extend(
+                    candidate
+                    for candidate in (previous_scan.get("candidates") or [])
+                    if str(candidate.get("server") or "")
+                    in previous_complete_servers - complete_servers
+                )
+                previous_servers = {
+                    str(server.get("name") or ""): server
+                    for server in (previous_scan.get("servers") or [])
+                }
+                servers = [
+                    (
+                        {**previous_servers.get(str(server.get("name")), {}), **server}
+                        if not server.get("complete")
+                        else server
+                    )
+                    for server in servers
+                ]
+                errors.append("部分扫描失败，失败服务器的上次候选快照已保留")
             if len(candidates) > self._max_candidates:
                 candidates = candidates[: self._max_candidates]
                 truncated = True
@@ -777,7 +832,6 @@ class WatchedCleaner(_PluginBase):
                 "errors": errors,
                 "truncated": truncated,
             }
-            previous_scan = self._load_scan()
             self._store_scan(state)
             message = (
                 f"扫描完成：{len(candidates)} 个候选，"
@@ -884,7 +938,7 @@ class WatchedCleaner(_PluginBase):
                     if adapter is None:
                         adapter = build_adapter(server_name, service)
                         adapter_cache[server_name] = adapter
-                    current = adapter.refresh(candidate)
+                    current = self._revalidate_candidate(adapter, candidate)
                     current_paths = self._record_paths(current)
                     if current_paths:
                         result["path"] = current_paths[0]
@@ -1050,6 +1104,7 @@ class WatchedCleaner(_PluginBase):
             "min_days_since_played": self._min_days_since_played,
             "min_days_since_added": self._min_days_since_added,
             "protect_favorites": self._protect_favorites,
+            "require_season_complete": self._require_season_complete,
             "anime_keywords": ", ".join(self._anime_keywords),
             "allowed_roots": self._allowed_roots,
             "allow_delete": self._allow_delete,
@@ -1103,6 +1158,10 @@ class WatchedCleaner(_PluginBase):
             "protect_favorites": as_bool(
                 value("protect_favorites", self._protect_favorites), True
             ),
+            "require_season_complete": as_bool(
+                value("require_season_complete", self._require_season_complete),
+                True,
+            ),
             "anime_keywords": split_values(
                 value("anime_keywords", self._anime_keywords)
             )
@@ -1125,9 +1184,30 @@ class WatchedCleaner(_PluginBase):
             "min_days_since_played": self._min_days_since_played,
             "min_days_since_added": self._min_days_since_added,
             "protect_favorites": self._protect_favorites,
+            "require_season_complete": self._require_season_complete,
             "allowed_roots": split_values(self._allowed_roots),
             "require_allowed_roots": True,
         }
+
+    def _revalidate_candidate(
+        self, adapter: MediaAdapter, candidate: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Recheck both viewing-account identity and current media state."""
+        expected_user_id = str(candidate.get("user_id") or "").strip()
+        if adapter.service_type != "plex" and not expected_user_id:
+            raise AdapterError("候选缺少观看用户标识，请重新扫描")
+        if adapter.service_type == "plex":
+            return adapter.refresh(candidate)
+        actual_user_name, actual_user_id = adapter.resolve_user(
+            str(candidate.get("user") or "")
+        )
+        if expected_user_id and actual_user_id != expected_user_id:
+            raise AdapterError(
+                "观看用户已变化"
+                f"（当前为 {actual_user_name or actual_user_id or '未知'}），"
+                "请重新扫描"
+            )
+        return adapter.refresh(candidate)
 
     @staticmethod
     def _public_scan_options(options: Mapping[str, Any]) -> dict[str, Any]:
@@ -1295,10 +1375,19 @@ class WatchedCleaner(_PluginBase):
             }
 
         scan = self._load_scan()
+        complete_servers = {
+            str(server.get("name") or "")
+            for server in (scan.get("servers") or [])
+            if server.get("complete") is not False
+        }
         state = self._load_age_reminder_state()
         now = datetime.now(timezone.utc)
         eligible = self._eligible_age_reminder_candidates(
-            list(scan.get("candidates") or []),
+            [
+                candidate
+                for candidate in (scan.get("candidates") or [])
+                if str(candidate.get("server") or "") in complete_servers
+            ],
             state,
             now=now,
         )
@@ -1520,7 +1609,18 @@ class WatchedCleaner(_PluginBase):
             candidate
             for candidate in (state.get("candidates") or [])
             if isinstance(candidate, Mapping)
+            and any(
+                str(candidate.get("server") or "") == str(server.get("name") or "")
+                and server.get("complete") is not False
+                for server in (state.get("servers") or [])
+            )
         ]
+        if not state.get("servers"):
+            candidates = [
+                candidate
+                for candidate in (state.get("candidates") or [])
+                if isinstance(candidate, Mapping)
+            ]
         notification_state, notification_state_exists = (
             self._load_scan_notification_state()
         )
@@ -1593,24 +1693,7 @@ class WatchedCleaner(_PluginBase):
         ):
             return
 
-        notified_at = datetime.now(timezone.utc).isoformat()
         scan_id = str(state.get("scan_id") or "")
-        for candidate in new_candidates:
-            key = str(candidate.get("key") or "")
-            if not self._valid_candidate_key(key):
-                continue
-            notified_items[key] = self._scan_notification_entry(
-                candidate,
-                notified_at,
-                scan_id,
-            )
-        try:
-            self._store_scan_notification_state(notification_state)
-        except Exception as error:
-            logger.warning(
-                f"[已观看媒体清理] 保存扫描通知状态失败：{error}"
-            )
-
         if new_candidates:
             items = [
                 self._scan_notification_item(candidate)
@@ -1620,7 +1703,11 @@ class WatchedCleaner(_PluginBase):
                 Thread(
                     target=self._send_notification_items,
                     args=(items,),
-                    kwargs={"title_prefix": "扫描候选"},
+                    kwargs={
+                        "title_prefix": "扫描候选",
+                        "notified_candidates": new_candidates,
+                        "scan_id": scan_id,
+                    },
                     daemon=True,
                     name="WatchedCleanerScanNotify",
                 ).start()
@@ -1764,6 +1851,8 @@ class WatchedCleaner(_PluginBase):
         *,
         title_prefix: str,
         delay_seconds: float = 1.05,
+        notified_candidates: Optional[List[Mapping[str, Any]]] = None,
+        scan_id: str = "",
     ) -> dict[str, int]:
         total = len(items)
         sent = 0
@@ -1780,6 +1869,12 @@ class WatchedCleaner(_PluginBase):
             ):
                 sent += 1
                 failed = 0
+                if notified_candidates is not None and index <= len(
+                    notified_candidates
+                ):
+                    self._mark_scan_candidate_notified(
+                        notified_candidates[index - 1], scan_id
+                    )
             else:
                 failed += 1
                 if failed >= 3:
@@ -1790,6 +1885,31 @@ class WatchedCleaner(_PluginBase):
             if delay_seconds > 0 and index < total:
                 time.sleep(delay_seconds)
         return {"sent": sent, "failed": failed, "total": total}
+
+    def _mark_scan_candidate_notified(
+        self, candidate: Mapping[str, Any], scan_id: str
+    ) -> None:
+        """Persist only a candidate whose individual Telegram message succeeded."""
+        key = str(candidate.get("key") or "")
+        if not self._valid_candidate_key(key):
+            return
+        try:
+            state, _ = self._load_scan_notification_state()
+            previous = state["items"].get(key)
+            previous = previous if isinstance(previous, Mapping) else {}
+            notified_at = datetime.now(timezone.utc).isoformat()
+            entry = self._scan_notification_entry(
+                candidate, notified_at, scan_id
+            )
+            entry["first_notified_at"] = (
+                previous.get("first_notified_at") or notified_at
+            )
+            state["items"][key] = entry
+            self._store_scan_notification_state(state)
+        except Exception as error:
+            logger.warning(
+                f"[已观看媒体清理] 保存扫描通知状态失败：{error}"
+            )
 
     def _load_age_reminder_state(self) -> dict[str, Any]:
         with self._state_lock:
@@ -2007,7 +2127,7 @@ class WatchedCleaner(_PluginBase):
             if not service:
                 raise AdapterError("原媒体服务器已不可用")
             adapter = build_adapter(server_name, service)
-            current = adapter.refresh(candidate)
+            current = self._revalidate_candidate(adapter, candidate)
             current_paths = self._record_paths(current)
             if current_paths:
                 result["path"] = current_paths[0]

@@ -10,6 +10,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 CATEGORIES = ("movie", "tv", "anime")
 TV_MODES = ("season", "series", "episode")
+ENDED_STATUSES = {"ended", "canceled", "cancelled", "completed", "complete"}
 DEFAULT_ANIME_KEYWORDS = (
     "动漫",
     "动画",
@@ -251,6 +252,20 @@ def record_block_reason(record: Mapping[str, Any], options: Mapping[str, Any]) -
         unit = "整季" if kind == "season" else "整剧"
         if not episodes:
             return f"未找到已入库分集，无法确认{unit}已看完"
+        if kind == "season" and as_bool(
+            options.get("require_season_complete"), True
+        ):
+            statuses = {
+                str(record.get("status") or "").strip().casefold(),
+                str(record.get("series_status") or "").strip().casefold(),
+            }
+            if not statuses & ENDED_STATUSES:
+                return "无法确认该季已完结，已跳过"
+            expected = _positive_int(record.get("expected_episode_count"))
+            if expected is None:
+                return "缺少季分集总数，无法确认入库完整"
+            if len(episodes) != expected:
+                return f"季分集不完整（已入库 {len(episodes)}/{expected} 集）"
         unfinished = sum(1 for episode in episodes if not is_watched(episode, threshold))
         if unfinished:
             return f"仍有 {unfinished} 集未达到观看阈值"
@@ -271,15 +286,27 @@ def record_block_reason(record: Mapping[str, Any], options: Mapping[str, Any]) -
         added_dates = [record.get("added_at")]
 
     latest_played = newest_timestamp(played_dates)
-    if min_played_days > 0 and latest_played:
+    if min_played_days > 0:
+        if not latest_played or any(
+            not iso_timestamp(value) for value in played_dates
+        ):
+            return "缺少有效播放时间，无法执行播放保护校验"
         elapsed = days_since(latest_played, now)
-        if elapsed is not None and elapsed < min_played_days:
+        if elapsed is None:
+            return "缺少有效播放时间，无法执行播放保护校验"
+        if elapsed < min_played_days:
             return f"最近 {min_played_days} 天内播放过"
 
     latest_added = newest_timestamp(added_dates)
-    if min_added_days > 0 and latest_added:
+    if min_added_days > 0:
+        if not latest_added or any(
+            not iso_timestamp(value) for value in added_dates
+        ):
+            return "缺少有效入库时间，无法执行入库保护校验"
         elapsed = days_since(latest_added, now)
-        if elapsed is not None and elapsed < min_added_days:
+        if elapsed is None:
+            return "缺少有效入库时间，无法执行入库保护校验"
+        if elapsed < min_added_days:
             return f"最近 {min_added_days} 天内入库"
 
     if not paths:
@@ -295,6 +322,15 @@ def candidate_key(server: str, kind: str, item_id: str) -> str:
     """Build an opaque key that cannot contain path or shell syntax."""
     raw = f"{server}\0{kind}\0{item_id}".encode("utf-8", errors="replace")
     return hashlib.sha256(raw).hexdigest()[:24]
+
+
+def _positive_int(value: Any) -> int | None:
+    """Return a positive server-reported count, rejecting unknown values."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
 
 
 def normalize_record(record: Mapping[str, Any]) -> dict[str, Any]:
@@ -315,6 +351,16 @@ def normalize_record(record: Mapping[str, Any]) -> dict[str, Any]:
     normalized["percentage"] = percentage(normalized)
     normalized["last_played"] = iso_timestamp(normalized.get("last_played"))
     normalized["added_at"] = iso_timestamp(normalized.get("added_at"))
+    normalized["expected_episode_count"] = _positive_int(
+        normalized.get("expected_episode_count")
+    )
+    normalized["series_expected_episode_count"] = _positive_int(
+        normalized.get("series_expected_episode_count")
+    )
+    normalized["status"] = str(normalized.get("status") or "").strip()
+    normalized["series_status"] = str(
+        normalized.get("series_status") or ""
+    ).strip()
     normalized["episodes"] = [
         normalize_record(episode)
         for episode in (normalized.get("episodes") or [])
