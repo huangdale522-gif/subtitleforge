@@ -332,16 +332,62 @@ def test_cleanup_bluray_subtitles_only_removes_generated_siblings(
     saved: dict = {}
     plugin.save_data = lambda key, value: saved.update({key: value})
 
+    candidates, errors = plugin._bluray_cleanup_candidates(history)
+
+    assert candidates == sorted(generated)
+    assert errors == []
+
     result = plugin._cleanup_bluray_subtitles()
 
     assert result["status"] == "ok"
     assert result["candidates"] == 2
     assert result["deleted"] == 2
+    assert result["paths"] == [str(path) for path in sorted(generated)]
     assert all(not path.exists() for path in generated)
     assert manual.exists()
     assert orphan.exists()
     assert history[0]["result"]["downloaded"] == []
     assert "download_history" in saved
+    assert plugin._bluray_cleanup_candidates(history) == ([], [])
+
+
+def test_bluray_cleanup_page_counts_existing_files_only(tmp_path: Path) -> None:
+    plugin_module = load_moviepilot_plugin()
+    plugin = plugin_module.CSFReborn()
+    stream = tmp_path / "Movie (2026)" / "BDMV" / "STREAM"
+    stream.mkdir(parents=True)
+    video = stream / "00000.m2ts"
+    video.write_bytes(b"video")
+    generated = stream / "00000.chi.zh-cn.srt"
+    generated.write_text("subtitle", encoding="utf-8")
+    missing = stream / "00001.chi.zh-cn.srt"
+    history = [
+        {
+            "result": {
+                "downloaded": [
+                    {"path": str(generated)},
+                    {"path": str(missing)},
+                ]
+            }
+        }
+    ]
+    plugin._media_roots = str(tmp_path)
+    plugin._load_history = lambda: history
+    plugin.get_data = lambda _key: None
+    plugin._request_json = lambda *_args, **_kwargs: {}
+
+    rendered = json.dumps(plugin.get_page(), ensure_ascii=False)
+
+    assert "清理蓝光分片误生成字幕（1）" in rendered
+    assert "检测到 1 个蓝光分片误生成字幕" in rendered
+    assert str(generated) in rendered
+    assert str(missing) not in rendered
+
+    generated.unlink()
+    rendered = json.dumps(plugin.get_page(), ensure_ascii=False)
+
+    assert "清理蓝光分片误生成字幕（1）" not in rendered
+    assert "清理蓝光分片误生成字幕（0）" not in rendered
 
 
 def test_cleanup_bluray_api_requires_confirmation() -> None:
